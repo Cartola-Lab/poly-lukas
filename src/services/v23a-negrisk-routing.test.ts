@@ -342,6 +342,16 @@ describe('V2.3A negRisk routing propagation (offline CLOB fixtures)', () => {
     expect(mergeData.startsWith(utils.id('mergePositions(address,bytes32,bytes32,uint256[],uint256)').slice(0, 10))).toBe(true);
     expect(String(await send.mock.calls[0][0].to).toLowerCase()).toBe('0xada100874d00e3331d00f2007a9c336a65009718');
 
+    // Neg-risk mergeByTokenIds: V2.3C2c adapter path (NegRiskCtfCollateralAdapter
+    // mergePositions).
+    send.mockClear();
+    const negRiskMerge = await ctf.mergeByTokenIds(condition, ids, '1', { negRisk: true });
+    expect(negRiskMerge.success).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    const negRiskMergeData = String(await send.mock.calls[0][0].data);
+    expect(negRiskMergeData.startsWith(utils.id('mergePositions(address,bytes32,bytes32,uint256[],uint256)').slice(0, 10))).toBe(true);
+    expect(String(await send.mock.calls[0][0].to).toLowerCase()).toBe('0xada200001000ef00d07553cee7006808f895c6f1');
+
     // Redeem with standard routing: V2.3C1c adapter path (CtfCollateralAdapter
     // redeemPositions). Neg-risk redeem fails closed.
     send.mockClear();

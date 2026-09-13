@@ -505,7 +505,7 @@ export class CTFClient {
   }
 
   /**
-   * V2.3C1b: canonical STANDARD merge through the CtfCollateralAdapter.
+   * V2.3C1b/C2c: canonical merge through the selected collateral adapter.
    * Balance validation is performed by the caller (merge vs mergeByTokenIds);
    * this method executes the adapter transaction and the required ERC1155
    * operator approval.
@@ -522,8 +522,8 @@ export class CTFClient {
       await sendCtfOperatorApprovalTx(this.wallet, this.provider, adapter.address);
     }
 
-    const standardAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
-    const tx = await standardAdapter.mergePositions(
+    const lifecycleAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
+    const tx = await lifecycleAdapter.mergePositions(
       USDC_CONTRACT,
       ethers.constants.HashZero,
       conditionId,
@@ -561,7 +561,11 @@ export class CTFClient {
   }
 
   async mergeByTokenIds(conditionId: string, tokenIds: TokenIds, amount: string, routing?: LifecycleRouting): Promise<MergeResult> {
-    const adapter = this.resolveStandardMergeAdapter(routing);
+    // V2.3C1b/C2c: both market types must merge through a V2 collateral
+    // adapter via mergeByTokenIds. Standard uses CtfCollateralAdapter; neg-risk
+    // uses NegRiskCtfCollateralAdapter. Unknown routing fails closed.
+    // Generic merge() for neg-risk remains blocked.
+    const adapter = resolveLifecycleAdapter(routing); // fails closed on non-boolean routing
     const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
     const balances = await this.getPositionBalanceByTokenIds(conditionId, tokenIds);

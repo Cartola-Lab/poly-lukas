@@ -212,12 +212,19 @@ describe('V2.3C1b standard merge through CtfCollateralAdapter (offline)', () => 
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('NEG-RISK fails closed without any broadcast or read', async () => {
+  it('neg-risk generic merge() remains fail-closed; mergeByTokenIds routes to NegRisk adapter', async () => {
     const { ctf } = await setup('LIVE');
+    // Generic merge() for neg-risk is still blocked.
     await expect(ctf.merge(condition, '12.5', { negRisk: true })).rejects.toThrow(/not implemented yet/);
-    await expect(ctf.mergeByTokenIds(condition, ids, '12.5', { negRisk: true })).rejects.toThrow(/not implemented yet/);
     expect(send).not.toHaveBeenCalled();
     expect(reads).toHaveLength(0);
+    // mergeByTokenIds with neg-risk now routes to the NegRiskCtfCollateralAdapter.
+    operatorApproved = true;
+    const result = await ctf.mergeByTokenIds(condition, ids, '12.5', { negRisk: true });
+    expect(result.success).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    const to = String(await send.mock.calls[0][0].to).toLowerCase();
+    expect(to).toBe('0xAdA200001000ef00D07553cEE7006808F895c6F1'.toLowerCase());
   });
 
   it('UNKNOWN routing fails closed without any broadcast or read', async () => {
