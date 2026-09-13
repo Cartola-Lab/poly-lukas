@@ -21,6 +21,7 @@ import {
   NEG_RISK_CTF_COLLATERAL_ADAPTER,
   resolveLifecycleAdapter,
   sendPusdApproveTx,
+  sendCtfOperatorApprovalTx,
   type LifecycleRouting,
   type ApprovalTxResult,
 } from '../clients/ctf-client.js';
@@ -400,9 +401,6 @@ export class AuthorizationService {
     const pusd = new ethers.Contract(PUSD, ERC20_ABI, this.signer);
     const conditionalTokens = new ethers.Contract(CONDITIONAL_TOKENS, ERC1155_ABI, this.signer);
 
-    const gasPrice = await this.provider.getGasPrice();
-    const adjustedGasPrice = gasPrice.mul(150).div(100);
-
     let erc20Approval: ApprovalTxResult;
     const allowance = await pusd.allowance(walletAddress, adapter.address);
     const allowanceNum = parseFloat(ethers.utils.formatUnits(allowance, COLLATERAL_TOKEN_DECIMALS));
@@ -417,20 +415,7 @@ export class AuthorizationService {
     if (isOperator) {
       erc1155Approval = { contract: adapter.name, success: true };
     } else {
-      try {
-        const tx = await conditionalTokens.setApprovalForAll(adapter.address, true, {
-          gasPrice: adjustedGasPrice,
-          gasLimit: 100000,
-        });
-        await tx.wait();
-        erc1155Approval = { contract: adapter.name, txHash: tx.hash, success: true };
-      } catch (err) {
-        erc1155Approval = {
-          contract: adapter.name,
-          success: false,
-          error: err instanceof Error ? err.message : 'Unknown error',
-        };
-      }
+      erc1155Approval = await sendCtfOperatorApprovalTx(this.signer, this.provider, adapter.address);
     }
 
     const allApproved = erc20Approval.success && erc1155Approval.success;

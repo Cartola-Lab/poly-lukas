@@ -327,12 +327,16 @@ describe('V2.3A negRisk routing propagation (offline CLOB fixtures)', () => {
     const splitData = String(await send.mock.calls[1][0].data);
     expect(splitData.startsWith(utils.id('splitPosition(address,bytes32,bytes32,uint256[],uint256)').slice(0, 10))).toBe(true);
 
-    // Merge through OnchainService with routing: legacy mergePositions call.
+    // Merge through OnchainService with standard routing: V2.3C1b adapter
+    // path (CtfCollateralAdapter mergePositions). ERC1155 read returns
+    // truthy here, so no operator approval write is needed.
     send.mockClear();
     const merge = await onchain.mergeByTokenIds(condition, ids, '1', { negRisk: false });
     expect(merge.success).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
     const mergeData = String(await send.mock.calls[0][0].data);
     expect(mergeData.startsWith(utils.id('mergePositions(address,bytes32,bytes32,uint256[],uint256)').slice(0, 10))).toBe(true);
+    expect(String(await send.mock.calls[0][0].to).toLowerCase()).toBe('0xada100874d00e3331d00f2007a9c336a65009718');
 
     // Redeem with routing: legacy redeemPositions call.
     send.mockClear();

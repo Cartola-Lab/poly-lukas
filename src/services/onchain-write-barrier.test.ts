@@ -53,13 +53,13 @@ describe('on-chain economic routes with real contracts and offline transport', (
     const { ctf, onchain } = await setup(mode);
     const routes = [
       () => ctf.split(condition, '1', { negRisk: false }),
-      () => ctf.merge(condition, '1'),
-      () => ctf.mergeByTokenIds(condition, ids, '1'),
+      () => ctf.merge(condition, '1', { negRisk: false }),
+      () => ctf.mergeByTokenIds(condition, ids, '1', { negRisk: false }),
       () => ctf.redeem(condition),
       () => ctf.redeemByTokenIds(condition, ids),
       () => onchain.split(condition, '1', { negRisk: false }),
-      () => onchain.merge(condition, '1'),
-      () => onchain.mergeByTokenIds(condition, ids, '1'),
+      () => onchain.merge(condition, '1', { negRisk: false }),
+      () => onchain.mergeByTokenIds(condition, ids, '1', { negRisk: false }),
       () => onchain.redeem(condition),
       () => onchain.redeemByTokenIds(condition, ids),
       () => onchain.swap('USDC', 'USDC_E', '1'),

@@ -87,13 +87,19 @@ const CTF_ABI = [
 ];
 
 /**
- * V2.3C: Standard CtfCollateralAdapter. The external signature mirrors the
- * legacy CTF splitPosition signature for compatibility; the adapter ignores
- * the collateralToken, parentCollectionId and partition parameters and only
+ * V2.3C: Standard CtfCollateralAdapter. The external signatures mirror the
+ * legacy CTF signatures for compatibility; the adapter ignores the
+ * collateralToken, parentCollectionId and partition parameters and only
  * acts on conditionId + amount (verified from ctf-exchange-v2 source).
  */
 const STANDARD_CTF_ADAPTER_ABI = [
   'function splitPosition(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount) external',
+  'function mergePositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount) external',
+];
+
+const ERC1155_ABI = [
+  'function setApprovalForAll(address operator, bool approved) external',
+  'function isApprovedForAll(address account, address operator) view returns (bool)',
 ];
 
 const ERC20_ABI = [
@@ -168,6 +174,11 @@ export interface MergeResult {
   success: boolean;
   txHash: string;
   amount: string;
+  /**
+   * Collateral received after merging. Standard-market adapter merges return
+   * pUSD (V2.3C1b); legacy merges historically returned USDC.e. Field name
+   * retained for compatibility.
+   */
   usdcReceived: string;
   gasUsed?: string;
 }
@@ -252,6 +263,35 @@ export async function sendPusdApproveTx(
   } catch (err) {
     return {
       contract: spenderAddress,
+      success: false,
+      error: err instanceof Error ? err.message : 'Unknown error',
+    };
+  }
+}
+
+/**
+ * Send an ERC1155 setApprovalForAll(operator, true) on Conditional Tokens
+ * using the caller's protected wallet. Canonical single implementation shared
+ * by AuthorizationService.approveLifecycleAdapter and CTFClient standard merge.
+ */
+export async function sendCtfOperatorApprovalTx(
+  signer: Wallet,
+  provider: ethers.providers.Provider,
+  operatorAddress: string
+): Promise<ApprovalTxResult> {
+  const conditionalTokens = new Contract(CTF_CONTRACT, ERC1155_ABI, signer);
+  const gasPrice = await provider.getGasPrice();
+  const adjustedGasPrice = gasPrice.mul(150).div(100);
+  try {
+    const tx = await conditionalTokens.setApprovalForAll(operatorAddress, true, {
+      gasPrice: adjustedGasPrice,
+      gasLimit: 100000,
+    });
+    await tx.wait();
+    return { contract: operatorAddress, txHash: tx.hash, success: true };
+  } catch (err) {
+    return {
+      contract: operatorAddress,
       success: false,
       error: err instanceof Error ? err.message : 'Unknown error',
     };
@@ -439,8 +479,61 @@ export class CTFClient {
     };
   }
 
+  /**
+   * V2.3C1b: routing guard for standard merge. Fails closed before any
+   * balance read for neg-risk or unknown routing.
+   */
+  private resolveStandardMergeAdapter(routing: LifecycleRouting | undefined): { name: string; address: string } {
+    if (!routing) {
+      throw new Error('Standard merge requires lifecycle routing: market negRisk routing is unknown');
+    }
+    if (routing.negRisk === true) {
+      throw new Error('Neg-risk merge is not implemented yet (V2.3C1b covers standard markets only)');
+    }
+    return resolveLifecycleAdapter(routing); // fails closed on non-boolean routing
+  }
+
+  /**
+   * V2.3C1b: canonical STANDARD merge through the CtfCollateralAdapter.
+   * Balance validation is performed by the caller (merge vs mergeByTokenIds);
+   * this method executes the adapter transaction and the required ERC1155
+   * operator approval.
+   */
+  private async standardMergePositions(
+    conditionId: string,
+    amountWei: ethers.BigNumber,
+    adapter: { name: string; address: string }
+  ): Promise<MergeResult> {
+    // ERC1155 operator approval: the adapter pulls YES + NO from the EOA.
+    const conditionalTokens = new Contract(CTF_CONTRACT, ERC1155_ABI, this.provider);
+    const isOperator = await conditionalTokens.isApprovedForAll(this.wallet.address, adapter.address);
+    if (!isOperator) {
+      await sendCtfOperatorApprovalTx(this.wallet, this.provider, adapter.address);
+    }
+
+    const standardAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
+    const tx = await standardAdapter.mergePositions(
+      USDC_CONTRACT,
+      ethers.constants.HashZero,
+      conditionId,
+      [1, 2],
+      amountWei,
+      await this.getGasOptions()
+    );
+
+    const receipt = await tx.wait();
+
+    return {
+      success: true,
+      txHash: receipt.transactionHash,
+      amount: ethers.utils.formatUnits(amountWei, USDC_DECIMALS),
+      usdcReceived: ethers.utils.formatUnits(amountWei, USDC_DECIMALS),
+      gasUsed: receipt.gasUsed.toString(),
+    };
+  }
+
   async merge(conditionId: string, amount: string, routing?: LifecycleRouting): Promise<MergeResult> {
-    void routing; // V2.3A: plumbing only; legacy merge behavior unchanged.
+    const adapter = this.resolveStandardMergeAdapter(routing);
     const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
     const balances = await this.getPositionBalance(conditionId);
@@ -453,28 +546,11 @@ export class CTFClient {
       );
     }
 
-    const tx = await this.ctfContract.mergePositions(
-      USDC_CONTRACT,
-      ethers.constants.HashZero,
-      conditionId,
-      [1, 2],
-      amountWei,
-      await this.getGasOptions()
-    );
-
-    const receipt = await tx.wait();
-
-    return {
-      success: true,
-      txHash: receipt.transactionHash,
-      amount,
-      usdcReceived: amount,
-      gasUsed: receipt.gasUsed.toString(),
-    };
+    return this.standardMergePositions(conditionId, amountWei, adapter);
   }
 
   async mergeByTokenIds(conditionId: string, tokenIds: TokenIds, amount: string, routing?: LifecycleRouting): Promise<MergeResult> {
-    void routing; // V2.3A: plumbing only; legacy merge behavior unchanged.
+    const adapter = this.resolveStandardMergeAdapter(routing);
     const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
     const balances = await this.getPositionBalanceByTokenIds(conditionId, tokenIds);
@@ -487,24 +563,7 @@ export class CTFClient {
       );
     }
 
-    const tx = await this.ctfContract.mergePositions(
-      USDC_CONTRACT,
-      ethers.constants.HashZero,
-      conditionId,
-      [1, 2],
-      amountWei,
-      await this.getGasOptions()
-    );
-
-    const receipt = await tx.wait();
-
-    return {
-      success: true,
-      txHash: receipt.transactionHash,
-      amount,
-      usdcReceived: amount,
-      gasUsed: receipt.gasUsed.toString(),
-    };
+    return this.standardMergePositions(conditionId, amountWei, adapter);
   }
 
   async redeem(conditionId: string, outcome?: string, routing?: LifecycleRouting): Promise<RedeemResult> {
