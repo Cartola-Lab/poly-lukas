@@ -152,12 +152,12 @@ describe('V2.3C1a standard split through CtfCollateralAdapter (offline)', () => 
     expect(String(await splitTx.to).toLowerCase()).toBe(standardAdapter.toLowerCase());
   });
 
-  it('NEG-RISK fails closed without any broadcast', async () => {
+  it('NEG-RISK split routes through the NegRiskCtfCollateralAdapter', async () => {
     const { ctf } = await setup('LIVE');
-    await expect(ctf.split(condition, '12.5', { negRisk: true })).rejects.toThrow(/not implemented yet/);
-    expect(send).not.toHaveBeenCalled();
-    expect(reads.some(r => r.name === 'balanceOf')).toBe(false);
-    expect(reads.some(r => r.name === 'allowance')).toBe(false);
+    const result = await ctf.split(condition, '12.5', { negRisk: true });
+    expect(result.success).toBe(true);
+    const splitTx = send.mock.calls[send.mock.calls.length - 1][0];
+    expect(String(await splitTx.to).toLowerCase()).toBe(negRiskAdapter.toLowerCase());
   });
 
   it('UNKNOWN routing fails closed without any broadcast', async () => {

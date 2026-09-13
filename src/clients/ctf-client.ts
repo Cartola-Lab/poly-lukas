@@ -445,14 +445,12 @@ export class CTFClient {
   }
 
   async split(conditionId: string, amount: string, routing?: LifecycleRouting): Promise<SplitResult> {
-    // V2.3C1a: standard markets must split through the CtfCollateralAdapter
-    // with pUSD. Neg-risk migration is not implemented yet; unknown routing
-    // fails closed. There is no legacy fallback.
+    // V2.3C1a/C2b: both market types must split through a V2 collateral
+    // adapter with pUSD. Standard uses CtfCollateralAdapter; neg-risk uses
+    // NegRiskCtfCollateralAdapter. Unknown routing fails closed; there is
+    // no legacy fallback.
     if (!routing) {
-      throw new Error('Standard split requires lifecycle routing: market negRisk routing is unknown');
-    }
-    if (routing.negRisk === true) {
-      throw new Error('Neg-risk split is not implemented yet (V2.3C1a covers standard markets only)');
+      throw new Error('Split requires lifecycle routing: market negRisk routing is unknown');
     }
     const adapter = resolveLifecycleAdapter(routing); // fails closed on non-boolean routing
 
@@ -464,14 +462,14 @@ export class CTFClient {
       throw new Error(`Insufficient pUSD balance. Have: ${ethers.utils.formatUnits(balance, USDC_DECIMALS)}, Need: ${amount}`);
     }
 
-    // V2.3B lifecycle approval path (pUSD → CtfCollateralAdapter).
+    // V2.3B lifecycle approval path (pUSD → selected lifecycle adapter).
     const allowance = await pusd.allowance(this.wallet.address, adapter.address);
     if (allowance.lt(amountWei)) {
       await sendPusdApproveTx(this.wallet, this.provider, adapter.address, ethers.constants.MaxUint256);
     }
 
-    const standardAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
-    const tx = await standardAdapter.splitPosition(
+    const lifecycleAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
+    const tx = await lifecycleAdapter.splitPosition(
       USDC_CONTRACT,
       ethers.constants.HashZero,
       conditionId,

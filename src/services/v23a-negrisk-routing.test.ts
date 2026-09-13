@@ -313,11 +313,14 @@ describe('V2.3A negRisk routing propagation (offline CLOB fixtures)', () => {
     const condition = '0x' + '33'.repeat(32);
     const ids = { yesTokenId: '1', noTokenId: '2' };
 
-    // Split with standard routing: V2.3C1a adapter path (pUSD approve +
-    // CtfCollateralAdapter splitPosition). Neg-risk split fails closed.
+    // Split with neg-risk routing: V2.3C2b adapter path (NegRiskCtfCollateralAdapter
+    // splitPosition). Standard split still uses the Standard Adapter.
     send.mockClear();
-    await expect(ctf.split(condition, '1', { negRisk: true })).rejects.toThrow(/not implemented yet/);
-    expect(send).not.toHaveBeenCalled();
+    const negRiskSplit = await ctf.split(condition, '1', { negRisk: true });
+    expect(negRiskSplit.success).toBe(true);
+    expect(send).toHaveBeenCalledTimes(2); // approve + splitPosition (neg-risk adapter)
+    // Allowance is 0 in this suite → first send is the pUSD approve, second is the adapter split.
+    expect(String(await send.mock.calls[1][0].to).toLowerCase()).toBe('0xada200001000ef00d07553cee7006808f895c6f1');
     send.mockClear();
     const split = await ctf.split(condition, '1', { negRisk: false });
     expect(split.success).toBe(true);
@@ -326,6 +329,7 @@ describe('V2.3A negRisk routing propagation (offline CLOB fixtures)', () => {
     expect(approveData.startsWith(utils.id('approve(address,uint256)').slice(0, 10))).toBe(true);
     const splitData = String(await send.mock.calls[1][0].data);
     expect(splitData.startsWith(utils.id('splitPosition(address,bytes32,bytes32,uint256[],uint256)').slice(0, 10))).toBe(true);
+    expect(String(await send.mock.calls[1][0].to).toLowerCase()).toBe('0xada100874d00e3331d00f2007a9c336a65009718');
 
     // Merge through OnchainService with standard routing: V2.3C1b adapter
     // path (CtfCollateralAdapter mergePositions). ERC1155 read returns
