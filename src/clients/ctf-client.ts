@@ -1,12 +1,15 @@
 ﻿/**
  * Legacy CTF (Conditional Token Framework) Client
- * CLOB V2 collateral uses the separate getPusdBalance() read; lifecycle below
- * has not been migrated to the V2 collateral adapters.
+ * CLOB V2 collateral uses the separate getPusdBalance() read.
+ *
+ * V2.3C1a: STANDARD split migrated to CtfCollateralAdapter with pUSD.
+ * Merge / mergeByTokenIds / redeem / redeemByTokenIds remain on the legacy
+ * CTF/USDC.e path until their own migration steps land.
  *
  * Provides on-chain operations for Polymarket's conditional tokens:
- * - Split: USDC → YES + NO token pair
- * - Merge: YES + NO → USDC
- * - Redeem: Winning tokens → USDC (after market resolution)
+ * - Split: pUSD → YES + NO token pair (via CtfCollateralAdapter)
+ * - Merge: YES + NO → USDC.e (legacy CTF; not yet migrated)
+ * - Redeem: Winning tokens → USDC.e (legacy CTF; not yet migrated)
  *
  * ⚠️ CRITICAL: Polymarket CTF uses USDC.e (bridged), NOT native USDC!
  *
@@ -52,8 +55,20 @@ export const NATIVE_USDC_CONTRACT = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359'
 export const NEG_RISK_CTF_EXCHANGE = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
 export const NEG_RISK_ADAPTER = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296';
 
+/**
+ * V2.3C: current CLOB V2 CTF collateral adapters, verified against the
+ * authoritative Polymarket ctf-exchange-v2 deployment list (Polygon).
+ * Standard markets use CtfCollateralAdapter; neg-risk markets use
+ * NegRiskCtfCollateralAdapter.
+ */
+export const CTF_COLLATERAL_ADAPTER = '0xADa100874d00e3331D00F2007a9c336a65009718';
+export const NEG_RISK_CTF_COLLATERAL_ADAPTER = '0xAdA200001000ef00D07553cEE7006808F895c6F1';
+
 // USDC.e uses 6 decimals
 export const USDC_DECIMALS = 6;
+
+/** pUSD (Polymarket Collateral Token proxy) on Polygon, from the V2 SDK config. */
+export const PUSD = getContractConfig(137).collateral;
 
 // ===== ABIs =====
 
@@ -69,6 +84,16 @@ const CTF_ABI = [
   // Check if condition is resolved
   'function payoutNumerators(bytes32 conditionId, uint256 outcomeIndex) view returns (uint256)',
   'function payoutDenominator(bytes32 conditionId) view returns (uint256)',
+];
+
+/**
+ * V2.3C: Standard CtfCollateralAdapter. The external signature mirrors the
+ * legacy CTF splitPosition signature for compatibility; the adapter ignores
+ * the collateralToken, parentCollectionId and partition parameters and only
+ * acts on conditionId + amount (verified from ctf-exchange-v2 source).
+ */
+const STANDARD_CTF_ADAPTER_ABI = [
+  'function splitPosition(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount) external',
 ];
 
 const ERC20_ABI = [
@@ -181,6 +206,56 @@ export interface TokenIds {
 export interface LifecycleRouting {
   /** Whether the market is a neg-risk market (from CLOB metadata). */
   negRisk: boolean;
+}
+
+/** Result of a single approval transaction attempt. */
+export interface ApprovalTxResult {
+  contract: string;
+  txHash?: string;
+  success: boolean;
+  error?: string;
+}
+
+/**
+ * Resolve exactly one lifecycle collateral adapter from market routing.
+ * Fails closed on unknown routing — never defaults to the standard adapter.
+ * Canonical single implementation shared by AuthorizationService and
+ * CTFClient (kept here to avoid a clients→services dependency).
+ */
+export function resolveLifecycleAdapter(routing: LifecycleRouting | undefined): { name: string; address: string } {
+  if (!routing || typeof routing.negRisk !== 'boolean') {
+    throw new Error('Cannot select a lifecycle collateral adapter: market negRisk routing is unknown');
+  }
+  return routing.negRisk
+    ? { name: 'Neg Risk CTF Collateral Adapter', address: NEG_RISK_CTF_COLLATERAL_ADAPTER }
+    : { name: 'CTF Collateral Adapter', address: CTF_COLLATERAL_ADAPTER };
+}
+
+/**
+ * Send a pUSD ERC20 approval to a lifecycle collateral adapter using the
+ * caller's protected wallet. Canonical single implementation shared by
+ * AuthorizationService.approveLifecycleAdapter and CTFClient standard split.
+ */
+export async function sendPusdApproveTx(
+  signer: Wallet,
+  provider: ethers.providers.Provider,
+  spenderAddress: string,
+  amount: ethers.BigNumber
+): Promise<ApprovalTxResult> {
+  const pusd = new Contract(PUSD, ERC20_ABI, signer);
+  const gasPrice = await provider.getGasPrice();
+  const adjustedGasPrice = gasPrice.mul(150).div(100);
+  try {
+    const tx = await pusd.approve(spenderAddress, amount, { gasPrice: adjustedGasPrice });
+    await tx.wait();
+    return { contract: spenderAddress, txHash: tx.hash, success: true };
+  } catch (err) {
+    return {
+      contract: spenderAddress,
+      success: false,
+      error: err instanceof Error ? err.message : 'Unknown error',
+    };
+  }
 }
 
 export interface MarketResolution {
@@ -317,25 +392,33 @@ export class CTFClient {
   }
 
   async split(conditionId: string, amount: string, routing?: LifecycleRouting): Promise<SplitResult> {
-    void routing; // V2.3A: plumbing only; legacy split behavior unchanged.
+    // V2.3C1a: standard markets must split through the CtfCollateralAdapter
+    // with pUSD. Neg-risk migration is not implemented yet; unknown routing
+    // fails closed. There is no legacy fallback.
+    if (!routing) {
+      throw new Error('Standard split requires lifecycle routing: market negRisk routing is unknown');
+    }
+    if (routing.negRisk === true) {
+      throw new Error('Neg-risk split is not implemented yet (V2.3C1a covers standard markets only)');
+    }
+    const adapter = resolveLifecycleAdapter(routing); // fails closed on non-boolean routing
+
     const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
-    const balance = await this.usdcContract.balanceOf(this.wallet.address);
+    const pusd = new Contract(PUSD, ERC20_ABI, this.provider);
+    const balance = await pusd.balanceOf(this.wallet.address);
     if (balance.lt(amountWei)) {
-      throw new Error(`Insufficient USDC balance. Have: ${ethers.utils.formatUnits(balance, USDC_DECIMALS)}, Need: ${amount}`);
+      throw new Error(`Insufficient pUSD balance. Have: ${ethers.utils.formatUnits(balance, USDC_DECIMALS)}, Need: ${amount}`);
     }
 
-    const allowance = await this.usdcContract.allowance(this.wallet.address, CTF_CONTRACT);
+    // V2.3B lifecycle approval path (pUSD → CtfCollateralAdapter).
+    const allowance = await pusd.allowance(this.wallet.address, adapter.address);
     if (allowance.lt(amountWei)) {
-      const approveTx = await this.usdcContract.approve(
-        CTF_CONTRACT,
-        ethers.constants.MaxUint256,
-        await this.getGasOptions()
-      );
-      await approveTx.wait();
+      await sendPusdApproveTx(this.wallet, this.provider, adapter.address, ethers.constants.MaxUint256);
     }
 
-    const tx = await this.ctfContract.splitPosition(
+    const standardAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
+    const tx = await standardAdapter.splitPosition(
       USDC_CONTRACT,
       ethers.constants.HashZero,
       conditionId,

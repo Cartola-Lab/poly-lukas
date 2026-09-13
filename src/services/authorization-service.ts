@@ -17,21 +17,20 @@ import { protectWallet } from '../core/write-barrier.js';
 import {
   CTF_CONTRACT,
   USDC_CONTRACT,
+  CTF_COLLATERAL_ADAPTER,
+  NEG_RISK_CTF_COLLATERAL_ADAPTER,
+  resolveLifecycleAdapter,
+  sendPusdApproveTx,
   type LifecycleRouting,
+  type ApprovalTxResult,
 } from '../clients/ctf-client.js';
 
 // Contract addresses
 const { collateral: PUSD, exchangeV2: CTF_EXCHANGE, negRiskExchangeV2: NEG_RISK_CTF_EXCHANGE } = getContractConfig(137);
 const CONDITIONAL_TOKENS = CTF_CONTRACT;
 
-/**
- * V2.3B: CLOB V2 collateral adapter addresses for CTF lifecycle operations.
- * Verified against the current Polymarket ctf-exchange-v2 deployment list.
- * These are NOT trading exchanges; they must never enter the V2.2 trading
- * approval allowlist and vice versa.
- */
-export const CTF_COLLATERAL_ADAPTER = '0xADa100874d00e3331D00F2007a9c336a65009718';
-export const NEG_RISK_CTF_COLLATERAL_ADAPTER = '0xAdA200001000ef00D07553cEE7006808F895c6F1';
+export { CTF_COLLATERAL_ADAPTER, NEG_RISK_CTF_COLLATERAL_ADAPTER };
+export type { ApprovalTxResult };
 
 // ABIs
 const ERC20_ABI = [
@@ -60,13 +59,6 @@ export interface AllowancesResult {
   erc1155Approvals: AllowanceInfo[];
   tradingReady: boolean;
   issues: string[];
-}
-
-export interface ApprovalTxResult {
-  contract: string;
-  txHash?: string;
-  success: boolean;
-  error?: string;
 }
 
 export interface ApprovalsResult {
@@ -115,12 +107,6 @@ const ERC20_SPENDERS = [
 const ERC1155_OPERATORS = [
   { name: 'CTF Exchange', address: CTF_EXCHANGE },
   { name: 'Neg Risk CTF Exchange', address: NEG_RISK_CTF_EXCHANGE },
-];
-
-// V2.3B lifecycle collateral adapters. Separate allowlist from trading spenders.
-const LIFECYCLE_ADAPTERS = [
-  { name: 'CTF Collateral Adapter', address: CTF_COLLATERAL_ADAPTER },
-  { name: 'Neg Risk CTF Collateral Adapter', address: NEG_RISK_CTF_COLLATERAL_ADAPTER },
 ];
 
 /**
@@ -349,13 +335,10 @@ export class AuthorizationService {
   /**
    * V2.3B: resolve exactly one lifecycle collateral adapter from market
    * routing. Fails closed when routing is unknown — never defaults to
-   * the standard adapter.
+   * the standard adapter. Canonical implementation in ctf-client.
    */
   private resolveLifecycleAdapter(routing: LifecycleRouting | undefined): { name: string; address: string } {
-    if (!routing || typeof routing.negRisk !== 'boolean') {
-      throw new Error('Cannot select a lifecycle collateral adapter: market negRisk routing is unknown');
-    }
-    return routing.negRisk ? LIFECYCLE_ADAPTERS[1] : LIFECYCLE_ADAPTERS[0];
+    return resolveLifecycleAdapter(routing);
   }
 
   /**
@@ -426,17 +409,7 @@ export class AuthorizationService {
     if (allowanceNum > 1e12) {
       erc20Approval = { contract: adapter.name, success: true };
     } else {
-      try {
-        const tx = await pusd.approve(adapter.address, ethers.constants.MaxUint256, { gasPrice: adjustedGasPrice });
-        await tx.wait();
-        erc20Approval = { contract: adapter.name, txHash: tx.hash, success: true };
-      } catch (err) {
-        erc20Approval = {
-          contract: adapter.name,
-          success: false,
-          error: err instanceof Error ? err.message : 'Unknown error',
-        };
-      }
+      erc20Approval = await sendPusdApproveTx(this.signer, this.provider, adapter.address, ethers.constants.MaxUint256);
     }
 
     let erc1155Approval: ApprovalTxResult;

@@ -52,12 +52,12 @@ describe('on-chain economic routes with real contracts and offline transport', (
   it.each(['DRY', 'LIVE', 'HALT'] as const)('%s gates direct CTF and OnchainService writes', async mode => {
     const { ctf, onchain } = await setup(mode);
     const routes = [
-      () => ctf.split(condition, '1'),
+      () => ctf.split(condition, '1', { negRisk: false }),
       () => ctf.merge(condition, '1'),
       () => ctf.mergeByTokenIds(condition, ids, '1'),
       () => ctf.redeem(condition),
       () => ctf.redeemByTokenIds(condition, ids),
-      () => onchain.split(condition, '1'),
+      () => onchain.split(condition, '1', { negRisk: false }),
       () => onchain.merge(condition, '1'),
       () => onchain.mergeByTokenIds(condition, ids, '1'),
       () => onchain.redeem(condition),

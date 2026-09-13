@@ -313,11 +313,15 @@ describe('V2.3A negRisk routing propagation (offline CLOB fixtures)', () => {
     const condition = '0x' + '33'.repeat(32);
     const ids = { yesTokenId: '1', noTokenId: '2' };
 
-    // Split with routing: unchanged legacy flow = ERC20 approve + CTF splitPosition.
+    // Split with standard routing: V2.3C1a adapter path (pUSD approve +
+    // CtfCollateralAdapter splitPosition). Neg-risk split fails closed.
     send.mockClear();
-    const split = await ctf.split(condition, '1', { negRisk: true });
+    await expect(ctf.split(condition, '1', { negRisk: true })).rejects.toThrow(/not implemented yet/);
+    expect(send).not.toHaveBeenCalled();
+    send.mockClear();
+    const split = await ctf.split(condition, '1', { negRisk: false });
     expect(split.success).toBe(true);
-    expect(send).toHaveBeenCalledTimes(2); // approve + splitPosition (legacy flow)
+    expect(send).toHaveBeenCalledTimes(2); // approve + splitPosition (V2.3C1a flow)
     const approveData = String(await send.mock.calls[0][0].data);
     expect(approveData.startsWith(utils.id('approve(address,uint256)').slice(0, 10))).toBe(true);
     const splitData = String(await send.mock.calls[1][0].data);
