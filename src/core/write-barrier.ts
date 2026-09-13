@@ -1,5 +1,5 @@
 import type { Wallet, providers } from 'ethers';
-import type { ClobClient } from '@polymarket/clob-client';
+import type { ClobClient } from '@polymarket/clob-client-v2';
 import { executionMode } from './execution-mode.js';
 
 const wallets = new WeakSet<Wallet>();
@@ -52,7 +52,7 @@ export function protectWallet<T extends Wallet>(wallet: T): T {
 }
 
 /**
- * clob-client 5.2.0's createAndPost methods await signing/auth before calling the
+ * clob-client-v2 1.1.0's createAndPost methods await signing/auth before calling the
  * HTTP post method. Guard that final boundary too, not just strategy entry.
  * The narrow internal transport seam is covered by tests against the real SDK.
  * API-key setup and read requests do not change economic exposure.
@@ -60,34 +60,28 @@ export function protectWallet<T extends Wallet>(wallet: T): T {
 export function protectClobClient(client: ClobClient): ClobClient {
   if (clients.has(client)) return client;
   const transport = client as unknown as {
-    post(url: string, options?: unknown): Promise<unknown>;
-    del(url: string, options?: unknown): Promise<unknown>;
+    post(url: string, options?: unknown, skipThrow?: boolean): Promise<unknown>;
+    del(url: string, options?: unknown, skipThrow?: boolean): Promise<unknown>;
   };
   if (typeof transport.post !== 'function' || typeof transport.del !== 'function') {
     throw new Error('Unsupported CLOB client: missing guarded POST/DELETE transport.');
   }
   const post = transport.post;
-  transport.post = async function (url, options) {
+  transport.post = async function (url, options, skipThrow) {
     const path = new URL(url).pathname.replace(/\/$/, '');
     if (path === '/order' || path === '/orders' || path.startsWith('/rfq/') || path === '/v1/heartbeats') {
       executionMode.assertCanWrite(`CLOB POST ${path}`);
     }
-    return post.call(this, url, options);
+    return post.call(this, url, options, skipThrow);
   };
   const del = transport.del;
-  transport.del = async function (url, options) {
+  transport.del = async function (url, options, skipThrow) {
     // All SDK DELETE routes mutate remote state, including order/RFQ cancels,
     // notification deletion and API-key revocation. No HALT exception here.
     executionMode.assertCanWrite(`CLOB DELETE ${new URL(url).pathname}`);
-    return del.call(this, url, options);
+    return del.call(this, url, options, skipThrow);
   };
-  // RFQ captures bound transports in the 5.2.0 constructor, before we wrap them.
-  // Keep the advanced getter from exposing that captured, unguarded route.
-  const rfq = client.rfq as unknown as {
-    deps: { post: typeof transport.post; del: typeof transport.del };
-  };
-  rfq.deps.post = transport.post.bind(client);
-  rfq.deps.del = transport.del.bind(client);
+  // V2 1.1.0 has no RFQ client or separately captured RFQ transports.
   clients.add(client);
   return client;
 }

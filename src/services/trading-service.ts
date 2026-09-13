@@ -1,7 +1,7 @@
 /**
  * TradingService
  *
- * Trading service using official @polymarket/clob-client.
+ * Trading service using official @polymarket/clob-client-v2.
  *
  * Provides:
  * - Order creation (limit, market)
@@ -20,7 +20,7 @@ import {
   type OpenOrder,
   type Trade as ClobTrade,
   type TickSize,
-} from '@polymarket/clob-client';
+} from '@polymarket/clob-client-v2';
 
 import { Wallet } from 'ethers';
 import { executionMode } from '../core/execution-mode.js';
@@ -184,8 +184,11 @@ export class TradingService {
   async initialize(): Promise<void> {
     if (this.initialized) return;
 
-    // Create CLOB client with L1 auth (wallet)
-    this.clobClient = protectClobClient(new ClobClient(CLOB_HOST, this.chainId, this.wallet));
+    // Create CLOB client with L1 auth (wallet). V2 defaults to EOA signing
+    // and the signer's address as funder, matching this service's existing setup.
+    this.clobClient = protectClobClient(new ClobClient({
+      host: CLOB_HOST, chain: this.chainId, signer: this.wallet,
+    }));
 
     // Get or create API credentials
     // We use derive-first strategy (opposite of official createOrDeriveApiKey)
@@ -200,16 +203,16 @@ export class TradingService {
     }
 
     // Re-initialize with L2 auth (credentials)
-    this.clobClient = protectClobClient(new ClobClient(
-      CLOB_HOST,
-      this.chainId,
-      this.wallet,
-      {
+    this.clobClient = protectClobClient(new ClobClient({
+      host: CLOB_HOST,
+      chain: this.chainId,
+      signer: this.wallet,
+      creds: {
         key: this.credentials.key,
         secret: this.credentials.secret,
         passphrase: this.credentials.passphrase,
       }
-    ));
+    }));
 
     this.initialized = true;
   }
@@ -326,7 +329,8 @@ export class TradingService {
             size: params.size,
             expiration: params.expiration || 0,
           },
-          { tickSize, negRisk },
+          // The V2 package also supports legacy orders; select V2 explicitly.
+          { tickSize, negRisk, version: 2 },
           orderType
         );
 
@@ -338,7 +342,7 @@ export class TradingService {
         return {
           success,
           orderId: result.orderID,
-          orderIds: result.orderIDs,
+          orderIds: 'orderIDs' in result && Array.isArray(result.orderIDs) ? result.orderIDs : undefined,
           errorMsg: result.errorMsg,
           transactionHashes: result.transactionsHashes,
         };
@@ -387,7 +391,7 @@ export class TradingService {
             amount: params.amount,
             price: params.price,
           },
-          { tickSize, negRisk },
+          { tickSize, negRisk, version: 2 },
           orderType
         );
 
@@ -399,7 +403,7 @@ export class TradingService {
         return {
           success,
           orderId: result.orderID,
-          orderIds: result.orderIDs,
+          orderIds: 'orderIDs' in result && Array.isArray(result.orderIDs) ? result.orderIDs : undefined,
           errorMsg: result.errorMsg,
           transactionHashes: result.transactionsHashes,
         };
@@ -575,14 +579,18 @@ export class TradingService {
   async getBalanceAllowance(
     assetType: 'COLLATERAL' | 'CONDITIONAL',
     tokenId?: string
-  ): Promise<{ balance: string; allowance: string }> {
+  ): Promise<{ balance: string; allowance?: string }> {
     const client = await this.ensureInitialized();
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
       const result = await client.getBalanceAllowance({
         asset_type: assetType as any,
         token_id: tokenId,
       });
-      return { balance: result.balance, allowance: result.allowance };
+      // V2 declares allowances per contract. Preserve an optional legacy field;
+      // selecting operational collateral/spenders belongs to the next migration.
+      const allowance = 'allowance' in result && typeof result.allowance === 'string'
+        ? result.allowance : undefined;
+      return { balance: result.balance, allowance };
     });
   }
 

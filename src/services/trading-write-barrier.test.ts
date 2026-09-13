@@ -22,13 +22,19 @@ async function setup(mode: 'DRY' | 'LIVE' | 'HALT') {
   const client = service.getClobClient()!;
   vi.spyOn(client, 'getTickSize').mockResolvedValue('0.01');
   vi.spyOn(client, 'getNegRisk').mockResolvedValue(false);
-  vi.spyOn(client, 'getFeeRateBps').mockResolvedValue(0);
   if (mode === 'HALT') executionMode.halt();
   return { service, client, executionMode };
 }
 
 beforeEach(() => {
-  http.mockReset().mockResolvedValue({ data: { success: true, orderID: 'test-order' }, status: 200, headers: {} });
+  http.mockReset().mockImplementation(async request => {
+    const path = new URL(request.url).pathname;
+    const data = path === '/version' ? { version: 2 }
+      : path === '/markets-by-token/1' ? { condition_id: 'condition-1' }
+      : path === '/clob-markets/condition-1' ? { t: [{ t: '1' }], mts: '0.01', nr: false }
+      : { success: true, orderID: 'test-order' };
+    return { data, status: 200, headers: {} };
+  });
   axios.defaults.adapter = http;
 });
 afterEach(() => {
@@ -36,7 +42,9 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe('real clob-client 5.2.0 with mocked HTTP only', () => {
+const writes = () => http.mock.calls.filter(([request]) => request.method !== 'get');
+
+describe('real clob-client-v2 1.1.0 with mocked HTTP only', () => {
   describe.each(['DRY', 'LIVE', 'HALT'] as const)('%s cancellation and heartbeat transport', mode => {
     const routes = [
       { name: 'service.cancelOrder', path: '/order', data: { orderID: 'order-1' }, run: ({ service }: Awaited<ReturnType<typeof setup>>) => service.cancelOrder('order-1') },
@@ -46,8 +54,6 @@ describe('real clob-client 5.2.0 with mocked HTTP only', () => {
       { name: 'raw.cancelOrders', path: '/orders', data: ['order-1', 'order-2'], run: ({ client }: Awaited<ReturnType<typeof setup>>) => client.cancelOrders(['order-1', 'order-2']) },
       { name: 'raw.cancelAll', path: '/cancel-all', data: undefined, run: ({ client }: Awaited<ReturnType<typeof setup>>) => client.cancelAll() },
       { name: 'raw.cancelMarketOrders', path: '/cancel-market-orders', data: { market: 'market-1', asset_id: '1' }, run: ({ client }: Awaited<ReturnType<typeof setup>>) => client.cancelMarketOrders({ market: 'market-1', asset_id: '1' }) },
-      { name: 'rfq.cancelRfqRequest', path: '/rfq/request', data: { requestId: 'request-1' }, run: ({ client }: Awaited<ReturnType<typeof setup>>) => client.rfq.cancelRfqRequest({ requestId: 'request-1' }) },
-      { name: 'rfq.cancelRfqQuote', path: '/rfq/quote', data: { quoteId: 'quote-1' }, run: ({ client }: Awaited<ReturnType<typeof setup>>) => client.rfq.cancelRfqQuote({ quoteId: 'quote-1' }) },
       { name: 'raw.postHeartbeat', path: '/v1/heartbeats', data: { heartbeat_id: 'heartbeat-1' }, run: ({ client }: Awaited<ReturnType<typeof setup>>) => client.postHeartbeat('heartbeat-1') },
     ];
     it.each(routes)('$name', async route => {
@@ -74,7 +80,7 @@ describe('real clob-client 5.2.0 with mocked HTTP only', () => {
     const limit = await service.createLimitOrder({ tokenId: '1', side: 'SELL', size: 10, price: 0.5 });
     expect(market.success).toBe(mode === 'LIVE');
     expect(limit.success).toBe(mode === 'LIVE');
-    expect(http).toHaveBeenCalledTimes(mode === 'LIVE' ? 2 : 0);
+    expect(writes()).toHaveLength(mode === 'LIVE' ? 2 : 0);
     if (mode !== 'LIVE') expect(market.errorMsg).toContain(mode);
   });
 
@@ -83,7 +89,7 @@ describe('real clob-client 5.2.0 with mocked HTTP only', () => {
     const signed = await client.createOrder({ tokenID: '1', side: 'BUY' as never, size: 10, price: 0.5 });
     await expect(client.postOrder(signed)).rejects.toThrow(mode);
     await expect(client.postOrders([{ order: signed, orderType: 'FOK' as never }])).rejects.toThrow(mode);
-    expect(http).not.toHaveBeenCalled();
+    expect(writes()).toHaveLength(0);
   });
 
   it('rechecks HALT after order signing started but before final HTTP POST', async () => {
@@ -97,7 +103,7 @@ describe('real clob-client 5.2.0 with mocked HTTP only', () => {
     const result = await service.createMarketOrder({ tokenId: '1', side: 'BUY', amount: 5, price: 0.5 });
     expect(result.success).toBe(false);
     expect(result.errorMsg).toContain('HALT');
-    expect(http).not.toHaveBeenCalled();
+    expect(writes()).toHaveLength(0);
   });
 
   it.each(['DRY', 'HALT'] as const)('%s allows authenticated reads', async mode => {
@@ -107,20 +113,9 @@ describe('real clob-client 5.2.0 with mocked HTTP only', () => {
     expect(http).toHaveBeenCalledWith(expect.objectContaining({ method: 'get' }));
   });
 
-  it.each(['DRY', 'LIVE', 'HALT'] as const)('%s gates the RFQ captured POST route', async mode => {
-    const { client } = await setup(mode);
-    const request = client.rfq.createRfqRequest(
-      { tokenID: '1', side: 'BUY' as never, size: 10, price: 0.5 },
-      { tickSize: '0.01' },
-    );
-    if (mode === 'LIVE') {
-      await request;
-      expect(http).toHaveBeenCalledTimes(1);
-      expect(http).toHaveBeenCalledWith(expect.objectContaining({ method: 'post' }));
-    } else {
-      await expect(request).rejects.toThrow(mode);
-      expect(http).not.toHaveBeenCalled();
-    }
+  it('does not expose the removed V1 RFQ client or captured transports', async () => {
+    const { client } = await setup('LIVE');
+    expect(client).not.toHaveProperty('rfq');
   });
 
   it.each(['DRY', 'HALT'] as const)('%s allows batch book reads even though they use POST', async mode => {

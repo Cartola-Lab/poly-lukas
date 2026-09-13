@@ -54,7 +54,7 @@
   },
   "dependencies": {
     "@catalyst-team/cache": "^0.2.0",
-    "@polymarket/clob-client": "^5.1.3",
+    "@polymarket/clob-client-v2": "1.1.0",
     "@polymarket/real-time-data-client": "^1.4.0",
     "@types/ws": "^8.18.1",
     "bottleneck": "^2.19.5",

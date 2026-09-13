@@ -15,7 +15,7 @@ import {
   Chain,
   PriceHistoryInterval,
   type OrderBookSummary,
-} from '@polymarket/clob-client';
+} from '@polymarket/clob-client-v2';
 import { Wallet } from 'ethers';
 import { protectClobClient, protectWallet } from '../core/write-barrier.js';
 import { DataApiClient, Trade } from '../clients/data-api.js';
@@ -212,10 +212,10 @@ export class MarketService {
       if (this.config?.privateKey) {
         // Authenticated client
         const wallet = protectWallet(new Wallet(this.config.privateKey));
-        this.clobClient = protectClobClient(new ClobClient(CLOB_HOST, chainId, wallet));
+        this.clobClient = protectClobClient(new ClobClient({ host: CLOB_HOST, chain: chainId, signer: wallet }));
       } else {
         // Read-only client (no auth needed for market data)
-        this.clobClient = protectClobClient(new ClobClient(CLOB_HOST, chainId));
+        this.clobClient = protectClobClient(new ClobClient({ host: CLOB_HOST, chain: chainId }));
       }
       this.initialized = true;
     }
