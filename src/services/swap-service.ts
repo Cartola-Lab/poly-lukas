@@ -7,6 +7,7 @@
 
 import { ethers, Contract, BigNumber } from 'ethers';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
+import { protectWallet } from '../core/write-barrier.js';
 
 // QuickSwap V3 Contracts on Polygon
 export const QUICKSWAP_ROUTER = '0xf5b509bB0909a69B1c207E495f687a596C168E12';
@@ -159,7 +160,7 @@ export class SwapService {
     // Use signer's provider if available, otherwise create a default Polygon provider
     this.provider = signer.provider || new ethers.providers.JsonRpcProvider(resolvePolygonRpcUrl());
     // Ensure signer is connected to the provider
-    this.signer = signer.provider ? signer : signer.connect(this.provider);
+    this.signer = protectWallet(signer.provider ? signer : signer.connect(this.provider));
     this.router = new Contract(QUICKSWAP_ROUTER, QUICKSWAP_ROUTER_ABI, this.signer);
     this.quoter = new Contract(QUICKSWAP_QUOTER, QUICKSWAP_QUOTER_ABI, this.provider);
     this.factory = new Contract(QUICKSWAP_FACTORY, QUICKSWAP_FACTORY_ABI, this.provider);

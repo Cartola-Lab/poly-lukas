@@ -9,6 +9,8 @@
  */
 
 import 'dotenv/config';
+import { executionMode } from './src/core/execution-mode.js';
+import { handleExecutionModeCommand } from './src/dashboard/execution-commands.js';
 import { ethers } from 'ethers';
 import {
   PolymarketSDK,
@@ -42,7 +44,7 @@ import { fetchClosedPnls } from './src/utils/closed-positions.js';
 
 const CAPITAL_USD = parseFloat(process.env.CAPITAL_USD || '250');
 
-let CONFIG = {
+const CONFIG = {
   capital: {
     totalUsd: CAPITAL_USD,
     maxPerTradePct: 0.02,  // 🔴 FIXED: Reduced from 3% to 2%
@@ -159,7 +161,7 @@ let CONFIG = {
     minRiskReward: 1.5,
   },
 
-  dryRun: process.env.DRY_RUN !== 'false',
+  get dryRun() { return executionMode.startupMode === 'DRY'; },
 };
 
 // ============================================================================
@@ -372,6 +374,7 @@ function canTrade(): boolean {
   const totalLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.totalMaxLossPct;
   if (state.totalPnL <= -totalLossLimit) {
     state.permanentlyHalted = true;
+    executionMode.halt();
     log('ERROR', '💀 TOTAL LOSS LIMIT REACHED - TRADING PERMANENTLY HALTED');
     log('ERROR', `Total loss: -$${Math.abs(state.totalPnL).toFixed(2)} (limit: $${totalLossLimit.toFixed(2)})`);
     updateDashboard();
@@ -1542,42 +1545,8 @@ async function main() {
   // Listen for commands from dashboard — single handler (registered after
   // the SDK exists; the old second handler double-processed commands)
   dashboardEmitter.on('command', async ({ command, payload }: { command: string; payload: any }) => {
-    // v3.2: mode toggle — payload.enabled is the TARGET dryRun state
-    // (App.tsx sends !isDryRun). dryRun is captured by the copy
-    // subscription at start, so it must be restarted on every flip.
-    if (command === 'toggleDryRun') {
-      const enable = payload?.enabled === true;
-      if (CONFIG.dryRun !== enable) {
-        log('INFO', `Switching to ${enable ? 'DRY RUN' : 'LIVE'} mode... (Requested by user)`);
-
-        CONFIG.dryRun = enable;
-        if (CONFIG.dryRun && !state.paper) {
-          state.paper = {
-            balance: CONFIG.capital.totalUsd,
-            initialBalance: CONFIG.capital.totalUsd,
-            pnl: 0,
-            trades: 0,
-            totalVolume: 0,
-          };
-        }
-
-        // Restart mode-sensitive services
-        stopSmartMoneyCopy();
-        await startSmartMoneyCopy(sdk);
-
-        if (arbService) {
-          await arbService.stop();
-          await setupArbitrage(sdk);
-        }
-
-        sdk.dipArb.updateConfig({
-          autoExecute: !CONFIG.dryRun,
-          preExecutionGuard: riskGuard,
-        });
-
-        dashboardEmitter.updateConfig(buildDashboardConfig());
-        log('WARN', `⚠️ BOT MODE CHANGED TO: ${CONFIG.dryRun ? '🧪 DRY RUN' : '🔴 LIVE'}`);
-      }
+    if (handleExecutionModeCommand(command, message => log('WARN', message))) {
+      dashboardEmitter.updateConfig(buildDashboardConfig());
       return;
     }
 
@@ -1585,6 +1554,7 @@ async function main() {
     // (permanentlyHalted is the first check). Does NOT flip CONFIG.*.enabled:
     // a user could re-toggle a strategy, but nothing can open while halted.
     if (command === 'emergencyStop') {
+      executionMode.halt(); // Latch before any await; no cancel-all or drain here.
       state.permanentlyHalted = true;
       state.isPaused = true;
       state.pauseUntil = Date.now() + 365 * 24 * 60 * 60 * 1000;

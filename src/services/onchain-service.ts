@@ -35,6 +35,7 @@
 
 import { ethers } from 'ethers';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
+import { protectWallet } from '../core/write-barrier.js';
 
 // Import underlying services
 import {
@@ -149,7 +150,7 @@ export class OnchainService {
 
     // Create shared provider and wallet
     this.provider = new ethers.providers.JsonRpcProvider(rpcUrl);
-    this.wallet = new ethers.Wallet(config.privateKey, this.provider);
+    this.wallet = protectWallet(new ethers.Wallet(config.privateKey, this.provider));
 
     // Initialize CTFClient with config
     const ctfConfig: CTFConfig = {

@@ -488,6 +488,7 @@ export class BridgeClient {
 // ===== Deposit Execution =====
 
 import { ethers } from 'ethers';
+import { protectWallet } from '../core/write-barrier.js';
 
 // ERC20 ABI for deposits
 const ERC20_DEPOSIT_ABI = [
@@ -537,6 +538,7 @@ export async function depositUsdc(
   amount: number,
   options: DepositOptions = {}
 ): Promise<DepositResult> {
+  protectWallet(signer);
   const { token = 'NATIVE_USDC', gasPriceMultiplier = 1.2 } = options;
 
   // Validate minimum deposit

@@ -25,6 +25,7 @@
  */
 
 import 'dotenv/config';
+import { executionMode } from './src/core/execution-mode.js';
 import {
   PolymarketSDK,
   ArbitrageService,
@@ -165,7 +166,7 @@ const CONFIG = {
     minRiskReward: 1.5,  // Minimum 1.5:1 risk/reward ratio
   },
 
-  dryRun: process.env.DRY_RUN !== 'false',
+  get dryRun() { return executionMode.startupMode === 'DRY'; },
 };
 
 // ============================================================================
@@ -361,6 +362,7 @@ function canTrade(): boolean {
   const totalLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.totalMaxLossPct;
   if (state.totalPnL <= -totalLossLimit) {
     state.permanentlyHalted = true;
+    executionMode.halt();
     log('ERROR', '💀 TOTAL LOSS LIMIT REACHED - TRADING PERMANENTLY HALTED');
     log('ERROR', `Total loss: -$${Math.abs(state.totalPnL).toFixed(2)} (limit: $${totalLossLimit.toFixed(2)})`);
     log('ERROR', 'Please review strategy before restarting with new capital');

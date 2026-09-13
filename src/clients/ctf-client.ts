@@ -25,6 +25,7 @@
 
 import { ethers, Contract, Wallet, BigNumber } from 'ethers';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
+import { protectWallet } from '../core/write-barrier.js';
 
 // ===== Contract Addresses (Polygon Mainnet) =====
 
@@ -199,7 +200,7 @@ export class CTFClient {
 
     // StaticJsonRpcProvider évite le check async eth_chainId qui provoque l'erreur "noNetwork"
     this.provider = new ethers.providers.StaticJsonRpcProvider(rpcUrl, network);
-    this.wallet = new Wallet(config.privateKey, this.provider);
+    this.wallet = protectWallet(new Wallet(config.privateKey, this.provider));
     this.ctfContract = new Contract(CTF_CONTRACT, CTF_ABI, this.wallet);
     this.usdcContract = new Contract(USDC_CONTRACT, ERC20_ABI, this.wallet);
     this.gasPriceMultiplier = config.gasPriceMultiplier || 1.2;

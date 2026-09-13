@@ -23,6 +23,8 @@ import {
 } from '@polymarket/clob-client';
 
 import { Wallet } from 'ethers';
+import { executionMode } from '../core/execution-mode.js';
+import { protectClobClient, protectWallet } from '../core/write-barrier.js';
 import { RateLimiter, ApiType } from '../core/rate-limiter.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
 import { CACHE_TTL } from '../core/unified-cache.js';
@@ -170,7 +172,7 @@ export class TradingService {
     private cache: UnifiedCache,
     private config: TradingServiceConfig
   ) {
-    this.wallet = new Wallet(config.privateKey);
+    this.wallet = protectWallet(new Wallet(config.privateKey));
     this.chainId = (config.chainId || POLYGON_MAINNET) as Chain;
     this.credentials = config.credentials || null;
   }
@@ -183,7 +185,7 @@ export class TradingService {
     if (this.initialized) return;
 
     // Create CLOB client with L1 auth (wallet)
-    this.clobClient = new ClobClient(CLOB_HOST, this.chainId, this.wallet);
+    this.clobClient = protectClobClient(new ClobClient(CLOB_HOST, this.chainId, this.wallet));
 
     // Get or create API credentials
     // We use derive-first strategy (opposite of official createOrDeriveApiKey)
@@ -198,7 +200,7 @@ export class TradingService {
     }
 
     // Re-initialize with L2 auth (credentials)
-    this.clobClient = new ClobClient(
+    this.clobClient = protectClobClient(new ClobClient(
       CLOB_HOST,
       this.chainId,
       this.wallet,
@@ -207,7 +209,7 @@ export class TradingService {
         secret: this.credentials.secret,
         passphrase: this.credentials.passphrase,
       }
-    );
+    ));
 
     this.initialized = true;
   }
@@ -308,6 +310,7 @@ export class TradingService {
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
       try {
+        executionMode.assertCanWrite('TradingService.createLimitOrder');
         const [tickSize, negRisk] = await Promise.all([
           this.getTickSize(params.tokenId),
           this.isNegRisk(params.tokenId),
@@ -369,6 +372,7 @@ export class TradingService {
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
       try {
+        executionMode.assertCanWrite('TradingService.createMarketOrder');
         const [tickSize, negRisk] = await Promise.all([
           this.getTickSize(params.tokenId),
           this.isNegRisk(params.tokenId),

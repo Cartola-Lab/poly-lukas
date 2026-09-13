@@ -12,6 +12,7 @@
 
 import { ethers } from 'ethers';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
+import { protectWallet } from '../core/write-barrier.js';
 import {
   CTF_CONTRACT,
   NEG_RISK_CTF_EXCHANGE,
@@ -110,7 +111,7 @@ export class AuthorizationService {
   private provider: ethers.providers.Provider;
 
   constructor(signer: ethers.Wallet, config: AuthorizationServiceConfig = {}) {
-    this.signer = signer;
+    this.signer = protectWallet(signer);
     this.provider = config.provider || signer.provider || new ethers.providers.JsonRpcProvider(resolvePolygonRpcUrl());
   }
 
