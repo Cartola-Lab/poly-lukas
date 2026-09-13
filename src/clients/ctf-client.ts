@@ -596,8 +596,7 @@ export class CTFClient {
   }
 
   /**
-   * V2.3C1c: canonical STANDARD redeem through the CtfCollateralAdapter.
-   *
+   * V2.3C1c/C2d: canonical redeem through the selected collateral adapter.
    * The adapter pulls the caller's FULL balances of BOTH outcome positions
    * (no amount parameter). Balances are snapshot before the transaction and
    * reported in the result for truthful accounting.
@@ -616,8 +615,8 @@ export class CTFClient {
       await sendCtfOperatorApprovalTx(this.wallet, this.provider, adapter.address);
     }
 
-    const standardAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
-    const tx = await standardAdapter.redeemPositions(
+    const lifecycleAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
+    const tx = await lifecycleAdapter.redeemPositions(
       USDC_CONTRACT,
       ethers.constants.HashZero,
       conditionId,
@@ -676,7 +675,11 @@ export class CTFClient {
     outcome?: string,
     routing?: LifecycleRouting
   ): Promise<RedeemResult> {
-    const adapter = this.resolveStandardRedeemAdapter(routing);
+    // V2.3C1c/C2d: both market types must redeem through a V2 collateral
+    // adapter via redeemByTokenIds. Standard uses CtfCollateralAdapter; neg-risk
+    // uses NegRiskCtfCollateralAdapter. Unknown routing fails closed.
+    // Generic redeem() for neg-risk remains blocked.
+    const adapter = resolveLifecycleAdapter(routing); // fails closed on non-boolean routing
     const resolution = await this.getMarketResolution(conditionId);
     if (!resolution.isResolved) {
       throw new Error('Market is not resolved yet');

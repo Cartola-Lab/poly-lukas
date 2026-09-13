@@ -198,12 +198,19 @@ describe('V2.3C1c standard redeem through CtfCollateralAdapter (offline)', () =>
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('NEG-RISK fails closed without any broadcast or read', async () => {
+  it('neg-risk generic redeem() remains fail-closed; redeemByTokenIds routes to NegRisk adapter', async () => {
     const { ctf } = await setup('LIVE');
+    // Generic redeem() for neg-risk is still blocked.
     await expect(ctf.redeem(condition, undefined, { negRisk: true })).rejects.toThrow(/not implemented yet/);
-    await expect(ctf.redeemByTokenIds(condition, ids, undefined, { negRisk: true })).rejects.toThrow(/not implemented yet/);
     expect(send).not.toHaveBeenCalled();
     expect(reads).toHaveLength(0);
+    // redeemByTokenIds with neg-risk now routes to the NegRiskCtfCollateralAdapter.
+    operatorApproved = true;
+    const result = await ctf.redeemByTokenIds(condition, ids, undefined, { negRisk: true });
+    expect(result.success).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    const to = String(await send.mock.calls[0][0].to).toLowerCase();
+    expect(to).toBe('0xAdA200001000ef00D07553cEE7006808F895c6F1'.toLowerCase());
   });
 
   it('UNKNOWN routing fails closed without any broadcast or read', async () => {

@@ -352,11 +352,18 @@ describe('V2.3A negRisk routing propagation (offline CLOB fixtures)', () => {
     expect(negRiskMergeData.startsWith(utils.id('mergePositions(address,bytes32,bytes32,uint256[],uint256)').slice(0, 10))).toBe(true);
     expect(String(await send.mock.calls[0][0].to).toLowerCase()).toBe('0xada200001000ef00d07553cee7006808f895c6f1');
 
-    // Redeem with standard routing: V2.3C1c adapter path (CtfCollateralAdapter
-    // redeemPositions). Neg-risk redeem fails closed.
+    // Redeem with routing: generic neg-risk redeem() still fails closed;
+    // neg-risk redeemByTokenIds routes to the NegRiskCtfCollateralAdapter.
     send.mockClear();
-    await expect(ctf.redeemByTokenIds(condition, ids, undefined, { negRisk: true })).rejects.toThrow(/not implemented yet/);
+    await expect(ctf.redeem(condition, undefined, { negRisk: true })).rejects.toThrow(/not implemented yet/);
     expect(send).not.toHaveBeenCalled();
+    send.mockClear();
+    const negRiskRedeem = await ctf.redeemByTokenIds(condition, ids, undefined, { negRisk: true });
+    expect(negRiskRedeem.success).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    const negRiskRedeemData = String(await send.mock.calls[0][0].data);
+    expect(negRiskRedeemData.startsWith(utils.id('redeemPositions(address,bytes32,bytes32,uint256[])').slice(0, 10))).toBe(true);
+    expect(String(await send.mock.calls[0][0].to).toLowerCase()).toBe('0xada200001000ef00d07553cee7006808f895c6f1');
     send.mockClear();
     const redeem = await ctf.redeemByTokenIds(condition, ids, undefined, { negRisk: false });
     expect(redeem.success).toBe(true);
