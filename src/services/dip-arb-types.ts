@@ -229,6 +229,8 @@ export interface DipArbMarketConfig {
   upTokenId: string;
   /** DOWN token ID */
   downTokenId: string;
+  /** Whether this is a neg-risk market (from CLOB metadata) */
+  negRisk?: boolean;
   /** 底层资产 */
   underlying: DipArbUnderlying;
   /** 市场时长（分钟） */

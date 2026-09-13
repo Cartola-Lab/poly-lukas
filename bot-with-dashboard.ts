@@ -1727,8 +1727,9 @@ async function main() {
 
         log('CHAIN', `Found market: ${market.question} (Tokens: ${tokenIds.yesTokenId.slice(0, 10)}... / ${tokenIds.noTokenId.slice(0, 10)}...)`);
 
-        // 2. Redeem using Polymarket Token IDs
-        const result = await ctfClient.redeemByTokenIds(conditionId, tokenIds);
+        // 2. Redeem using Polymarket Token IDs (V2.3A: neg-risk routing from CLOB metadata)
+        const routing = typeof market.negRisk === 'boolean' ? { negRisk: market.negRisk } : undefined;
+        const result = await ctfClient.redeemByTokenIds(conditionId, tokenIds, undefined, routing);
 
         if (result.success) {
           log('CHAIN', `✅ Redeemed! ${result.tokensRedeemed} tokens → ${result.usdcReceived} USDC`);

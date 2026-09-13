@@ -49,6 +49,7 @@ import {
   type GasEstimate,
   type TransactionStatus,
   type TokenIds,
+  type LifecycleRouting,
 } from '../clients/ctf-client.js';
 
 import {
@@ -260,8 +261,8 @@ export class OnchainService {
    * @param amount - USDC amount (e.g., "100" for 100 USDC)
    * @returns SplitResult with transaction details
    */
-  async split(conditionId: string, amount: string): Promise<SplitResult> {
-    return this.ctfClient.split(conditionId, amount);
+  async split(conditionId: string, amount: string, routing?: LifecycleRouting): Promise<SplitResult> {
+    return this.ctfClient.split(conditionId, amount, routing);
   }
 
   /**
@@ -271,8 +272,8 @@ export class OnchainService {
    * @param amount - Number of token pairs to merge
    * @returns MergeResult with transaction details
    */
-  async merge(conditionId: string, amount: string): Promise<MergeResult> {
-    return this.ctfClient.merge(conditionId, amount);
+  async merge(conditionId: string, amount: string, routing?: LifecycleRouting): Promise<MergeResult> {
+    return this.ctfClient.merge(conditionId, amount, routing);
   }
 
   /**
@@ -284,9 +285,10 @@ export class OnchainService {
   async mergeByTokenIds(
     conditionId: string,
     tokenIds: TokenIds,
-    amount: string
+    amount: string,
+    routing?: LifecycleRouting
   ): Promise<MergeResult> {
-    return this.ctfClient.mergeByTokenIds(conditionId, tokenIds, amount);
+    return this.ctfClient.mergeByTokenIds(conditionId, tokenIds, amount, routing);
   }
 
   /**
@@ -297,8 +299,8 @@ export class OnchainService {
    * @param conditionId - Market condition ID
    * @param outcome - Optional: Specific outcome to redeem (e.g., "YES", "UP", "TEAM A")
    */
-  async redeem(conditionId: string, outcome?: string): Promise<RedeemResult> {
-    return this.ctfClient.redeem(conditionId, outcome);
+  async redeem(conditionId: string, outcome?: string, routing?: LifecycleRouting): Promise<RedeemResult> {
+    return this.ctfClient.redeem(conditionId, outcome, routing);
   }
 
   /**
@@ -314,9 +316,10 @@ export class OnchainService {
   async redeemByTokenIds(
     conditionId: string,
     tokenIds: TokenIds,
-    outcome?: string
+    outcome?: string,
+    routing?: LifecycleRouting
   ): Promise<RedeemResult> {
-    return this.ctfClient.redeemByTokenIds(conditionId, tokenIds, outcome);
+    return this.ctfClient.redeemByTokenIds(conditionId, tokenIds, outcome, routing);
   }
 
   // ===== Balances =====
@@ -420,8 +423,8 @@ export class OnchainService {
   /**
    * Check if a market is resolved and get payout info
    */
-  async getMarketResolution(conditionId: string): Promise<MarketResolution> {
-    return this.ctfClient.getMarketResolution(conditionId);
+  async getMarketResolution(conditionId: string, routing?: LifecycleRouting): Promise<MarketResolution> {
+    return this.ctfClient.getMarketResolution(conditionId, routing);
   }
 
   // ===== Gas Estimation =====

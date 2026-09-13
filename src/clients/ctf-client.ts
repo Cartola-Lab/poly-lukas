@@ -170,6 +170,19 @@ export interface TokenIds {
   noTokenId: string;
 }
 
+/**
+ * Market identity used to route lifecycle operations in CLOB V2.
+ *
+ * Standard markets must eventually use `CtfCollateralAdapter` and neg-risk
+ * markets `NegRiskCtfCollateralAdapter`; position IDs differ between the two.
+ * V2.3A only propagates this value to the lifecycle boundary — transactions
+ * still target the legacy CTF contracts until adapter routing lands.
+ */
+export interface LifecycleRouting {
+  /** Whether the market is a neg-risk market (from CLOB metadata). */
+  negRisk: boolean;
+}
+
 export interface MarketResolution {
   conditionId: string;
   isResolved: boolean;
@@ -303,7 +316,8 @@ export class CTFClient {
     return result;
   }
 
-  async split(conditionId: string, amount: string): Promise<SplitResult> {
+  async split(conditionId: string, amount: string, routing?: LifecycleRouting): Promise<SplitResult> {
+    void routing; // V2.3A: plumbing only; legacy split behavior unchanged.
     const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
     const balance = await this.usdcContract.balanceOf(this.wallet.address);
@@ -342,7 +356,8 @@ export class CTFClient {
     };
   }
 
-  async merge(conditionId: string, amount: string): Promise<MergeResult> {
+  async merge(conditionId: string, amount: string, routing?: LifecycleRouting): Promise<MergeResult> {
+    void routing; // V2.3A: plumbing only; legacy merge behavior unchanged.
     const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
     const balances = await this.getPositionBalance(conditionId);
@@ -375,7 +390,8 @@ export class CTFClient {
     };
   }
 
-  async mergeByTokenIds(conditionId: string, tokenIds: TokenIds, amount: string): Promise<MergeResult> {
+  async mergeByTokenIds(conditionId: string, tokenIds: TokenIds, amount: string, routing?: LifecycleRouting): Promise<MergeResult> {
+    void routing; // V2.3A: plumbing only; legacy merge behavior unchanged.
     const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
     const balances = await this.getPositionBalanceByTokenIds(conditionId, tokenIds);
@@ -408,7 +424,8 @@ export class CTFClient {
     };
   }
 
-  async redeem(conditionId: string, outcome?: string): Promise<RedeemResult> {
+  async redeem(conditionId: string, outcome?: string, routing?: LifecycleRouting): Promise<RedeemResult> {
+    void routing; // V2.3A: plumbing only; legacy redeem behavior unchanged.
     const resolution = await this.getMarketResolution(conditionId);
     if (!resolution.isResolved) {
       throw new Error('Market is not resolved yet');
@@ -451,8 +468,10 @@ export class CTFClient {
   async redeemByTokenIds(
     conditionId: string,
     tokenIds: TokenIds,
-    outcome?: string
+    outcome?: string,
+    routing?: LifecycleRouting
   ): Promise<RedeemResult> {
+    void routing; // V2.3A: plumbing only; legacy redeem behavior unchanged.
     const resolution = await this.getMarketResolution(conditionId);
     if (!resolution.isResolved) {
       throw new Error('Market is not resolved yet');
@@ -528,7 +547,8 @@ export class CTFClient {
     };
   }
 
-  async getMarketResolution(conditionId: string): Promise<MarketResolution> {
+  async getMarketResolution(conditionId: string, routing?: LifecycleRouting): Promise<MarketResolution> {
+    void routing; // V2.3A: plumbing only; resolution reads still hit the legacy CTF.
     const [yesNumerator, noNumerator, denominator] = await Promise.all([
       this.ctfContract.payoutNumerators(conditionId, 0),
       this.ctfContract.payoutNumerators(conditionId, 1),

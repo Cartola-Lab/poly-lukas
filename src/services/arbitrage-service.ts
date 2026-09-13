@@ -27,7 +27,7 @@ import {
 } from './realtime-service-v2.js';
 import { TradingService } from './trading-service.js';
 import { MarketService } from './market-service.js';
-import { CTFClient, type TokenIds } from '../clients/ctf-client.js';
+import { CTFClient, type TokenIds, type LifecycleRouting } from '../clients/ctf-client.js';
 import { GammaApiClient } from '../clients/gamma-api.js';
 import { RateLimiter } from '../core/rate-limiter.js';
 import { createUnifiedCache } from '../core/unified-cache.js';
@@ -54,6 +54,8 @@ export interface ArbitrageMarketConfig {
   noTokenId: string;
   /** Outcome names [YES, NO] */
   outcomes?: [string, string];
+  /** Whether this is a neg-risk market (from CLOB metadata) */
+  negRisk?: boolean;
 }
 
 export interface ArbitrageServiceConfig {
@@ -816,7 +818,7 @@ export class ArbitrageService extends EventEmitter {
 
       switch (rebalanceAction.type) {
         case 'split': {
-          const result = await this.ctf.split(this.market.conditionId, rebalanceAction.amount.toString());
+          const result = await this.ctf.split(this.market.conditionId, rebalanceAction.amount.toString(), this.toLifecycleRouting(this.market));
           txHash = result.txHash;
           this.log(`   ✅ Split TX: ${txHash}`);
           break;
@@ -829,7 +831,8 @@ export class ArbitrageService extends EventEmitter {
           const result = await this.ctf.mergeByTokenIds(
             this.market.conditionId,
             tokenIds,
-            rebalanceAction.amount.toString()
+            rebalanceAction.amount.toString(),
+            this.toLifecycleRouting(this.market)
           );
           txHash = result.txHash;
           this.log(`   ✅ Merge TX: ${txHash}`);
@@ -950,7 +953,8 @@ export class ArbitrageService extends EventEmitter {
         const mergeResult = await this.ctf.mergeByTokenIds(
           targetMarket.conditionId,
           tokenIds,
-          mergeAmount.toString()
+          mergeAmount.toString(),
+          this.toLifecycleRouting(targetMarket)
         );
         result.merged = true;
         result.mergeAmount = mergeAmount;
@@ -1069,7 +1073,7 @@ export class ArbitrageService extends EventEmitter {
     let winningOutcome: string | undefined;
 
     try {
-      const resolution = await this.ctf.getMarketResolution(market.conditionId);
+      const resolution = await this.ctf.getMarketResolution(market.conditionId, this.toLifecycleRouting(market));
       marketStatus = resolution.isResolved ? 'resolved' : 'active';
       winningOutcome = resolution.winningOutcome;
       this.log(`   Status: ${marketStatus}${resolution.isResolved ? ` (Winner: ${winningOutcome})` : ''}`);
@@ -1173,7 +1177,7 @@ export class ArbitrageService extends EventEmitter {
       const winningBalance = winningOutcome === 'YES' ? yesBalance : noBalance;
       if (winningBalance >= 0.001) {
         try {
-          const redeemResult = await this.ctf.redeem(market.conditionId);
+          const redeemResult = await this.ctf.redeem(market.conditionId, undefined, this.toLifecycleRouting(market));
           actions.push({
             type: 'redeem',
             amount: winningBalance,
@@ -1207,7 +1211,8 @@ export class ArbitrageService extends EventEmitter {
           const mergeResult = await this.ctf.mergeByTokenIds(
             market.conditionId,
             tokenIds,
-            mergeAmount.toString()
+            mergeAmount.toString(),
+            this.toLifecycleRouting(market)
           );
           actions.push({
             type: 'merge',
@@ -1592,7 +1597,8 @@ export class ArbitrageService extends EventEmitter {
           const mergeResult = await this.ctf!.mergeByTokenIds(
             this.market!.conditionId,
             tokenIds,
-            mergeSize.toString()
+            mergeSize.toString(),
+            this.toLifecycleRouting(this.market)
           );
           txHashes.push(mergeResult.txHash);
           this.log(`     TX: ${mergeResult.txHash}`);
@@ -1765,6 +1771,15 @@ export class ArbitrageService extends EventEmitter {
     }
   }
 
+  /**
+   * V2.3A: explicit lifecycle routing from market metadata.
+   * Returns undefined when the market type is unknown (no silent false default).
+   */
+  private toLifecycleRouting(market: ArbitrageMarketConfig | null): LifecycleRouting | undefined {
+    if (!market || typeof market.negRisk !== 'boolean') return undefined;
+    return { negRisk: market.negRisk };
+  }
+
   // ===== Market Scanning Methods =====
 
   /**
@@ -1889,6 +1904,7 @@ export class ArbitrageService extends EventEmitter {
           yesTokenId: yesToken.tokenId,
           noTokenId: noToken.tokenId,
           outcomes: gammaMarket.outcomes as [string, string],
+          negRisk: clobMarket.negRisk,
         };
 
         const longCost = effectivePrices.effectiveBuyYes + effectivePrices.effectiveBuyNo;

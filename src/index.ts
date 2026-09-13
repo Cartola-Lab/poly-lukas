@@ -304,6 +304,7 @@ export type {
   GasEstimate,
   TransactionStatus,
   TokenIds,
+  LifecycleRouting,
 } from './clients/ctf-client.js';
 export { RevertReason } from './clients/ctf-client.js';
 

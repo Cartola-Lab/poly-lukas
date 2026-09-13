@@ -444,6 +444,12 @@ export interface UnifiedMarket {
   closed: boolean;
   /** Whether market is accepting orders */
   acceptingOrders: boolean;
+  /**
+   * Whether this is a neg-risk market (from CLOB metadata).
+   * Required for CLOB V2 lifecycle routing (standard vs neg-risk adapter).
+   * Undefined only when the market came exclusively from Gamma data.
+   */
+  negRisk?: boolean;
   /** Market end date */
   endDate: Date;
   /** Data source indicator */

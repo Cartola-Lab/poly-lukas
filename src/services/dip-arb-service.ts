@@ -38,7 +38,7 @@ import {
 } from './realtime-service-v2.js';
 import { TradingService, type MarketOrderParams } from './trading-service.js';
 import { MarketService } from './market-service.js';
-import { CTFClient } from '../clients/ctf-client.js';
+import { CTFClient, type LifecycleRouting } from '../clients/ctf-client.js';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
 import { estimateTakerFee, calculateNetLongArbProfit } from '../utils/price-utils.js';
 import type { Side } from '../core/types.js';
@@ -269,6 +269,7 @@ export class DipArbService extends EventEmitter {
                 conditionId: gm.conditionId,
                 upTokenId: upToken.tokenId,
                 downTokenId: downToken.tokenId,
+                negRisk: market.negRisk,
                 underlying: parseUnderlyingFromSlug(gm.slug),
                 durationMinutes: parseDurationFromSlug(gm.slug),
                 endTime: gm.endDate,
@@ -473,7 +474,8 @@ export class DipArbService extends EventEmitter {
           const result = await this.ctf.mergeByTokenIds(
             this.market.conditionId,
             tokenIds,
-            pairsToMerge.toString()
+            pairsToMerge.toString(),
+            this.toLifecycleRouting(this.market)
           );
 
           if (result.success) {
@@ -1026,7 +1028,8 @@ export class DipArbService extends EventEmitter {
       const result = await this.ctf.mergeByTokenIds(
         this.market.conditionId,
         tokenIds,
-        shares.toString()
+        shares.toString(),
+        this.toLifecycleRouting(this.market)
       );
 
       if (result.success) {
@@ -1807,7 +1810,7 @@ export class DipArbService extends EventEmitter {
 
           // If we have any tokens, check if market is resolved
           if (upBalance > 0.01 || downBalance > 0.01) {
-            const resolution = await this.ctf.getMarketResolution(market.conditionId);
+            const resolution = await this.ctf.getMarketResolution(market.conditionId, this.toLifecycleRouting(market));
 
             if (resolution.isResolved) {
               // Check if we have winning tokens
@@ -1844,7 +1847,8 @@ export class DipArbService extends EventEmitter {
                 const result = await this.ctf.mergeByTokenIds(
                   market.conditionId,
                   tokenIds,
-                  pairsToMerge.toString()
+                  pairsToMerge.toString(),
+                  this.toLifecycleRouting(market)
                 );
                 if (result.success) {
                   this.log(`✅ Merged ${pairsToMerge.toFixed(2)} pairs from ${market.slug}`);
@@ -2057,7 +2061,7 @@ export class DipArbService extends EventEmitter {
         }
 
         // Check if market is resolved
-        const resolution = await this.ctf.getMarketResolution(pending.market.conditionId);
+        const resolution = await this.ctf.getMarketResolution(pending.market.conditionId, this.toLifecycleRouting(pending.market));
 
         if (!resolution.isResolved) {
           this.log(`Pending redemption ${pending.market.slug}: market not yet resolved (retry ${pending.retryCount})`);
@@ -2083,7 +2087,7 @@ export class DipArbService extends EventEmitter {
           yesTokenId: pending.market.upTokenId,
           noTokenId: pending.market.downTokenId,
         };
-        const result = await this.ctf.redeemByTokenIds(pending.market.conditionId, tokenIds);
+        const result = await this.ctf.redeemByTokenIds(pending.market.conditionId, tokenIds, undefined, this.toLifecycleRouting(pending.market));
 
         // Remove from queue
         this.pendingRedemptions.splice(i, 1);
@@ -2270,7 +2274,7 @@ export class DipArbService extends EventEmitter {
 
     try {
       // Check market resolution first
-      const resolution = await this.ctf.getMarketResolution(this.market.conditionId);
+      const resolution = await this.ctf.getMarketResolution(this.market.conditionId, this.toLifecycleRouting(this.market));
 
       if (!resolution.isResolved) {
         return {
@@ -2287,7 +2291,7 @@ export class DipArbService extends EventEmitter {
         noTokenId: this.market.downTokenId,
       };
 
-      const result = await this.ctf.redeemByTokenIds(this.market.conditionId, tokenIds);
+      const result = await this.ctf.redeemByTokenIds(this.market.conditionId, tokenIds, undefined, this.toLifecycleRouting(this.market));
 
       return {
         success: result.success,
@@ -2456,6 +2460,15 @@ export class DipArbService extends EventEmitter {
     } else {
       console.log(formatted);
     }
+  }
+
+  /**
+   * V2.3A: explicit lifecycle routing from market metadata.
+   * Returns undefined when the market type is unknown (no silent false default).
+   */
+  private toLifecycleRouting(market: DipArbMarketConfig | null): LifecycleRouting | undefined {
+    if (!market || typeof market.negRisk !== 'boolean') return undefined;
+    return { negRisk: market.negRisk };
   }
 }
 

@@ -1532,6 +1532,7 @@ export class MarketService {
       active: clob.active,
       closed: clob.closed,
       acceptingOrders: clob.acceptingOrders,
+      negRisk: clob.negRisk,
       endDate: clob.endDateIso ? new Date(clob.endDateIso) : new Date(),
       source: 'merged',
     };
@@ -1588,6 +1589,7 @@ export class MarketService {
       active: clob.active,
       closed: clob.closed,
       acceptingOrders: clob.acceptingOrders,
+      negRisk: clob.negRisk,
       endDate: clob.endDateIso ? new Date(clob.endDateIso) : new Date(),
       source: 'clob',
     };
