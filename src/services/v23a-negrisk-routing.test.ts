@@ -338,11 +338,16 @@ describe('V2.3A negRisk routing propagation (offline CLOB fixtures)', () => {
     expect(mergeData.startsWith(utils.id('mergePositions(address,bytes32,bytes32,uint256[],uint256)').slice(0, 10))).toBe(true);
     expect(String(await send.mock.calls[0][0].to).toLowerCase()).toBe('0xada100874d00e3331d00f2007a9c336a65009718');
 
-    // Redeem with routing: legacy redeemPositions call.
+    // Redeem with standard routing: V2.3C1c adapter path (CtfCollateralAdapter
+    // redeemPositions). Neg-risk redeem fails closed.
     send.mockClear();
-    const redeem = await ctf.redeemByTokenIds(condition, ids, undefined, { negRisk: true });
+    await expect(ctf.redeemByTokenIds(condition, ids, undefined, { negRisk: true })).rejects.toThrow(/not implemented yet/);
+    expect(send).not.toHaveBeenCalled();
+    send.mockClear();
+    const redeem = await ctf.redeemByTokenIds(condition, ids, undefined, { negRisk: false });
     expect(redeem.success).toBe(true);
     const redeemData = String(await send.mock.calls[0][0].data);
     expect(redeemData.startsWith(utils.id('redeemPositions(address,bytes32,bytes32,uint256[])').slice(0, 10))).toBe(true);
+    expect(String(await send.mock.calls[0][0].to).toLowerCase()).toBe('0xada100874d00e3331d00f2007a9c336a65009718');
   });
 });

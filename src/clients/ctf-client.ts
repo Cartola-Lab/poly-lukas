@@ -95,6 +95,7 @@ const CTF_ABI = [
 const STANDARD_CTF_ADAPTER_ABI = [
   'function splitPosition(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount) external',
   'function mergePositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount) external',
+  'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets) external',
 ];
 
 const ERC1155_ABI = [
@@ -188,8 +189,20 @@ export interface RedeemResult {
   txHash: string;
   /** Winning outcome (e.g., 'YES', 'NO', 'Up', 'Down', 'Team1', 'Team2') */
   outcome: string;
+  /** Full winning-side balance consumed by the redemption (reporting). */
   tokensRedeemed: string;
+  /**
+   * Collateral received after redemption. Standard-market adapter redeems
+   * return pUSD (V2.3C1c); legacy redeems historically returned USDC.e.
+   * Field name retained for compatibility.
+   */
   usdcReceived: string;
+  /**
+   * V2.3C1c full-balance accounting: the adapter consumes the caller's FULL
+   * balances of BOTH outcome positions (snapshot taken before the redeem).
+   */
+  yesTokensConsumed: string;
+  noTokensConsumed: string;
   gasUsed?: string;
 }
 
@@ -566,8 +579,70 @@ export class CTFClient {
     return this.standardMergePositions(conditionId, amountWei, adapter);
   }
 
+  /**
+   * V2.3C1c: routing guard for standard redeem. Fails closed before any
+   * balance read for neg-risk or unknown routing.
+   */
+  private resolveStandardRedeemAdapter(routing: LifecycleRouting | undefined): { name: string; address: string } {
+    if (!routing) {
+      throw new Error('Standard redeem requires lifecycle routing: market negRisk routing is unknown');
+    }
+    if (routing.negRisk === true) {
+      throw new Error('Neg-risk redeem is not implemented yet (V2.3C1c covers standard markets only)');
+    }
+    return resolveLifecycleAdapter(routing); // fails closed on non-boolean routing
+  }
+
+  /**
+   * V2.3C1c: canonical STANDARD redeem through the CtfCollateralAdapter.
+   *
+   * The adapter pulls the caller's FULL balances of BOTH outcome positions
+   * (no amount parameter). Balances are snapshot before the transaction and
+   * reported in the result for truthful accounting.
+   */
+  private async standardRedeemPositions(
+    conditionId: string,
+    yesBalanceWei: ethers.BigNumber,
+    noBalanceWei: ethers.BigNumber,
+    winningOutcome: string,
+    adapter: { name: string; address: string }
+  ): Promise<RedeemResult> {
+    // ERC1155 operator approval: the adapter pulls YES + NO from the EOA.
+    const conditionalTokens = new Contract(CTF_CONTRACT, ERC1155_ABI, this.provider);
+    const isOperator = await conditionalTokens.isApprovedForAll(this.wallet.address, adapter.address);
+    if (!isOperator) {
+      await sendCtfOperatorApprovalTx(this.wallet, this.provider, adapter.address);
+    }
+
+    const standardAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
+    const tx = await standardAdapter.redeemPositions(
+      USDC_CONTRACT,
+      ethers.constants.HashZero,
+      conditionId,
+      [1, 2],
+      await this.getGasOptions()
+    );
+
+    const receipt = await tx.wait();
+
+    // 1:1 payout for the winning side; pUSD is the user-facing output asset.
+    const winningBalanceWei = winningOutcome === 'YES' ? yesBalanceWei : noBalanceWei;
+    const winningBalance = ethers.utils.formatUnits(winningBalanceWei, USDC_DECIMALS);
+
+    return {
+      success: true,
+      txHash: receipt.transactionHash,
+      outcome: winningOutcome,
+      tokensRedeemed: winningBalance,
+      usdcReceived: winningBalance,
+      yesTokensConsumed: ethers.utils.formatUnits(yesBalanceWei, USDC_DECIMALS),
+      noTokensConsumed: ethers.utils.formatUnits(noBalanceWei, USDC_DECIMALS),
+      gasUsed: receipt.gasUsed.toString(),
+    };
+  }
+
   async redeem(conditionId: string, outcome?: string, routing?: LifecycleRouting): Promise<RedeemResult> {
-    void routing; // V2.3A: plumbing only; legacy redeem behavior unchanged.
+    const adapter = this.resolveStandardRedeemAdapter(routing);
     const resolution = await this.getMarketResolution(conditionId);
     if (!resolution.isResolved) {
       throw new Error('Market is not resolved yet');
@@ -577,34 +652,20 @@ export class CTFClient {
     if (!winningOutcome) {
       throw new Error('Could not determine winning outcome');
     }
+    if (outcome && resolution.winningOutcome && outcome !== resolution.winningOutcome) {
+      throw new Error(`Outcome mismatch: requested ${outcome}, but market resolved to ${resolution.winningOutcome}`);
+    }
 
     const balances = await this.getPositionBalance(conditionId);
-    const tokenBalance = winningOutcome === 'YES' ? balances.yesBalance : balances.noBalance;
+    const yesBalanceWei = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
+    const noBalanceWei = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
 
-    if (parseFloat(tokenBalance) === 0) {
+    const winningBalance = winningOutcome === 'YES' ? balances.yesBalance : balances.noBalance;
+    if (parseFloat(winningBalance) === 0) {
       throw new Error(`No ${winningOutcome} tokens to redeem`);
     }
 
-    const indexSets = winningOutcome === 'YES' ? [1] : [2];
-
-    const tx = await this.ctfContract.redeemPositions(
-      USDC_CONTRACT,
-      ethers.constants.HashZero,
-      conditionId,
-      indexSets,
-      await this.getGasOptions()
-    );
-
-    const receipt = await tx.wait();
-
-    return {
-      success: true,
-      txHash: receipt.transactionHash,
-      outcome: winningOutcome,
-      tokensRedeemed: tokenBalance,
-      usdcReceived: tokenBalance,
-      gasUsed: receipt.gasUsed.toString(),
-    };
+    return this.standardRedeemPositions(conditionId, yesBalanceWei, noBalanceWei, winningOutcome, adapter);
   }
 
   async redeemByTokenIds(
@@ -613,7 +674,7 @@ export class CTFClient {
     outcome?: string,
     routing?: LifecycleRouting
   ): Promise<RedeemResult> {
-    void routing; // V2.3A: plumbing only; legacy redeem behavior unchanged.
+    const adapter = this.resolveStandardRedeemAdapter(routing);
     const resolution = await this.getMarketResolution(conditionId);
     if (!resolution.isResolved) {
       throw new Error('Market is not resolved yet');
@@ -623,34 +684,20 @@ export class CTFClient {
     if (!winningOutcome) {
       throw new Error('Could not determine winning outcome');
     }
+    if (outcome && resolution.winningOutcome && outcome !== resolution.winningOutcome) {
+      throw new Error(`Outcome mismatch: requested ${outcome}, but market resolved to ${resolution.winningOutcome}`);
+    }
 
     const balances = await this.getPositionBalanceByTokenIds(conditionId, tokenIds);
-    const tokenBalance = winningOutcome === 'YES' ? balances.yesBalance : balances.noBalance;
+    const yesBalanceWei = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
+    const noBalanceWei = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
 
-    if (parseFloat(tokenBalance) === 0) {
+    const winningBalance = winningOutcome === 'YES' ? balances.yesBalance : balances.noBalance;
+    if (parseFloat(winningBalance) === 0) {
       throw new Error(`No ${winningOutcome} tokens to redeem`);
     }
 
-    const indexSets = winningOutcome === 'YES' ? [1] : [2];
-
-    const tx = await this.ctfContract.redeemPositions(
-      USDC_CONTRACT,
-      ethers.constants.HashZero,
-      conditionId,
-      indexSets,
-      await this.getGasOptions()
-    );
-
-    const receipt = await tx.wait();
-
-    return {
-      success: true,
-      txHash: receipt.transactionHash,
-      outcome: winningOutcome,
-      tokensRedeemed: tokenBalance,
-      usdcReceived: tokenBalance,
-      gasUsed: receipt.gasUsed.toString(),
-    };
+    return this.standardRedeemPositions(conditionId, yesBalanceWei, noBalanceWei, winningOutcome, adapter);
   }
 
   async getPositionBalance(conditionId: string): Promise<PositionBalance> {
