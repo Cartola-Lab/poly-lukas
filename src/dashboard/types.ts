@@ -26,7 +26,7 @@ export interface BotState {
   // v3.2 risk: chain-seeded exposure + PnL reconciliation
   totalExposureUsd: number;
   perMarketExposureUsd: Record<string, number>;
-  pnlBaselineUsdcE: number | null;
+  pnlBaselineCollateral: number | null;
 
   // Strategy stats
   smartMoneyTrades: number;
@@ -50,6 +50,7 @@ export interface BotState {
   // Balances
   usdcBalance: number;
   usdcEBalance: number;
+  pUsdBalance: number;
   maticBalance: number;
   unrealizedPnL: number;
 

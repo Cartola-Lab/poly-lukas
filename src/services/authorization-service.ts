@@ -4,24 +4,23 @@
  * Manages ERC20 and ERC1155 approvals required for trading on Polymarket.
  *
  * Required approvals for trading:
- * - ERC20 (USDC): Approve USDC spending for CTF Exchange, Neg Risk Exchange, etc.
+ * - ERC20 (pUSD): Approve spending for the two CLOB V2 exchanges.
  * - ERC1155 (Conditional Tokens): Approve operators for conditional token transfers
  *
  * @see https://docs.polymarket.com/
  */
 
 import { ethers } from 'ethers';
+import { getContractConfig, COLLATERAL_TOKEN_DECIMALS } from '@polymarket/clob-client-v2';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
 import { protectWallet } from '../core/write-barrier.js';
 import {
   CTF_CONTRACT,
-  NEG_RISK_CTF_EXCHANGE,
-  NEG_RISK_ADAPTER,
   USDC_CONTRACT,
 } from '../clients/ctf-client.js';
 
 // Contract addresses
-const CTF_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
+const { collateral: PUSD, exchangeV2: CTF_EXCHANGE, negRiskExchangeV2: NEG_RISK_CTF_EXCHANGE } = getContractConfig(137);
 const CONDITIONAL_TOKENS = CTF_CONTRACT;
 
 // ABIs
@@ -46,7 +45,7 @@ export interface AllowanceInfo {
 
 export interface AllowancesResult {
   wallet: string;
-  usdcBalance: string;
+  pUsdBalance: string;
   erc20Allowances: AllowanceInfo[];
   erc1155Approvals: AllowanceInfo[];
   tradingReady: boolean;
@@ -76,15 +75,12 @@ export interface AuthorizationServiceConfig {
 const ERC20_SPENDERS = [
   { name: 'CTF Exchange', address: CTF_EXCHANGE },
   { name: 'Neg Risk CTF Exchange', address: NEG_RISK_CTF_EXCHANGE },
-  { name: 'Neg Risk Adapter', address: NEG_RISK_ADAPTER },
-  { name: 'Conditional Tokens', address: CONDITIONAL_TOKENS },
 ];
 
 // Operators that need ERC1155 approval
 const ERC1155_OPERATORS = [
   { name: 'CTF Exchange', address: CTF_EXCHANGE },
   { name: 'Neg Risk CTF Exchange', address: NEG_RISK_CTF_EXCHANGE },
-  { name: 'Neg Risk Adapter', address: NEG_RISK_ADAPTER },
 ];
 
 /**
@@ -127,28 +123,30 @@ export class AuthorizationService {
    *
    * @returns Status of all allowances and whether trading is ready
    */
-  async checkAllowances(): Promise<AllowancesResult> {
+  async checkAllowances(amount = '1'): Promise<AllowancesResult> {
+    const required = ethers.utils.parseUnits(amount, COLLATERAL_TOKEN_DECIMALS);
+    if (required.lte(0)) throw new Error('Trading collateral amount must be positive');
     const walletAddress = this.signer.address;
 
-    const usdc = new ethers.Contract(USDC_CONTRACT, ERC20_ABI, this.provider);
+    const pusd = new ethers.Contract(PUSD, ERC20_ABI, this.provider);
     const conditionalTokens = new ethers.Contract(CONDITIONAL_TOKENS, ERC1155_ABI, this.provider);
 
-    // Check USDC balance
-    const balance = await usdc.balanceOf(walletAddress);
-    const balanceFormatted = ethers.utils.formatUnits(balance, 6);
+    // Check operational pUSD balance
+    const balance = await pusd.balanceOf(walletAddress);
+    const balanceFormatted = ethers.utils.formatUnits(balance, COLLATERAL_TOKEN_DECIMALS);
 
     // Check ERC20 allowances
     const erc20Allowances: AllowanceInfo[] = [];
     for (const spender of ERC20_SPENDERS) {
-      const allowance = await usdc.allowance(walletAddress, spender.address);
-      const allowanceNum = parseFloat(ethers.utils.formatUnits(allowance, 6));
+      const allowance = await pusd.allowance(walletAddress, spender.address);
+      const allowanceNum = parseFloat(ethers.utils.formatUnits(allowance, COLLATERAL_TOKEN_DECIMALS));
       const isUnlimited = allowanceNum > 1e12;
 
       erc20Allowances.push({
         contract: spender.name,
         address: spender.address,
-        approved: isUnlimited,
-        allowance: isUnlimited ? 'unlimited' : allowanceNum.toFixed(2),
+        approved: allowance.gte(required),
+        allowance: isUnlimited ? 'unlimited' : ethers.utils.formatUnits(allowance, COLLATERAL_TOKEN_DECIMALS),
       });
     }
 
@@ -166,9 +164,10 @@ export class AuthorizationService {
 
     // Determine issues
     const issues: string[] = [];
+    if (balance.lt(required)) issues.push(`Insufficient pUSD: need ${amount}`);
     for (const a of erc20Allowances) {
       if (!a.approved) {
-        issues.push(`ERC20: ${a.contract} needs USDC approval`);
+        issues.push(`ERC20: ${a.contract} needs pUSD approval`);
       }
     }
     for (const a of erc1155Approvals) {
@@ -181,7 +180,7 @@ export class AuthorizationService {
 
     return {
       wallet: walletAddress,
-      usdcBalance: balanceFormatted,
+      pUsdBalance: balanceFormatted,
       erc20Allowances,
       erc1155Approvals,
       tradingReady,
@@ -197,7 +196,7 @@ export class AuthorizationService {
   async approveAll(): Promise<ApprovalsResult> {
     const walletAddress = this.signer.address;
 
-    const usdc = new ethers.Contract(USDC_CONTRACT, ERC20_ABI, this.signer);
+    const pusd = new ethers.Contract(PUSD, ERC20_ABI, this.signer);
     const conditionalTokens = new ethers.Contract(CONDITIONAL_TOKENS, ERC1155_ABI, this.signer);
 
     // Get gas price with buffer
@@ -208,8 +207,8 @@ export class AuthorizationService {
     const erc20Results: ApprovalTxResult[] = [];
     for (const spender of ERC20_SPENDERS) {
       // Check current allowance
-      const allowance = await usdc.allowance(walletAddress, spender.address);
-      const allowanceNum = parseFloat(ethers.utils.formatUnits(allowance, 6));
+      const allowance = await pusd.allowance(walletAddress, spender.address);
+      const allowanceNum = parseFloat(ethers.utils.formatUnits(allowance, COLLATERAL_TOKEN_DECIMALS));
 
       if (allowanceNum > 1e12) {
         // Already approved
@@ -221,7 +220,7 @@ export class AuthorizationService {
       }
 
       try {
-        const tx = await usdc.approve(spender.address, ethers.constants.MaxUint256, {
+        const tx = await pusd.approve(spender.address, ethers.constants.MaxUint256, {
           gasPrice: adjustedGasPrice,
         });
         await tx.wait();
@@ -287,17 +286,27 @@ export class AuthorizationService {
       summary: allApproved
         ? newApprovals > 0
           ? `All approvals set. ${newApprovals} new approval(s) submitted.`
-          : 'All approvals already set. Ready to trade.'
+          : 'All trading approvals already set.'
         : 'Some approvals failed. Check the results for details.',
     };
   }
 
-  /**
-   * Approve USDC spending for a specific contract
-   *
-   * @param spenderAddress - The contract address to approve
-   * @param amount - The amount to approve (default: unlimited)
-   */
+  /** Approve operational pUSD only for a CLOB V2 exchange. */
+  async approvePusd(spenderAddress: string, amount: ethers.BigNumber = ethers.constants.MaxUint256): Promise<ApprovalTxResult> {
+    if (!ERC20_SPENDERS.some(s => s.address.toLowerCase() === spenderAddress.toLowerCase())) {
+      throw new Error('Not a CLOB V2 spender');
+    }
+    const token = new ethers.Contract(PUSD, ERC20_ABI, this.signer);
+    try {
+      const tx = await token.approve(spenderAddress, amount);
+      await tx.wait();
+      return { contract: spenderAddress, txHash: tx.hash, success: true };
+    } catch (err) {
+      return { contract: spenderAddress, success: false, error: err instanceof Error ? err.message : 'Unknown error' };
+    }
+  }
+
+  /** Utility approval for legacy USDC.e; not a CLOB V2 trading approval. */
   async approveUsdc(
     spenderAddress: string,
     amount: ethers.BigNumber = ethers.constants.MaxUint256

@@ -2,11 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import axios from 'axios';
 import { utils } from 'ethers';
 import { createHmac } from 'node:crypto';
+import { getContractConfig, AssetType } from '@polymarket/clob-client-v2';
 import type { RateLimiter } from '../core/rate-limiter.js';
 
 const key = '0x' + '11'.repeat(32);
 const credentials = { key: 'fixture-key', secret: 'dGVzdA==', passphrase: 'fixture-passphrase' };
 const originalAdapter = axios.defaults.adapter;
+const contracts = getContractConfig(137);
+const balanceResponse = { balance: '12500000', allowances: { [contracts.exchangeV2]: '12500000', [contracts.negRiskExchangeV2]: '9000000' } };
 const http = vi.fn();
 const unexpected: string[] = [];
 let derive = true;
@@ -36,7 +39,8 @@ beforeEach(() => {
         break;
       case 'post /auth/api-key': data = { apiKey: credentials.key, secret: credentials.secret, passphrase: credentials.passphrase }; break;
       case 'post /order': data = { success: true, orderID: 'fixture-order' }; break;
-      case 'get /balance-allowance': data = { balance: '100', allowances: { 'fixture-spender': '200' } }; break;
+      case 'get /balance-allowance': data = balanceResponse; break;
+      case 'get /balance-allowance/update': data = {}; break;
       case 'get /markets/condition-1': data = { condition_id: 'condition-1', tokens: [] }; break;
       default: unexpected.push(route); throw new Error(`Unexpected HTTP: ${route}`);
     }
@@ -116,8 +120,11 @@ describe('runtime CLOB V2 protocol with real SDK and fixture HTTP', () => {
       expect(utils.verifyTypedData(domain, types, value, request.headers.POLY_SIGNATURE)).toBe(service.getWallet().address);
     }
     // Auth domain v1 is distinct from the exchange order domain v2.
-    expect(await service.getBalanceAllowance('COLLATERAL')).toEqual({ balance: '100', allowance: undefined });
+    expect(await service.getBalanceAllowance('COLLATERAL')).toEqual(balanceResponse);
     expect(http.mock.calls.at(-1)![0].headers.POLY_API_KEY).toBe(credentials.key);
+    expect(http.mock.calls.at(-1)![0].params).toMatchObject({ asset_type: AssetType.COLLATERAL, signature_type: 0 });
+    await service.updateBalanceAllowance('COLLATERAL');
+    expect(http.mock.calls.at(-1)![0]).toMatchObject({ method: 'get', url: expect.stringContaining('/balance-allowance/update') });
   });
 
   it.each([false, true])('MarketService reads through V2 (wallet=%s)', async wallet => {

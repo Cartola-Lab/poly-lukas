@@ -108,8 +108,8 @@ describe('real clob-client-v2 1.1.0 with mocked HTTP only', () => {
 
   it.each(['DRY', 'HALT'] as const)('%s allows authenticated reads', async mode => {
     const { service } = await setup(mode);
-    http.mockResolvedValueOnce({ data: { balance: '100', allowance: '100' } });
-    expect(await service.getBalanceAllowance('COLLATERAL')).toEqual({ balance: '100', allowance: '100' });
+    http.mockResolvedValueOnce({ data: { balance: '100', allowances: { 'fixture-spender': '100' } } });
+    expect(await service.getBalanceAllowance('COLLATERAL')).toEqual({ balance: '100', allowances: { 'fixture-spender': '100' } });
     expect(http).toHaveBeenCalledWith(expect.objectContaining({ method: 'get' }));
   });
 

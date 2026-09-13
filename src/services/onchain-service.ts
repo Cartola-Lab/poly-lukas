@@ -218,8 +218,8 @@ export class OnchainService {
    *
    * @returns Status of all allowances and whether trading is ready
    */
-  async checkAllowances(): Promise<AllowancesResult> {
-    return this.authService.checkAllowances();
+  async checkAllowances(amount = '1'): Promise<AllowancesResult> {
+    return this.authService.checkAllowances(amount);
   }
 
   /**
@@ -321,9 +321,21 @@ export class OnchainService {
 
   // ===== Balances =====
 
-  /**
-   * Get USDC.e (bridged USDC) balance - the token used by Polymarket CTF
-   */
+  /** CLOB V2 operational collateral balance. */
+  async getPusdBalance(): Promise<string> {
+    return this.ctfClient.getPusdBalance();
+  }
+
+  /** Balance/approvals for CLOB trading, independent of legacy CTF and gas checks. */
+  async checkReadyForTrading(amount = '1'): Promise<AllowancesResult> {
+    return this.authService.checkAllowances(amount);
+  }
+
+  async approvePusd(spenderAddress: string, amount: ethers.BigNumber = ethers.constants.MaxUint256): Promise<ApprovalTxResult> {
+    return this.authService.approvePusd(spenderAddress, amount);
+  }
+
+  /** Get legacy USDC.e balance used by the unmigrated CTF lifecycle. */
   async getUsdcBalance(): Promise<string> {
     return this.ctfClient.getUsdcBalance();
   }
@@ -360,32 +372,20 @@ export class OnchainService {
   /**
    * Check if wallet is ready for CTF trading operations
    *
-   * Combines CTF readiness check with authorization status.
+   * Reports the legacy CTF client's USDC.e and gas readiness.
    *
    * @param minMatic - Minimum MATIC for gas, forwarded to the CTF check
    * (default: 0.01 to preserve legacy behavior).
    */
   async checkReadyForCTF(amount: string, minMatic = 0.01): Promise<ReadyStatus> {
-    // Check CTF readiness (balances)
     const ctfStatus = await this.ctfClient.checkReadyForCTF(amount, minMatic);
-
-    // Check authorization status
-    const authStatus = await this.authService.checkAllowances();
-
-    // Combine issues
-    const issues: string[] = [];
-    if (ctfStatus.suggestion) {
-      issues.push(ctfStatus.suggestion);
-    }
-    issues.push(...authStatus.issues);
-
     return {
-      ready: ctfStatus.ready && authStatus.tradingReady,
+      ready: ctfStatus.ready,
       usdcEBalance: ctfStatus.usdcEBalance,
       nativeUsdcBalance: ctfStatus.nativeUsdcBalance,
       maticBalance: ctfStatus.maticBalance,
-      tradingReady: authStatus.tradingReady,
-      issues,
+      tradingReady: ctfStatus.ready,
+      issues: ctfStatus.suggestion ? [ctfStatus.suggestion] : [],
       suggestion: ctfStatus.suggestion,
     };
   }

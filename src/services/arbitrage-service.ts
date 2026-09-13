@@ -213,7 +213,9 @@ export interface OrderbookState {
 }
 
 export interface BalanceState {
+  /** @deprecated Use pUsdBalance; this alias is CLOB collateral, not USDC.e. */
   usdc: number;
+  pUsdBalance: number;
   yesTokens: number;
   noTokens: number;
   lastUpdate: number;
@@ -304,6 +306,7 @@ export class ArbitrageService extends EventEmitter {
 
   private balance: BalanceState = {
     usdc: 0,
+    pUsdBalance: 0,
     yesTokens: 0,
     noTokens: 0,
     lastUpdate: 0,
@@ -415,13 +418,13 @@ export class ArbitrageService extends EventEmitter {
       await this.tradingService.initialize();
       this.log(`Wallet: ${this.ctf?.getAddress()}`);
       await this.updateBalance();
-      this.log(`USDC Balance: ${this.balance.usdc.toFixed(2)}`);
+      this.log(`pUSD Balance: ${this.balance.pUsdBalance.toFixed(2)}`);
       this.log(`YES Tokens: ${this.balance.yesTokens.toFixed(2)}`);
       this.log(`NO Tokens: ${this.balance.noTokens.toFixed(2)}`);
 
       // Calculate total capital (USDC + paired tokens)
       const pairedTokens = Math.min(this.balance.yesTokens, this.balance.noTokens);
-      this.totalCapital = this.balance.usdc + pairedTokens;
+      this.totalCapital = this.balance.pUsdBalance + pairedTokens;
       this.log(`Total Capital: ${this.totalCapital.toFixed(2)}`);
 
       // Start balance update interval
@@ -575,7 +578,7 @@ export class ArbitrageService extends EventEmitter {
     const orderbookLongSize = Math.min(yesAskDepth.size, noAskDepth.size);
     const orderbookShortSize = Math.min(yesBidDepth.size, noBidDepth.size);
     const heldPairs = Math.min(this.balance.yesTokens, this.balance.noTokens);
-    const balanceLongSize = longCost > 0 ? this.balance.usdc / longCost : 0;
+    const balanceLongSize = longCost > 0 ? this.balance.pUsdBalance / longCost : 0;
 
     // Check long arb (fee-aware: gross edge must survive fees + gas)
     if (longProfit > this.config.profitThreshold) {
@@ -1477,13 +1480,14 @@ export class ArbitrageService extends EventEmitter {
         noTokenId: this.market.noTokenId,
       };
 
-      const [usdcBalance, positions] = await Promise.all([
-        this.ctf.getUsdcBalance(),
+      const [pUsdBalance, positions] = await Promise.all([
+        this.ctf.getPusdBalance(),
         this.ctf.getPositionBalanceByTokenIds(this.market.conditionId, tokenIds),
       ]);
 
       this.balance = {
-        usdc: parseFloat(usdcBalance),
+        usdc: parseFloat(pUsdBalance),
+        pUsdBalance: parseFloat(pUsdBalance),
         yesTokens: parseFloat(positions.yesBalance),
         noTokens: parseFloat(positions.noBalance),
         lastUpdate: Date.now(),
@@ -1506,14 +1510,14 @@ export class ArbitrageService extends EventEmitter {
       const { buyYes, buyNo } = opportunity.effectivePrices;
       const requiredUsdc = (buyYes + buyNo) * size;
 
-      if (this.balance.usdc < requiredUsdc) {
+      if (this.balance.pUsdBalance < requiredUsdc) {
         return {
           success: false,
           type: 'long',
           size,
           profit: 0,
           txHashes,
-          error: `Insufficient USDC.e: have ${this.balance.usdc.toFixed(2)}, need ${requiredUsdc.toFixed(2)}`,
+          error: `Insufficient pUSD: have ${this.balance.pUsdBalance.toFixed(2)}, need ${requiredUsdc.toFixed(2)}`,
           executionTimeMs: Date.now() - startTime,
         };
       }

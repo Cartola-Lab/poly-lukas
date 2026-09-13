@@ -17,6 +17,8 @@ import {
   Side as ClobSide,
   OrderType as ClobOrderType,
   Chain,
+  AssetType,
+  type BalanceAllowanceResponse,
   type OpenOrder,
   type Trade as ClobTrade,
   type TickSize,
@@ -579,18 +581,16 @@ export class TradingService {
   async getBalanceAllowance(
     assetType: 'COLLATERAL' | 'CONDITIONAL',
     tokenId?: string
-  ): Promise<{ balance: string; allowance?: string }> {
+  ): Promise<BalanceAllowanceResponse> {
     const client = await this.ensureInitialized();
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
       const result = await client.getBalanceAllowance({
-        asset_type: assetType as any,
+        asset_type: assetType === 'COLLATERAL' ? AssetType.COLLATERAL : AssetType.CONDITIONAL,
         token_id: tokenId,
       });
-      // V2 declares allowances per contract. Preserve an optional legacy field;
-      // selecting operational collateral/spenders belongs to the next migration.
-      const allowance = 'allowance' in result && typeof result.allowance === 'string'
-        ? result.allowance : undefined;
-      return { balance: result.balance, allowance };
+      // Preserve raw base-unit strings and the per-spender map from CLOB V2.
+      // This backend read/refresh is not an ERC20 approval transaction.
+      return result;
     });
   }
 

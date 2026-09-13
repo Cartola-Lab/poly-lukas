@@ -185,9 +185,9 @@ describe('checkExposure', () => {
 
 describe('checkPnlDrift', () => {
   const base = {
-    baselineUsdcE: 250,
+    baselineCollateral: 250,
     trackedPnl: 10,
-    liquidUsdcE: 240,
+    liquidCollateral: 240,
     openExposureUsd: 20,
     maxDriftUsd: 5,
     maxDriftPct: 0.02,
@@ -200,19 +200,19 @@ describe('checkPnlDrift', () => {
 
   it('breaches when drift exceeds tolerance', () => {
     // actual 230 vs expected 260 → drift 30 > max(5, 5)
-    const r = checkPnlDrift({ ...base, liquidUsdcE: 210 });
+    const r = checkPnlDrift({ ...base, liquidCollateral: 210 });
     expect(r.drift).toBeCloseTo(30, 10);
     expect(r.breached).toBe(true);
   });
 
   it('uses the relative tolerance when it dominates', () => {
     // tol = max(5, 250*0.02=5); drift 5.01 breaches
-    const r = checkPnlDrift({ ...base, liquidUsdcE: 234.99 });
+    const r = checkPnlDrift({ ...base, liquidCollateral: 234.99 });
     expect(r.breached).toBe(true);
   });
 
   it('fails open on non-finite inputs', () => {
-    const r = checkPnlDrift({ ...base, liquidUsdcE: NaN });
+    const r = checkPnlDrift({ ...base, liquidCollateral: NaN });
     expect(r).toEqual({ drift: 0, breached: false });
   });
 });

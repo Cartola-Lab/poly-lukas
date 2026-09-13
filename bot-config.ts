@@ -217,10 +217,11 @@ interface BotState {
   // Balances
   usdcBalance: number;
   usdcEBalance: number;
+  pUsdBalance: number;
   maticBalance: number;
 
   // 🔴 AUDIT #6: session baseline for on-chain PnL reconciliation (null = off)
-  pnlBaselineUsdcE: number | null;
+  pnlBaselineCollateral: number | null;
 
   // Analysis
   btcTrend: 'up' | 'down' | 'neutral';
@@ -261,8 +262,9 @@ const state: BotState = {
   swaps: 0,
   usdcBalance: 0,
   usdcEBalance: 0,
+  pUsdBalance: 0,
   maticBalance: 0,
-  pnlBaselineUsdcE: null,
+  pnlBaselineCollateral: null,
   totalExposureUsd: 0,
   perMarketExposureUsd: {},
   btcTrend: 'neutral',
@@ -523,25 +525,24 @@ async function monitorMatic() {
 }
 
 // 🔴 AUDIT #6: periodic on-chain PnL reconciliation. Compares account value
-// (liquid USDC.e + open exposure) against baseline + tracked realized PnL.
+// (liquid pUSD + open exposure) against baseline + tracked realized PnL.
 // Mid-session deposits/withdrawals look like drift — restart to rebaseline.
 async function reconcilePnl() {
-  if (!onchainService || CONFIG.dryRun || state.pnlBaselineUsdcE === null) return;
+  if (!onchainService || CONFIG.dryRun || state.pnlBaselineCollateral === null) return;
   try {
-    const balances = await onchainService.getTokenBalances();
-    const liquid = parseFloat(balances.usdcE);
+    const liquid = parseFloat(await onchainService.getPusdBalance());
     if (!Number.isFinite(liquid)) return;
-    state.usdcEBalance = liquid;
+    state.pUsdBalance = liquid;
     const { drift, breached } = checkPnlDrift({
-      baselineUsdcE: state.pnlBaselineUsdcE,
+      baselineCollateral: state.pnlBaselineCollateral,
       trackedPnl: state.totalPnL,
-      liquidUsdcE: liquid,
+      liquidCollateral: liquid,
       openExposureUsd: state.totalExposureUsd,
       maxDriftUsd: CONFIG.risk.maxPnlDriftUsd,
       maxDriftPct: CONFIG.risk.maxPnlDriftPct,
     });
     if (breached) {
-      log('WARN', `🔴 PnL drift $${drift.toFixed(2)} exceeds tolerance — tracked $${state.totalPnL.toFixed(2)} vs on-chain $${(liquid + state.totalExposureUsd - state.pnlBaselineUsdcE).toFixed(2)} — pausing 30m (restart to rebaseline after deposits/withdrawals)`);
+      log('WARN', `🔴 PnL drift $${drift.toFixed(2)} exceeds tolerance — tracked $${state.totalPnL.toFixed(2)} vs on-chain $${(liquid + state.totalExposureUsd - state.pnlBaselineCollateral).toFixed(2)} — pausing 30m (restart to rebaseline after deposits/withdrawals)`);
       state.isPaused = true;
       state.pauseUntil = Date.now() + 30 * 60 * 1000;
     } else {
@@ -739,24 +740,26 @@ async function setupOnchain() {
       rpcUrl: process.env.POLYGON_RPC_URL, // P8: configurable RPC (service falls back to default)
     });
 
-    // P12: enforce the configured MATIC floor (was hardcoded 0.01 vs minMatic 0.5)
-    const status = await onchainService.checkReadyForCTF('10', CONFIG.onchain.minMatic);
-    log('CHAIN', 'CTF Ready Status', {
-      ready: status.ready,
-      usdcE: status.usdcEBalance,
-      matic: status.maticBalance,
+    // Keep the configured gas warning separate from CLOB collateral readiness.
+    const status = await onchainService.checkReadyForTrading('10');
+    const matic = await onchainService.getMaticBalance();
+    if (parseFloat(matic) < CONFIG.onchain.minMatic) log('WARN', 'Low MATIC for on-chain gas');
+    log('CHAIN', 'CLOB Ready Status', {
+      ready: status.tradingReady,
+      pUSD: status.pUsdBalance,
+      matic,
       issues: status.issues,
     });
 
-    state.usdcEBalance = parseFloat(status.usdcEBalance);
-    state.maticBalance = parseFloat(status.maticBalance);
+    state.pUsdBalance = parseFloat(status.pUsdBalance);
+    state.maticBalance = parseFloat(matic);
     // 🔴 AUDIT #6: anchor the reconciliation baseline at startup.
-    if (Number.isFinite(state.usdcEBalance)) {
-      state.pnlBaselineUsdcE = state.usdcEBalance;
-      log('CHAIN', `PnL baseline anchored: $${state.pnlBaselineUsdcE!.toFixed(2)} USDC.e`);
+    if (Number.isFinite(state.pUsdBalance)) {
+      state.pnlBaselineCollateral = state.pUsdBalance;
+      log('CHAIN', `PnL baseline anchored: $${state.pnlBaselineCollateral!.toFixed(2)} pUSD`);
     }
 
-    if (!status.ready && CONFIG.onchain.autoApprove) {
+    if (!status.tradingReady && CONFIG.onchain.autoApprove) {
       log('CHAIN', 'Setting up approvals...');
       await onchainService.approveAll();
       log('CHAIN', 'Approvals complete');

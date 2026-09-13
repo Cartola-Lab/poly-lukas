@@ -192,7 +192,7 @@ const state: BotState = {
   // v3.2 risk: chain-seeded exposure + PnL reconciliation baseline
   totalExposureUsd: 0,
   perMarketExposureUsd: {},
-  pnlBaselineUsdcE: null,
+  pnlBaselineCollateral: null,
 
   smartMoneyTrades: 0,
   arbTrades: 0,
@@ -209,6 +209,7 @@ const state: BotState = {
   swaps: 0,
   usdcBalance: 0,
   usdcEBalance: 0,
+  pUsdBalance: 0,
   maticBalance: 0,
   unrealizedPnL: 0,
   btcTrend: 'neutral',
@@ -593,17 +594,16 @@ async function refreshExposure(sdk: PolymarketSDK) {
 // |(liquid + open exposure) − (baseline + tracked)| must stay within
 // max($tol, %tol); fail-open on bad data (a monitor must never halt on NaN).
 async function reconcilePnl() {
-  if (!onchainService || CONFIG.dryRun || state.pnlBaselineUsdcE === null) return;
+  if (!onchainService || CONFIG.dryRun || state.pnlBaselineCollateral === null) return;
   try {
-    const balances = await onchainService.getTokenBalances();
-    const liquid = parseFloat(balances.usdcE);
+    const liquid = parseFloat(await onchainService.getPusdBalance());
     if (!Number.isFinite(liquid)) return;
-    state.usdcEBalance = liquid;
+    state.pUsdBalance = liquid;
 
     const { drift, breached } = checkPnlDrift({
-      baselineUsdcE: state.pnlBaselineUsdcE,
+      baselineCollateral: state.pnlBaselineCollateral,
       trackedPnl: state.totalPnL,
-      liquidUsdcE: liquid,
+      liquidCollateral: liquid,
       openExposureUsd: state.totalExposureUsd,
       maxDriftUsd: CONFIG.risk.maxPnlDriftUsd,
       maxDriftPct: CONFIG.risk.maxPnlDriftPct,
@@ -1105,7 +1105,7 @@ async function updateBalances() {
   if (CONFIG.dryRun) {
     // SIMULATION: Mock balances
     // Base 10,000 + whatever PnL we've made in this session
-    state.usdcEBalance = 10000 + state.totalPnL;
+    state.pUsdBalance = 10000 + state.totalPnL;
     state.maticBalance = 100;
 
     // Only verify once/log sparsely
@@ -1166,11 +1166,7 @@ async function setupSwap() {
       usdce: `$${state.usdcEBalance.toFixed(2)}`,
     });
 
-    // Check for low USDC.e (Bridged) balance
-    if (!CONFIG.dryRun && state.usdcEBalance < 5) {
-      log('WARN', `⚠️ Low USDC.e balance ($${state.usdcEBalance.toFixed(2)}). Bot requires USDC.e (Bridged USDC) on Polygon.`);
-      log('WARN', `ℹ️ Please deposit USDC.e or swap your Native USDC to USDC.e manually.`);
-    }
+    // USDC.e is a utility balance; CLOB capital is checked in setupOnchain().
 
     // Poll balances every 30 seconds
     setInterval(updateBalances, 30000);
@@ -1195,7 +1191,7 @@ async function setupOnchain() {
     onchainService = onchain; // v3.2: module handle for reconcilePnl()
 
     if (CONFIG.onchain.autoApprove) {
-      log('CHAIN', 'Auto-approving Proxy and Exchange...');
+      log('CHAIN', 'Auto-approving CLOB V2 exchanges...');
       const result = await onchain.approveAll();
 
       if (result.allApproved) {
@@ -1223,11 +1219,11 @@ async function setupOnchain() {
     // v3.2 AUDIT #6: anchor PnL baseline from live on-chain balance
     // (session-scoped; restart to rebaseline after deposits/withdrawals)
     try {
-      const balances = await onchain.getTokenBalances();
-      const usdcE = parseFloat(balances.usdcE);
-      if (Number.isFinite(usdcE)) {
-        state.pnlBaselineUsdcE = usdcE;
-        log('CHAIN', `PnL baseline anchored: $${usdcE.toFixed(2)} USDC.e`);
+      const collateral = parseFloat(await onchain.getPusdBalance());
+      state.pUsdBalance = collateral;
+      if (Number.isFinite(collateral)) {
+        state.pnlBaselineCollateral = collateral;
+        log('CHAIN', `PnL baseline anchored: ${collateral.toFixed(2)} pUSD`);
       }
     } catch { /* reconcile loop will surface persistent failure */ }
   } catch (err) {

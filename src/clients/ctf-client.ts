@@ -1,5 +1,7 @@
 ﻿/**
- * CTF (Conditional Token Framework) Client
+ * Legacy CTF (Conditional Token Framework) Client
+ * CLOB V2 collateral uses the separate getPusdBalance() read; lifecycle below
+ * has not been migrated to the V2 collateral adapters.
  *
  * Provides on-chain operations for Polymarket's conditional tokens:
  * - Split: USDC → YES + NO token pair
@@ -24,6 +26,7 @@
  */
 
 import { ethers, Contract, Wallet, BigNumber } from 'ethers';
+import { getContractConfig, COLLATERAL_TOKEN_DECIMALS } from '@polymarket/clob-client-v2';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
 import { protectWallet } from '../core/write-barrier.js';
 
@@ -210,6 +213,13 @@ export class CTFClient {
 
   getAddress(): string {
     return this.wallet.address;
+  }
+
+  /** CLOB V2 collateral only; legacy CTF lifecycle retains USDC.e. */
+  async getPusdBalance(): Promise<string> {
+    const { collateral } = getContractConfig(this.provider.network.chainId);
+    const token = new Contract(collateral, ERC20_ABI, this.provider);
+    return ethers.utils.formatUnits(await token.balanceOf(this.wallet.address), COLLATERAL_TOKEN_DECIMALS);
   }
 
   async getUsdcBalance(): Promise<string> {

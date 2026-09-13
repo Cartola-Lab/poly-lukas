@@ -222,12 +222,12 @@ export function checkExposure(
 }
 
 export interface PnlReconciliation {
-  /** Liquid USDC.e at bot start (session baseline). */
-  baselineUsdcE: number;
+  /** Liquid trading collateral at bot start (session baseline). */
+  baselineCollateral: number;
   /** Cumulative tracked PnL since start (recordTrade sum). */
   trackedPnl: number;
-  /** Current liquid USDC.e on-chain. */
-  liquidUsdcE: number;
+  /** Current liquid trading collateral on-chain. */
+  liquidCollateral: number;
   /** Current open-position value (chain-seeded exposure). */
   openExposureUsd: number;
   /** Absolute drift tolerance in USD. */
@@ -245,12 +245,12 @@ export interface PnlReconciliation {
  * non-finite inputs: a monitor must never halt trading on bad data.
  */
 export function checkPnlDrift(r: PnlReconciliation): { drift: number; breached: boolean } {
-  const vals = [r.baselineUsdcE, r.trackedPnl, r.liquidUsdcE, r.openExposureUsd, r.maxDriftUsd, r.maxDriftPct];
+  const vals = [r.baselineCollateral, r.trackedPnl, r.liquidCollateral, r.openExposureUsd, r.maxDriftUsd, r.maxDriftPct];
   if (!vals.every(Number.isFinite)) return { drift: 0, breached: false };
-  const expected = r.baselineUsdcE + r.trackedPnl;
-  const actual = r.liquidUsdcE + r.openExposureUsd;
+  const expected = r.baselineCollateral + r.trackedPnl;
+  const actual = r.liquidCollateral + r.openExposureUsd;
   const drift = Math.abs(actual - expected);
-  const tol = Math.max(r.maxDriftUsd, Math.abs(r.baselineUsdcE) * r.maxDriftPct);
+  const tol = Math.max(r.maxDriftUsd, Math.abs(r.baselineCollateral) * r.maxDriftPct);
   return { drift, breached: drift > tol };
 }
 
