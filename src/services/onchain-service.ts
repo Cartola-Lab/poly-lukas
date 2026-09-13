@@ -57,6 +57,8 @@ import {
   type AllowancesResult,
   type ApprovalsResult,
   type ApprovalTxResult,
+  type LifecycleAdapterStatus,
+  type LifecycleApprovalsResult,
 } from './authorization-service.js';
 
 import {
@@ -119,6 +121,8 @@ export type {
   AllowancesResult,
   ApprovalsResult,
   ApprovalTxResult,
+  LifecycleAdapterStatus,
+  LifecycleApprovalsResult,
   SwapQuote,
   SwapResult,
   TokenBalance,
@@ -336,6 +340,28 @@ export class OnchainService {
 
   async approvePusd(spenderAddress: string, amount: ethers.BigNumber = ethers.constants.MaxUint256): Promise<ApprovalTxResult> {
     return this.authService.approvePusd(spenderAddress, amount);
+  }
+
+  /**
+   * V2.3B: check lifecycle collateral adapter approvals (pUSD ERC20 +
+   * ERC1155 operator) for the adapter selected by market routing.
+   * Separate from V2.2 CLOB trading approvals.
+   */
+  async checkLifecycleAdapterApprovals(
+    routing: LifecycleRouting | undefined,
+    amount = '1'
+  ): Promise<LifecycleAdapterStatus> {
+    return this.authService.checkLifecycleAdapterApprovals(routing, amount);
+  }
+
+  /**
+   * V2.3B: set lifecycle collateral adapter approvals for the adapter
+   * selected by market routing. Unknown routing fails closed.
+   */
+  async approveLifecycleAdapter(
+    routing: LifecycleRouting | undefined
+  ): Promise<LifecycleApprovalsResult> {
+    return this.authService.approveLifecycleAdapter(routing);
   }
 
   /** Get legacy USDC.e balance used by the unmigrated CTF lifecycle. */

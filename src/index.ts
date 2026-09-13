@@ -347,13 +347,19 @@ export type {
 } from './services/swap-service.js';
 
 // Authorization (ERC20/ERC1155 Approvals)
-export { AuthorizationService } from './services/authorization-service.js';
+export {
+  AuthorizationService,
+  CTF_COLLATERAL_ADAPTER,
+  NEG_RISK_CTF_COLLATERAL_ADAPTER,
+} from './services/authorization-service.js';
 export type {
   AllowanceInfo,
   AllowancesResult,
   ApprovalTxResult,
   ApprovalsResult,
   AuthorizationServiceConfig,
+  LifecycleAdapterStatus,
+  LifecycleApprovalsResult,
 } from './services/authorization-service.js';
 
 // OnchainService (Unified on-chain operations: CTF + Authorization + Swaps)

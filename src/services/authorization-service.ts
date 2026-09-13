@@ -17,11 +17,21 @@ import { protectWallet } from '../core/write-barrier.js';
 import {
   CTF_CONTRACT,
   USDC_CONTRACT,
+  type LifecycleRouting,
 } from '../clients/ctf-client.js';
 
 // Contract addresses
 const { collateral: PUSD, exchangeV2: CTF_EXCHANGE, negRiskExchangeV2: NEG_RISK_CTF_EXCHANGE } = getContractConfig(137);
 const CONDITIONAL_TOKENS = CTF_CONTRACT;
+
+/**
+ * V2.3B: CLOB V2 collateral adapter addresses for CTF lifecycle operations.
+ * Verified against the current Polymarket ctf-exchange-v2 deployment list.
+ * These are NOT trading exchanges; they must never enter the V2.2 trading
+ * approval allowlist and vice versa.
+ */
+export const CTF_COLLATERAL_ADAPTER = '0xADa100874d00e3331D00F2007a9c336a65009718';
+export const NEG_RISK_CTF_COLLATERAL_ADAPTER = '0xAdA200001000ef00D07553cEE7006808F895c6F1';
 
 // ABIs
 const ERC20_ABI = [
@@ -67,6 +77,30 @@ export interface ApprovalsResult {
   summary: string;
 }
 
+/** V2.3B: approval status for one lifecycle collateral adapter. */
+export interface LifecycleAdapterStatus {
+  adapter: string;
+  /** Human-readable adapter name (standard / neg-risk). */
+  adapterName: string;
+  /** pUSD ERC20 allowance for the adapter. */
+  pusdAllowance: AllowanceInfo;
+  /** ERC1155 operator approval on Conditional Tokens for the adapter. */
+  erc1155Approval: AllowanceInfo;
+  /** True when both approvals are sufficient for lifecycle operations. */
+  ready: boolean;
+  issues: string[];
+}
+
+/** V2.3B: outcome of lifecycle adapter approval setup for one adapter. */
+export interface LifecycleApprovalsResult {
+  wallet: string;
+  adapter: string;
+  erc20Approval: ApprovalTxResult;
+  erc1155Approval: ApprovalTxResult;
+  allApproved: boolean;
+  summary: string;
+}
+
 export interface AuthorizationServiceConfig {
   provider?: ethers.providers.Provider;
 }
@@ -81,6 +115,12 @@ const ERC20_SPENDERS = [
 const ERC1155_OPERATORS = [
   { name: 'CTF Exchange', address: CTF_EXCHANGE },
   { name: 'Neg Risk CTF Exchange', address: NEG_RISK_CTF_EXCHANGE },
+];
+
+// V2.3B lifecycle collateral adapters. Separate allowlist from trading spenders.
+const LIFECYCLE_ADAPTERS = [
+  { name: 'CTF Collateral Adapter', address: CTF_COLLATERAL_ADAPTER },
+  { name: 'Neg Risk CTF Collateral Adapter', address: NEG_RISK_CTF_COLLATERAL_ADAPTER },
 ];
 
 /**
@@ -304,6 +344,133 @@ export class AuthorizationService {
     } catch (err) {
       return { contract: spenderAddress, success: false, error: err instanceof Error ? err.message : 'Unknown error' };
     }
+  }
+
+  /**
+   * V2.3B: resolve exactly one lifecycle collateral adapter from market
+   * routing. Fails closed when routing is unknown — never defaults to
+   * the standard adapter.
+   */
+  private resolveLifecycleAdapter(routing: LifecycleRouting | undefined): { name: string; address: string } {
+    if (!routing || typeof routing.negRisk !== 'boolean') {
+      throw new Error('Cannot select a lifecycle collateral adapter: market negRisk routing is unknown');
+    }
+    return routing.negRisk ? LIFECYCLE_ADAPTERS[1] : LIFECYCLE_ADAPTERS[0];
+  }
+
+  /**
+   * V2.3B: check pUSD ERC20 allowance and ERC1155 operator approval for the
+   * lifecycle collateral adapter selected by market routing.
+   */
+  async checkLifecycleAdapterApprovals(routing: LifecycleRouting | undefined, amount = '1'): Promise<LifecycleAdapterStatus> {
+    const adapter = this.resolveLifecycleAdapter(routing);
+    const required = ethers.utils.parseUnits(amount, COLLATERAL_TOKEN_DECIMALS);
+    if (required.lte(0)) throw new Error('Lifecycle collateral amount must be positive');
+    const walletAddress = this.signer.address;
+
+    const pusd = new ethers.Contract(PUSD, ERC20_ABI, this.provider);
+    const conditionalTokens = new ethers.Contract(CONDITIONAL_TOKENS, ERC1155_ABI, this.provider);
+
+    const allowance = await pusd.allowance(walletAddress, adapter.address);
+    const allowanceNum = parseFloat(ethers.utils.formatUnits(allowance, COLLATERAL_TOKEN_DECIMALS));
+    const isUnlimited = allowanceNum > 1e12;
+    const pusdAllowance: AllowanceInfo = {
+      contract: adapter.name,
+      address: adapter.address,
+      approved: allowance.gte(required),
+      allowance: isUnlimited ? 'unlimited' : ethers.utils.formatUnits(allowance, COLLATERAL_TOKEN_DECIMALS),
+    };
+
+    const isOperator = await conditionalTokens.isApprovedForAll(walletAddress, adapter.address);
+    const erc1155Approval: AllowanceInfo = {
+      contract: adapter.name,
+      address: adapter.address,
+      approved: isOperator,
+    };
+
+    const issues: string[] = [];
+    if (!pusdAllowance.approved) issues.push(`ERC20: ${adapter.name} needs pUSD approval`);
+    if (!erc1155Approval.approved) issues.push(`ERC1155: ${adapter.name} needs approval for Conditional Tokens`);
+
+    return {
+      adapter: adapter.address,
+      adapterName: adapter.name,
+      pusdAllowance,
+      erc1155Approval,
+      ready: issues.length === 0,
+      issues,
+    };
+  }
+
+  /**
+   * V2.3B: set the pUSD ERC20 allowance and ERC1155 operator approval for the
+   * lifecycle collateral adapter selected by market routing. Only the two
+   * verified adapter addresses are eligible; unknown routing fails closed.
+   *
+   * This is lifecycle-specific and must NOT be used for CLOB trading
+   * approvals (and vice versa).
+   */
+  async approveLifecycleAdapter(routing: LifecycleRouting | undefined): Promise<LifecycleApprovalsResult> {
+    const adapter = this.resolveLifecycleAdapter(routing);
+    const walletAddress = this.signer.address;
+
+    const pusd = new ethers.Contract(PUSD, ERC20_ABI, this.signer);
+    const conditionalTokens = new ethers.Contract(CONDITIONAL_TOKENS, ERC1155_ABI, this.signer);
+
+    const gasPrice = await this.provider.getGasPrice();
+    const adjustedGasPrice = gasPrice.mul(150).div(100);
+
+    let erc20Approval: ApprovalTxResult;
+    const allowance = await pusd.allowance(walletAddress, adapter.address);
+    const allowanceNum = parseFloat(ethers.utils.formatUnits(allowance, COLLATERAL_TOKEN_DECIMALS));
+    if (allowanceNum > 1e12) {
+      erc20Approval = { contract: adapter.name, success: true };
+    } else {
+      try {
+        const tx = await pusd.approve(adapter.address, ethers.constants.MaxUint256, { gasPrice: adjustedGasPrice });
+        await tx.wait();
+        erc20Approval = { contract: adapter.name, txHash: tx.hash, success: true };
+      } catch (err) {
+        erc20Approval = {
+          contract: adapter.name,
+          success: false,
+          error: err instanceof Error ? err.message : 'Unknown error',
+        };
+      }
+    }
+
+    let erc1155Approval: ApprovalTxResult;
+    const isOperator = await conditionalTokens.isApprovedForAll(walletAddress, adapter.address);
+    if (isOperator) {
+      erc1155Approval = { contract: adapter.name, success: true };
+    } else {
+      try {
+        const tx = await conditionalTokens.setApprovalForAll(adapter.address, true, {
+          gasPrice: adjustedGasPrice,
+          gasLimit: 100000,
+        });
+        await tx.wait();
+        erc1155Approval = { contract: adapter.name, txHash: tx.hash, success: true };
+      } catch (err) {
+        erc1155Approval = {
+          contract: adapter.name,
+          success: false,
+          error: err instanceof Error ? err.message : 'Unknown error',
+        };
+      }
+    }
+
+    const allApproved = erc20Approval.success && erc1155Approval.success;
+    return {
+      wallet: walletAddress,
+      adapter: adapter.address,
+      erc20Approval,
+      erc1155Approval,
+      allApproved,
+      summary: allApproved
+        ? `${adapter.name} lifecycle approvals ready.`
+        : `Some ${adapter.name} lifecycle approvals failed. Check the results for details.`,
+    };
   }
 
   /** Utility approval for legacy USDC.e; not a CLOB V2 trading approval. */
