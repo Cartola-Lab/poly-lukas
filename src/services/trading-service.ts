@@ -134,6 +134,8 @@ export interface TradeStatus {
   id: string;
   status: string;
   transactionHash?: string;
+  size?: string;
+  price?: string;
 }
 
 // Rewards types
@@ -492,7 +494,7 @@ export class TradingService {
       const trades = await client.getTrades({ id: tradeId }, true);
       if (trades.length > 0) {
         for (const t of trades) {
-          results.push({ id: t.id, status: t.status, transactionHash: t.transaction_hash });
+          results.push({ id: t.id, status: t.status, transactionHash: t.transaction_hash, size: t.size, price: t.price });
         }
       } else {
         results.push({ id: tradeId, status: 'UNKNOWN' });
@@ -510,6 +512,20 @@ export class TradingService {
     const client = await this.ensureInitialized();
     const order = await client.getOrder(orderId);
     return order.associate_trades ?? [];
+  }
+
+  /**
+   * Query factual order fill data from the CLOB. Returns raw strings only —
+   * does NOT interpret order status, settlement, or failure.
+   * Throws on CLOB query failure.
+   */
+  async getOrderFillDetails(orderId: string): Promise<{ tradeIds: string[]; sizeMatched: string }> {
+    const client = await this.ensureInitialized();
+    const order = await client.getOrder(orderId);
+    return {
+      tradeIds: order.associate_trades ?? [],
+      sizeMatched: order.size_matched,
+    };
   }
 
   async getOpenOrders(marketId?: string): Promise<Order[]> {
