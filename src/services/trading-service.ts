@@ -360,17 +360,19 @@ export class TradingService {
   /**
    * Create and post a market order
    *
-   * Note: Polymarket enforces minimum order requirements:
-   * - Minimum value: $1 USDC (MIN_ORDER_VALUE_USDC)
-   *
-   * Market orders below this limit will be rejected by the API.
+   * Local guard: rejects amounts below the LOCAL minimum threshold
+   * ($1 USDC notional for BUY, 1 share for SELL).
+   * The CLOB API enforces the authoritative per-market min_order_size.
    */
   async createMarketOrder(params: MarketOrderParams): Promise<OrderResult> {
     // Validate minimum order value before sending to API
     if (params.amount < MIN_ORDER_VALUE_USDC) {
+      const label = params.side === 'BUY'
+        ? `Order amount ($${params.amount.toFixed(2)}) is below local minimum ($${MIN_ORDER_VALUE_USDC})`
+        : `Order shares (${params.amount.toFixed(2)}) are below local minimum (1 share)`;
       return {
         success: false,
-        errorMsg: `Order amount ($${params.amount.toFixed(2)}) is below Polymarket minimum ($${MIN_ORDER_VALUE_USDC})`,
+        errorMsg: label,
       };
     }
 
