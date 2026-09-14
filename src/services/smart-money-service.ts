@@ -1338,7 +1338,7 @@ export class SmartMoneyService {
             result = await this.tradingService.createMarketOrder({
               tokenId,
               side: trade.side,
-              amount: usdcAmount,
+              amount: trade.side === 'BUY' ? usdcAmount : copySize,
               price: slippagePrice,
               orderType,
             });
