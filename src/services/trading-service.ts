@@ -117,6 +117,7 @@ export interface OrderResult {
   orderIds?: string[];
   errorMsg?: string;
   transactionHashes?: string[];
+  tradeIds?: string[];
 }
 
 export interface TradeInfo {
@@ -410,6 +411,7 @@ export class TradingService {
           orderIds: 'orderIDs' in result && Array.isArray(result.orderIDs) ? result.orderIDs : undefined,
           errorMsg: result.errorMsg,
           transactionHashes: result.transactionsHashes,
+          tradeIds: result.tradeIDs,
         };
       } catch (error) {
         return {
