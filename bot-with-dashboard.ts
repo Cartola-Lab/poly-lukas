@@ -455,7 +455,7 @@ function recordEntry(strategy: StrategyKey) {
   updateDashboard();
 }
 
-function recordRealized(profit: number) {
+function recordRealized(profit: number, broadcast = true) {
   state.dailyPnL += profit;
   state.monthlyPnL += profit;
   state.totalPnL += profit;
@@ -472,7 +472,7 @@ function recordRealized(profit: number) {
     state.wins++;
   }
 
-  updateDashboard();
+  if (broadcast) updateDashboard();
 }
 
 function simulateTrade(profit: number, strategy: string, description: string) {
@@ -675,7 +675,7 @@ function stopSmartMoneyCopy() {
 }
 
 // P0.3c-1: session-local settlement facts only. Terminal records remain here
-// for the accounting wiring in the next micro-block; nothing is persisted.
+// until consumed. Finalized records remain as session-local deduplication tombstones.
 type CloseSettlement =
   | { state: 'PENDING' }
   | { state: 'TERMINAL_FAILED'; orderId: string; successShares: number; weightedPrice: null; todosFailed: true }
@@ -685,6 +685,7 @@ type PendingClose = {
   entryPrice: number | null;
   directEntry?: DirectEntry;
   settlement: CloseSettlement;
+  accountingFinalized?: boolean;
 };
 const pendingCloses = new Map<string, PendingClose>();
 let closeFlushPromise: Promise<void> | null = null;
@@ -747,6 +748,65 @@ function flushPendingCloses(sdk: PolymarketSDK): Promise<void> {
     }
   }).finally(() => { closeFlushPromise = null; });
   return closeFlushPromise;
+}
+
+// No awaits: validate everything before claiming the order and mutating local
+// accounting. Notifications run only after all local mutations have completed.
+function consumeTerminalCloses(): void {
+  for (const [orderId, pending] of [...pendingCloses]) {
+    if (pending.accountingFinalized || pending.settlement.state === 'PENDING') continue;
+    try {
+      const settled = pending.settlement;
+      if (settled.orderId !== orderId) throw new Error('Close settlement orderId mismatch');
+      if (settled.state === 'TERMINAL_FAILED') {
+        pending.accountingFinalized = true;
+        continue;
+      }
+      const q = settled.successShares;
+      const price = settled.weightedPrice;
+      if (!Number.isFinite(q) || q <= 0 || !Number.isFinite(price) || price <= 0) {
+        throw new Error('Invalid economic close quantity or price');
+      }
+      const entry = pending.directEntry;
+      if (entry && directEntries.get(pending.tokenId) !== entry) {
+        throw new Error('Original direct entry missing or replaced');
+      }
+      if (entry && (!Number.isFinite(entry.size) || entry.size <= 0 || q > entry.size)) {
+        throw new Error('Settled close exceeds or invalidates original entry balance');
+      }
+      const costPrice = pending.entryPrice;
+      if (costPrice === null || !Number.isFinite(costPrice) || costPrice <= 0) {
+        if (entry) throw new Error('Invalid captured close cost basis');
+        // A wallet position without captured cost can settle, but cannot yield PnL.
+        pending.accountingFinalized = true;
+        log('WARN', `Close ${orderId} settled without cost basis; PnL/history withheld`);
+        continue;
+      }
+      const cost = q * costPrice;
+      const notional = q * price;
+      const exitFeeUsd = 0; // No factual/configured close fee: this is gross PnL.
+      const realizedPnl = notional - cost - exitFeeUsd;
+      if (![cost, notional, realizedPnl].every(Number.isFinite)) throw new Error('Invalid close accounting totals');
+
+      // All expected failure paths above are side-effect free. Claim before
+      // non-idempotent writes, and keep external notifications out of this block.
+      pending.accountingFinalized = true;
+      if (entry) {
+        entry.size -= q;
+        if (entry.size === 0) directEntries.delete(pending.tokenId);
+      }
+      recordRealized(realizedPnl, false);
+      if (entry) {
+        recordTradeForHistory({ strategy: 'direct', market: pending.tokenId.slice(0, 12),
+          side: 'SELL', size: q, price, profit: realizedPnl });
+      }
+      updateDashboard();
+      log('TRADE', `Close settled: ${q} shares of ${pending.tokenId.slice(0, 10)}...; gross PnL $${realizedPnl.toFixed(2)} (exit fee excluded)`);
+    } catch (err) {
+      // A notification failure must not stop consumption of other terminal orders.
+      try { log('WARN', `Close accounting ${orderId}: ${err instanceof Error ? err.message : String(err)}`); } catch { /* state remains claimed or pending */ }
+    }
+  }
 }
 
 // true means submission accepted, never proof of an economically closed position.
@@ -1469,6 +1529,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
   setInterval(async () => {
     try {
       await flushPendingCloses(sdk);
+      consumeTerminalCloses();
       const positions = await sdk.wallets.getWalletPositions(sdk.tradingService.getAddress());
 
       // Enrich positions with market data (to check if won or lost)
