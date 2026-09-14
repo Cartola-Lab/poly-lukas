@@ -501,6 +501,17 @@ export class TradingService {
     return results;
   }
 
+  /**
+   * Query trade IDs from the CLOB response. Returns raw factual data only —
+   * does NOT interpret order status, settlement, or failure.
+   * Throws on CLOB query failure; does NOT return an empty array as error.
+   */
+  async getOrderTradeIds(orderId: string): Promise<string[]> {
+    const client = await this.ensureInitialized();
+    const order = await client.getOrder(orderId);
+    return order.associate_trades ?? [];
+  }
+
   async getOpenOrders(marketId?: string): Promise<Order[]> {
     const client = await this.ensureInitialized();
 
