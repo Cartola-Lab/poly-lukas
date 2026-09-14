@@ -1292,26 +1292,23 @@ export class DipArbService extends EventEmitter {
         ? (this.upAsks[0]?.price ?? 0.5)
         : (this.downAsks[0]?.price ?? 0.5);
 
-      const exitAmount = leg1.shares * currentPrice;
+      const exitAmount = leg1.shares;
+      const exitValue = exitAmount * currentPrice;
 
-      // 检查退出金额是否满足最低限额. A sub-$1 position cannot be sold on
-      // the CLOB — record it explicitly as stuck dust and emit an event so
-      // operators (and the merge path at expiry) can account for it instead
-      // of silently holding unhedged exposure (PROBLEMS.md #4).
-      if (exitAmount < 1) {
-        this.log(`⚠️ Exit amount ($${exitAmount.toFixed(2)}) below $1 minimum - position is stuck dust; will attempt merge/redeem at expiry`);
+      if (exitValue < 1) {
+        this.log(`⚠️ Exit value ($${exitValue.toFixed(2)}) below $1 minimum - position is stuck dust; will attempt merge/redeem at expiry`);
         this.emit('dustStuck', {
           roundId: this.currentRound.roundId,
           side: leg1.side,
           shares: leg1.shares,
           tokenId: leg1.tokenId,
-          exitAmount,
+          exitValue,
         });
         return {
           success: false,
           leg: 'exit',
           roundId: this.currentRound.roundId,
-          error: `Exit amount ($${exitAmount.toFixed(2)}) below Polymarket minimum ($1) - stuck dust, will attempt merge/redeem at expiry`,
+          error: `Exit value ($${exitValue.toFixed(2)}) below Polymarket minimum ($1) - stuck dust, will attempt merge/redeem at expiry`,
           executionTimeMs: Date.now() - startTime,
         };
       }
