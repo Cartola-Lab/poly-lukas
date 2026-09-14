@@ -1177,7 +1177,7 @@ export class ArbitrageService extends EventEmitter {
       const winningBalance = winningOutcome === 'YES' ? yesBalance : noBalance;
       if (winningBalance >= 0.001) {
         try {
-          const redeemResult = await this.ctf.redeem(market.conditionId, undefined, this.toLifecycleRouting(market));
+          const redeemResult = await this.ctf.redeemByTokenIds(market.conditionId, tokenIds, undefined, this.toLifecycleRouting(market));
           actions.push({
             type: 'redeem',
             amount: winningBalance,
