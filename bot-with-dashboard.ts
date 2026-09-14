@@ -690,6 +690,24 @@ type PendingClose = {
 const pendingCloses = new Map<string, PendingClose>();
 let closeFlushPromise: Promise<void> | null = null;
 
+// P0.3d: BUY settlement — submission acceptance is not economic fill.
+// PendingBuy mirrors the pending-close pattern so directEntries are only
+// created after settlement proves the fill.
+type BuySettlement =
+  | { state: 'PENDING' }
+  | { state: 'TERMINAL_FAILED'; orderId: string; successShares: number; weightedPrice: null; todosFailed: true }
+  | { state: 'TERMINAL_SUCCESS'; orderId: string; successShares: number; weightedPrice: number; todosFailed: false };
+type PendingBuy = {
+  orderId: string;
+  tokenId: string;
+  submittedAt: number;
+  priorDirectEntry?: DirectEntry;
+  settlement: BuySettlement;
+  accountingFinalized?: boolean;
+};
+const pendingBuys = new Map<string, PendingBuy>();
+let buyFlushPromise: Promise<void> | null = null;
+
 function parseCloseShares(value: unknown): bigint {
   if (typeof value !== 'string' || !/^\d+(?:\.\d{1,2})?$/.test(value)) {
     throw new Error(`Invalid factual close shares: ${String(value)}`);
@@ -750,6 +768,59 @@ function flushPendingCloses(sdk: PolymarketSDK): Promise<void> {
   return closeFlushPromise;
 }
 
+// Single-flight settlement for pending BUYs — identical pattern to closes.
+function flushPendingBuys(sdk: PolymarketSDK): Promise<void> {
+  if (buyFlushPromise) return buyFlushPromise;
+  buyFlushPromise = Promise.resolve().then(async () => {
+    for (const [orderId, pending] of [...pendingBuys]) {
+      if (pending.settlement.state !== 'PENDING') continue;
+      try {
+        const details = await sdk.tradingService.getOrderFillDetails(orderId);
+        const matched = parseCloseShares(details.sizeMatched);
+        const ids = [...new Set(details.tradeIds)];
+        if (ids.length === 0) continue;
+        const trades = await sdk.tradingService.getTradeStatuses(ids);
+        if (trades.length !== ids.length || new Set(trades.map(t => t.id)).size !== ids.length ||
+            trades.some(t => !ids.includes(t.id))) {
+          throw new Error('Incomplete or ambiguous buy trade records');
+        }
+        const sizes = trades.map(t => parseCloseShares(t.size));
+        const total = sizes.reduce((sum, size) => sum + size, 0n);
+        if (total < matched) continue;
+        if (total > matched) throw new Error('Buy child sizes exceed sizeMatched');
+        const success = trades.map(t => typeof t.transactionHash === 'string' && t.transactionHash.trim().length > 0);
+        if (trades.some((t, i) => !success[i] && t.status !== 'FAILED')) continue;
+        let units = 0n;
+        let notional = 0;
+        for (let i = 0; i < trades.length; i++) {
+          if (!success[i]) continue;
+          const rawPrice = trades[i].price;
+          const price = typeof rawPrice === 'string' && /^\d+(?:\.\d+)?$/.test(rawPrice) ? Number(rawPrice) : NaN;
+          if (!Number.isFinite(price) || price <= 0 || sizes[i] <= 0n) {
+            throw new Error('Invalid successful buy trade price or size');
+          }
+          units += sizes[i];
+          notional += Number(sizes[i]) / 100 * price;
+        }
+        if (units > BigInt(Number.MAX_SAFE_INTEGER) || !Number.isFinite(notional)) {
+          throw new Error('Invalid buy settlement totals');
+        }
+        const successShares = Number(units) / 100;
+        if (units === 0n) {
+          pending.settlement = { state: 'TERMINAL_FAILED', orderId, successShares: 0, weightedPrice: null, todosFailed: true };
+        } else {
+          const weightedPrice = notional / successShares;
+          if (!Number.isFinite(weightedPrice) || weightedPrice <= 0) throw new Error('Invalid weighted buy price');
+          pending.settlement = { state: 'TERMINAL_SUCCESS', orderId, successShares, weightedPrice, todosFailed: false };
+        }
+      } catch (err) {
+        log('WARN', `Buy settlement ${orderId}: ${(err as Error).message}`);
+      }
+    }
+  }).finally(() => { buyFlushPromise = null; });
+  return buyFlushPromise;
+}
+
 // No awaits: validate everything before claiming the order and mutating local
 // accounting. Notifications run only after all local mutations have completed.
 function consumeTerminalCloses(): void {
@@ -805,6 +876,47 @@ function consumeTerminalCloses(): void {
     } catch (err) {
       // A notification failure must not stop consumption of other terminal orders.
       try { log('WARN', `Close accounting ${orderId}: ${err instanceof Error ? err.message : String(err)}`); } catch { /* state remains claimed or pending */ }
+    }
+  }
+}
+
+// P0.3d: consume terminal BUY settlements — only after settlement proof.
+// Creates directEntries with factual weighted price and success shares.
+// Never uses snapshot price or requested notional/size as authority.
+function consumeTerminalBuys(): void {
+  for (const [orderId, pending] of [...pendingBuys]) {
+    if (pending.accountingFinalized || pending.settlement.state === 'PENDING') continue;
+    try {
+      const settled = pending.settlement;
+      if (settled.orderId !== orderId) throw new Error('Buy settlement orderId mismatch');
+      if (settled.state === 'TERMINAL_FAILED') {
+        pending.accountingFinalized = true;
+        continue;
+      }
+      const q = settled.successShares;
+      const price = settled.weightedPrice;
+      if (!Number.isFinite(q) || q <= 0 || !Number.isFinite(price) || price <= 0) {
+        throw new Error('Invalid economic buy quantity or price');
+      }
+      const prior = pending.priorDirectEntry;
+      const current = directEntries.get(pending.tokenId);
+      if (prior === undefined) {
+        if (current !== undefined) {
+          throw new Error('Direct entry appeared during buy settlement; refusing to overwrite');
+        }
+      } else {
+        if (current !== prior) {
+          throw new Error('Original direct entry replaced during buy settlement; refusing to overwrite');
+        }
+      }
+      // Claim before non-idempotent writes.
+      pending.accountingFinalized = true;
+      directEntries.set(pending.tokenId, { price, size: q, time: pending.submittedAt });
+      recordEntry('direct');
+      updateDashboard();
+      log('TRADE', `Buy settled: ${q} shares of ${pending.tokenId.slice(0, 10)}... @ $${price.toFixed(4)}`);
+    } catch (err) {
+      try { log('WARN', `Buy accounting ${orderId}: ${err instanceof Error ? err.message : String(err)}`); } catch { /* state remains claimed or pending */ }
     }
   }
 }
@@ -1486,9 +1598,20 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
                   amount: amountUsdc
                 }).then(res => {
                   if (res.success) {
-                    log('TRADE', `✅ Direct Trade: Bought $${amountUsdc} of ${targetToken.outcome} @ ~${price.toFixed(2)}`);
-                    recordEntry('direct');
-                    directEntries.set(targetToken.tokenId, { price, size: amountUsdc / price, time: Date.now() });
+                    const orderId = typeof res.orderId === 'string' ? res.orderId.trim() : '';
+                    if (!orderId) {
+                      log('WARN', `Direct BUY submission accepted without usable orderId for ${targetToken.tokenId}; accounting withheld`);
+                    } else if (!pendingBuys.has(orderId)) {
+                      const priorDirectEntry = directEntries.get(targetToken.tokenId);
+                      pendingBuys.set(orderId, {
+                        orderId,
+                        tokenId: targetToken.tokenId,
+                        submittedAt: Date.now(),
+                        priorDirectEntry,
+                        settlement: { state: 'PENDING' },
+                      });
+                      log('TRADE', `Direct BUY submitted: ${orderId} on ${targetToken.outcome}; settlement pending`);
+                    }
                   } else {
                     log('WARN', `❌ Direct Trade failed: ${res.errorMsg}`);
                   }
@@ -1529,7 +1652,9 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
   setInterval(async () => {
     try {
       await flushPendingCloses(sdk);
+      await flushPendingBuys(sdk);
       consumeTerminalCloses();
+      consumeTerminalBuys();
       const positions = await sdk.wallets.getWalletPositions(sdk.tradingService.getAddress());
 
       // Enrich positions with market data (to check if won or lost)
