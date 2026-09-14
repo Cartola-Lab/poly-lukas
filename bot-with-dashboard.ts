@@ -539,6 +539,7 @@ function persistSession() {
         swaps: state.swaps,
         usdcBalance: state.usdcBalance,
         usdcEBalance: state.usdcEBalance,
+        pUsdBalance: state.pUsdBalance,
       },
       {
         dryRun: CONFIG.dryRun,

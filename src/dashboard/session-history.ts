@@ -178,6 +178,7 @@ export function createSessionFromState(
     swaps: number;
     usdcBalance: number;
     usdcEBalance: number;
+    pUsdBalance: number;
   },
   config: {
     dryRun: boolean;
@@ -236,7 +237,7 @@ export function createSessionFromState(
     },
   };
   
-  const startingBalance = state.usdcBalance + state.usdcEBalance - state.totalPnL;
+  const startingBalance = state.usdcBalance + state.usdcEBalance + state.pUsdBalance - state.totalPnL;
   
   return {
     id: `session-${startTime}`,
@@ -245,7 +246,7 @@ export function createSessionFromState(
     durationMs,
     totalPnL: state.totalPnL,
     startingBalance: Math.max(0, startingBalance),
-    endingBalance: state.usdcBalance + state.usdcEBalance,
+    endingBalance: state.usdcBalance + state.usdcEBalance + state.pUsdBalance,
     totalTrades: state.tradesExecuted,
     wins,
     losses,
