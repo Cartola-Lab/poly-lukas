@@ -62,6 +62,7 @@ export interface BotState {
   swaps: number;
   usdcBalance: number;
   usdcEBalance: number;
+  pUsdBalance: number;
   maticBalance: number;
   unrealizedPnL: number;
   btcTrend: 'up' | 'down' | 'neutral';

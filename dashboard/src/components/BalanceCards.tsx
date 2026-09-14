@@ -90,10 +90,11 @@ export function BalanceCards({ state, config }: BalanceCardsProps) {
   const matic = state?.maticBalance ?? 0;
   const usdc = state?.usdcBalance ?? 0;
   const usdce = state?.usdcEBalance ?? 0;
-  const total = usdc + usdce;
+  const pusd = state?.pUsdBalance ?? 0;
+  const total = usdc + usdce + pusd;
 
   return (
-    <div className="grid grid-cols-2 xl:grid-cols-4 gap-2">
+    <div className="grid grid-cols-2 xl:grid-cols-5 gap-2">
       <BalanceCard
         icon="💜"
         label="MATIC"
@@ -104,19 +105,27 @@ export function BalanceCards({ state, config }: BalanceCardsProps) {
       />
       <BalanceCard
         icon="💵"
-        label="USDC"
+        label="Native USDC"
         value={`$${formatCurrency(usdc)}`}
-        subLabel="Bridged"
+        subLabel="Polygon"
         gradient="bg-gradient-to-br from-green-500/10 to-green-500/5"
         iconBg="bg-green-500/20"
       />
       <BalanceCard
         icon="💰"
-        label="USDC.e"
+        label="Bridged USDC.e"
         value={`$${formatCurrency(usdce)}`}
-        subLabel="Native"
+        subLabel="Bridged"
         gradient="bg-gradient-to-br from-blue-500/10 to-blue-500/5"
         iconBg="bg-blue-500/20"
+      />
+      <BalanceCard
+        icon="💲"
+        label="pUSD (CLOB)"
+        value={`$${formatCurrency(pusd)}`}
+        subLabel="Collateral"
+        gradient="bg-gradient-to-br from-teal-500/10 to-teal-500/5"
+        iconBg="bg-teal-500/20"
       />
       <BalanceCard
         icon="🏦"
