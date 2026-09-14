@@ -1153,7 +1153,7 @@ export class ArbitrageService extends EventEmitter {
         }
       }
 
-      this.log(`   📋 Plan: ${actions.length} actions, ~$${totalUsdcRecovered.toFixed(2)} USDC`);
+      this.log(`   📋 Plan: ${actions.length} actions, ~$${totalUsdcRecovered.toFixed(2)} pUSD`);
       for (const action of actions) {
         this.log(`      - ${action.type}: ${action.amount.toFixed(4)} → ~$${action.usdcResult.toFixed(2)}`);
       }
@@ -1311,7 +1311,7 @@ export class ArbitrageService extends EventEmitter {
     }
 
     const allSuccess = actions.every((a) => a.success);
-    this.log(`   📊 Result: ${actions.filter((a) => a.success).length}/${actions.length} succeeded, $${totalUsdcRecovered.toFixed(2)} recovered`);
+    this.log(`   📊 Result: ${actions.filter((a) => a.success).length}/${actions.length} succeeded, $${totalUsdcRecovered.toFixed(2)} pUSD recovered`);
 
     const result: ClearPositionResult = {
       market,

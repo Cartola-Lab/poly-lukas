@@ -479,7 +479,7 @@ export class DipArbService extends EventEmitter {
           );
 
           if (result.success) {
-            this.log(`✅ Startup merge successful: ${pairsToMerge.toFixed(2)} pairs → $${result.usdcReceived || pairsToMerge.toFixed(2)} USDC.e`);
+            this.log(`✅ Startup merge successful: ${pairsToMerge.toFixed(2)} pairs → $${result.usdcReceived || pairsToMerge.toFixed(2)} pUSD`);
             this.log(`   TxHash: ${result.txHash?.slice(0, 20)}...`);
           } else {
             this.log(`❌ Startup merge failed`);
@@ -1023,7 +1023,7 @@ export class DipArbService extends EventEmitter {
         noTokenId: this.market.downTokenId,
       };
 
-      this.log(`🔄 Merging ${shares.toFixed(1)} UP + DOWN → USDC.e...`);
+      this.log(`🔄 Merging ${shares.toFixed(1)} UP + DOWN → pUSD...`);
 
       const result = await this.ctf.mergeByTokenIds(
         this.market.conditionId,
@@ -1033,7 +1033,7 @@ export class DipArbService extends EventEmitter {
       );
 
       if (result.success) {
-        this.log(`✅ Merge successful: ${shares.toFixed(1)} pairs → $${result.usdcReceived || shares.toFixed(2)} USDC.e`);
+        this.log(`✅ Merge successful: ${shares.toFixed(1)} pairs → $${result.usdcReceived || shares.toFixed(2)} pUSD`);
         this.log(`   TxHash: ${result.txHash?.slice(0, 20)}...`);
       }
 

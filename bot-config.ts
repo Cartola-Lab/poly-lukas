@@ -974,6 +974,7 @@ function displayStatus() {
   console.log(`    MATIC:        ${state.maticBalance.toFixed(4)}`);
   console.log(`    USDC:         $${state.usdcBalance.toFixed(2)}`);
   console.log(`    USDC.e:       $${state.usdcEBalance.toFixed(2)}`);
+  console.log(`    pUSD (CLOB):  $${state.pUsdBalance.toFixed(2)}`);
   console.log('─'.repeat(80));
   console.log('  PnL & CAPITAL:');
   console.log(`    Daily:        $${state.dailyPnL >= 0 ? '+' : ''}${state.dailyPnL.toFixed(2)} / $${(CONFIG.capital.totalUsd * CONFIG.risk.dailyMaxLossPct).toFixed(2)} limit (${(CONFIG.risk.dailyMaxLossPct * 100).toFixed(0)}%)`);

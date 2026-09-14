@@ -1733,7 +1733,7 @@ async function main() {
         const result = await ctfClient.redeemByTokenIds(conditionId, tokenIds, undefined, routing);
 
         if (result.success) {
-          log('CHAIN', `✅ Redeemed! ${result.tokensRedeemed} tokens → ${result.usdcReceived} USDC`);
+          log('CHAIN', `✅ Redeemed! ${result.tokensRedeemed} tokens → ${result.usdcReceived} pUSD`);
           log('CHAIN', `   Tx: ${result.txHash}`);
         } else {
           log('WARN', `❌ Redeem failed`);
@@ -1772,6 +1772,7 @@ async function main() {
     console.log(`    MATIC:        ${state.maticBalance.toFixed(4)}`);
     console.log(`    USDC:         $${state.usdcBalance.toFixed(2)}`);
     console.log(`    USDC.e:       $${state.usdcEBalance.toFixed(2)}`);
+    console.log(`    pUSD (CLOB):  $${state.pUsdBalance.toFixed(2)}`);
     console.log('─'.repeat(70));
     console.log('  STRATEGIES:');
     console.log(`    Smart Money:  ${state.smartMoneyTrades} trades | ${state.followedWallets.length} wallets`);
