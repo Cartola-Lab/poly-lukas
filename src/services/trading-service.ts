@@ -130,6 +130,12 @@ export interface TradeInfo {
   timestamp: number;
 }
 
+export interface TradeStatus {
+  id: string;
+  status: string;
+  transactionHash?: string;
+}
+
 // Rewards types
 export interface UserEarning {
   date: string;
@@ -472,6 +478,27 @@ export class TradingService {
         );
       }
     });
+  }
+
+  /**
+   * Query CLOB trade status by trade ID. Returns raw factual data only —
+   * does NOT interpret statuses, classify terminality, or decide retries.
+   * Throws on CLOB query failure; does NOT return empty array as success.
+   */
+  async getTradeStatuses(tradeIds: string[]): Promise<TradeStatus[]> {
+    const client = await this.ensureInitialized();
+    const results: TradeStatus[] = [];
+    for (const tradeId of tradeIds) {
+      const trades = await client.getTrades({ id: tradeId }, true);
+      if (trades.length > 0) {
+        for (const t of trades) {
+          results.push({ id: t.id, status: t.status, transactionHash: t.transaction_hash });
+        }
+      } else {
+        results.push({ id: tradeId, status: 'UNKNOWN' });
+      }
+    }
+    return results;
   }
 
   async getOpenOrders(marketId?: string): Promise<Order[]> {
