@@ -269,6 +269,11 @@ export interface ArbitrageExecutionResult {
   executionTimeMs: number;
 }
 
+type SellLegSettlement =
+  | { state: 'PENDING' }
+  | { state: 'TERMINAL_FAILED' }
+  | { state: 'TERMINAL_SUCCESS'; successShares: number; weightedPrice: number; txHashes: string[] };
+
 export interface ArbitrageServiceEvents {
   opportunity: (opportunity: ArbitrageOpportunity) => void;
   execution: (result: ArbitrageExecutionResult) => void;
@@ -1658,6 +1663,54 @@ export class ArbitrageService extends EventEmitter {
         executionTimeMs: Date.now() - startTime,
       };
     }
+  }
+
+  private async reconcileSellLeg(orderId: string): Promise<SellLegSettlement> {
+    if (!this.tradingService) throw new Error('Trading not configured');
+    const parseShares = (value: unknown): bigint => {
+      if (typeof value !== 'string' || !/^\d+(?:\.\d{1,2})?$/.test(value)) {
+        throw new Error('Invalid factual SELL shares');
+      }
+      const [whole, fraction = ''] = value.split('.');
+      return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
+    };
+    const details = await this.tradingService.getOrderFillDetails(orderId);
+    const ids = [...new Set(details.tradeIds)];
+    if (ids.length === 0) return { state: 'PENDING' };
+    if (ids.some(id => typeof id !== 'string' || !id.trim())) throw new Error('Invalid SELL trade ID');
+    const matched = parseShares(details.sizeMatched);
+    const trades = await this.tradingService.getTradeStatuses(ids);
+    if (trades.length !== ids.length || new Set(trades.map(t => t.id)).size !== ids.length ||
+        trades.some(t => !ids.includes(t.id))) return { state: 'PENDING' };
+    if (trades.some(t => t.status === 'UNKNOWN' || t.size === undefined)) return { state: 'PENDING' };
+    const sizes = trades.map(t => parseShares(t.size));
+    const total = sizes.reduce((sum, size) => sum + size, 0n);
+    if (total < matched) return { state: 'PENDING' };
+    if (total > matched) throw new Error('SELL child sizes exceed sizeMatched');
+    const success = trades.map(t => typeof t.transactionHash === 'string' && t.transactionHash.trim().length > 0);
+    if (trades.some((t, i) => !success[i] && t.status !== 'FAILED')) return { state: 'PENDING' };
+    if (!success.some(Boolean)) return { state: 'TERMINAL_FAILED' };
+
+    // Completeness is proven in integer units before converting economic totals.
+    let units = 0n;
+    let notional = 0;
+    const txHashes = new Set<string>();
+    for (let i = 0; i < trades.length; i++) {
+      if (!success[i]) continue;
+      const rawPrice = trades[i].price;
+      const price = typeof rawPrice === 'string' && /^\d+(?:\.\d+)?$/.test(rawPrice) ? Number(rawPrice) : NaN;
+      if (!Number.isFinite(price) || price <= 0 || sizes[i] <= 0n) throw new Error('Invalid successful SELL facts');
+      units += sizes[i];
+      if (units > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('SELL shares exceed safe economic precision');
+      notional += Number(sizes[i]) / 100 * price;
+      txHashes.add(trades[i].transactionHash!.trim());
+    }
+    const successShares = Number(units) / 100;
+    const weightedPrice = notional / successShares;
+    if (!Number.isFinite(notional) || !Number.isFinite(weightedPrice) || weightedPrice <= 0) {
+      throw new Error('Invalid SELL settlement totals');
+    }
+    return { state: 'TERMINAL_SUCCESS', successShares, weightedPrice, txHashes: [...txHashes] };
   }
 
   private async executeShortArb(opportunity: ArbitrageOpportunity): Promise<ArbitrageExecutionResult> {
