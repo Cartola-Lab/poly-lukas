@@ -504,7 +504,8 @@ let isSmartMoneyInitializing = false;
 let onchainService: OnchainService | null = null;
 let copySubscription: AutoCopyTradingSubscription | null = null;
 let activeSdk: PolymarketSDK | null = null;
-const directEntries = new Map<string, { price: number; size: number; time: number }>();
+type DirectEntry = { price: number; size: number; time: number };
+const directEntries = new Map<string, DirectEntry>();
 
 // Session history: per-trade records feed createSessionFromState; the
 // session is persisted (upserted by id) every 5 min and on shutdown so a
@@ -673,44 +674,103 @@ function stopSmartMoneyCopy() {
   copySubscription = null;
 }
 
-// v3.2: shared close path for closePosition + panicSell. Books realized PnL
-// only when an exit price is known — booking $0 would count as a phantom
-// win in the streak tracker. Direct-opened tokens attribute via
-// directEntries (entry price captured at fill time).
+// P0.3c-1: session-local settlement facts only. Terminal records remain here
+// for the accounting wiring in the next micro-block; nothing is persisted.
+type CloseSettlement =
+  | { state: 'PENDING' }
+  | { state: 'TERMINAL_FAILED'; orderId: string; successShares: number; weightedPrice: null; todosFailed: true }
+  | { state: 'TERMINAL_SUCCESS'; orderId: string; successShares: number; weightedPrice: number; todosFailed: false };
+type PendingClose = {
+  tokenId: string;
+  entryPrice: number | null;
+  directEntry?: DirectEntry;
+  settlement: CloseSettlement;
+};
+const pendingCloses = new Map<string, PendingClose>();
+let closeFlushPromise: Promise<void> | null = null;
+
+function parseCloseShares(value: unknown): bigint {
+  if (typeof value !== 'string' || !/^\d+(?:\.\d{1,2})?$/.test(value)) {
+    throw new Error(`Invalid factual close shares: ${String(value)}`);
+  }
+  const [whole, fraction = ''] = value.split('.');
+  return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
+}
+
+function flushPendingCloses(sdk: PolymarketSDK): Promise<void> {
+  if (closeFlushPromise) return closeFlushPromise;
+  closeFlushPromise = Promise.resolve().then(async () => {
+    for (const [orderId, pending] of [...pendingCloses]) {
+      if (pending.settlement.state !== 'PENDING') continue;
+      try {
+        const details = await sdk.tradingService.getOrderFillDetails(orderId);
+        const matched = parseCloseShares(details.sizeMatched);
+        const ids = [...new Set(details.tradeIds)];
+        if (ids.length === 0) continue;
+        const trades = await sdk.tradingService.getTradeStatuses(ids);
+        if (trades.length !== ids.length || new Set(trades.map(t => t.id)).size !== ids.length ||
+            trades.some(t => !ids.includes(t.id))) {
+          throw new Error('Incomplete or ambiguous close trade records');
+        }
+        const sizes = trades.map(t => parseCloseShares(t.size));
+        const total = sizes.reduce((sum, size) => sum + size, 0n);
+        if (total < matched) continue;
+        if (total > matched) throw new Error('Close child sizes exceed sizeMatched');
+        const success = trades.map(t => typeof t.transactionHash === 'string' && t.transactionHash.trim().length > 0);
+        if (trades.some((t, i) => !success[i] && t.status !== 'FAILED')) continue;
+        let units = 0n;
+        let notional = 0;
+        for (let i = 0; i < trades.length; i++) {
+          if (!success[i]) continue;
+          const rawPrice = trades[i].price;
+          const price = typeof rawPrice === 'string' && /^\d+(?:\.\d+)?$/.test(rawPrice) ? Number(rawPrice) : NaN;
+          if (!Number.isFinite(price) || price <= 0 || sizes[i] <= 0n) {
+            throw new Error('Invalid successful close trade price or size');
+          }
+          units += sizes[i];
+          notional += Number(sizes[i]) / 100 * price;
+        }
+        if (units > BigInt(Number.MAX_SAFE_INTEGER) || !Number.isFinite(notional)) {
+          throw new Error('Invalid close settlement totals');
+        }
+        const successShares = Number(units) / 100;
+        if (units === 0n) {
+          pending.settlement = { state: 'TERMINAL_FAILED', orderId, successShares: 0, weightedPrice: null, todosFailed: true };
+        } else {
+          const weightedPrice = notional / successShares;
+          if (!Number.isFinite(weightedPrice) || weightedPrice <= 0) throw new Error('Invalid weighted close price');
+          pending.settlement = { state: 'TERMINAL_SUCCESS', orderId, successShares, weightedPrice, todosFailed: false };
+        }
+      } catch (err) {
+        log('WARN', `Close settlement ${orderId}: ${(err as Error).message}`);
+      }
+    }
+  }).finally(() => { closeFlushPromise = null; });
+  return closeFlushPromise;
+}
+
+// true means submission accepted, never proof of an economically closed position.
 async function executeClosePosition(sdk: PolymarketSDK, tokenId: string, size: number): Promise<boolean> {
   try {
-    const entry = directEntries.get(tokenId);
+    const directEntry = directEntries.get(tokenId);
     const position = state.positions.find(p => p.asset === tokenId);
-    const exitPrice = Number((position as any)?.curPrice) || Number(position?.msg_price) || 0;
-    const entryPrice = entry?.price ?? (Number(position?.avgPrice) || 0);
-    const realizedPnL = exitPrice > 0 ? (exitPrice - entryPrice) * size : 0;
-
-    const res = await sdk.tradingService.createMarketOrder({
-      tokenId,
-      side: 'SELL',
-      amount: size,
-    });
-
+    const candidatePrice = directEntry?.price ?? Number(position?.avgPrice);
+    const entryPrice = Number.isFinite(candidatePrice) && candidatePrice > 0 ? candidatePrice : null;
+    const res = await sdk.tradingService.createMarketOrder({ tokenId, side: 'SELL', amount: size });
     if (res.success) {
-      log('TRADE', `✅ Position closed: ${size} shares of ${tokenId.slice(0, 10)}... (PnL est $${realizedPnL.toFixed(2)})`);
-      if (exitPrice > 0) {
-        recordRealized(realizedPnL);
-        if (entry) {
-          recordTradeForHistory({ strategy: 'direct', market: tokenId.slice(0, 12), side: 'SELL', size, price: exitPrice, profit: realizedPnL });
-        }
-      } else {
-        log('WARN', `Close PnL untracked for ${tokenId.slice(0, 10)}...: no known exit price`);
+      const orderId = typeof res.orderId === 'string' ? res.orderId.trim() : '';
+      if (!orderId) {
+        log('WARN', `Close submission accepted without usable orderId for ${tokenId}; accounting withheld`);
+      } else if (!pendingCloses.has(orderId)) {
+        pendingCloses.set(orderId, { tokenId, entryPrice, directEntry, settlement: { state: 'PENDING' } });
       }
-      if (entry) {
-        entry.size -= size;
-        if (entry.size <= 0.0001) directEntries.delete(tokenId);
-      }
+      log('TRADE', `Close order submitted: ${size} shares of ${tokenId.slice(0, 10)}...; settlement not yet accounted`);
       return true;
     }
-    log('WARN', `❌ Close failed: ${res.errorMsg}`);
+    log('WARN', `❌ Close submission failed: ${res.errorMsg}`);
     return false;
   } catch (err: any) {
-    log('WARN', `❌ Close error: ${err.message}`);
+    log('WARN', `❌ Close submission error: ${err.message}`);
     return false;
   }
 }
@@ -1408,6 +1468,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
   // Periodic Position Sync (Every 30s)
   setInterval(async () => {
     try {
+      await flushPendingCloses(sdk);
       const positions = await sdk.wallets.getWalletPositions(sdk.tradingService.getAddress());
 
       // Enrich positions with market data (to check if won or lost)
