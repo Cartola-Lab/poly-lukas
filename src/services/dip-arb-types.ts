@@ -261,6 +261,14 @@ export interface DipArbLegInfo {
   timestamp: number;
   /** Token ID */
   tokenId: string;
+  /** Whether an emergency SELL attempt is pending settlement */
+  exitPending?: boolean;
+  /** CLOB trade IDs from the pending SELL order */
+  exitTradeIds?: string[];
+  /** Orderbook ask price at SELL submission time */
+  exitSubmitPrice?: number;
+  /** On-chain share count at SELL submission time */
+  exitSubmitShares?: number;
 }
 
 /**

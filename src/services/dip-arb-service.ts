@@ -1253,9 +1253,12 @@ export class DipArbService extends EventEmitter {
         // Try to sell Leg1 position
         const exitResult = await this.emergencyExitLeg1();
 
-        this.currentRound.phase = 'expired';
-        this.stats.roundsExpired++;
-        this.stats.roundsCompleted++;
+        if (exitResult?.success) {
+          this.currentRound.phase = 'expired';
+          this.stats.roundsExpired++;
+          this.stats.roundsCompleted++;
+        }
+        // On !success: phase stays 'leg1_filled', retry on next signal.
 
         const result: DipArbRoundResult = {
           roundId: this.currentRound.roundId,
@@ -1283,89 +1286,159 @@ export class DipArbService extends EventEmitter {
 
     const leg1 = this.currentRound.leg1;
     const startTime = Date.now();
+    const DUST_EPSILON = 0.001;
 
     try {
-      this.log(`Selling ${leg1.shares} ${leg1.side} tokens...`);
+      // ---- PRE-SUBMIT: read CTF balance as single source of truth ----
+      let currentBalance = leg1.shares; // fallback when CTF unavailable
+      if (this.ctf) {
+        try {
+          const pos = await this.ctf.getPositionBalanceByTokenIds(
+            this.market.conditionId,
+            { yesTokenId: this.market.upTokenId, noTokenId: this.market.downTokenId }
+          );
+          const held = leg1.side === 'UP'
+            ? parseFloat(pos.yesBalance)
+            : parseFloat(pos.noBalance);
+          if (!Number.isFinite(held)) {
+            this.log('⚠️ CTF balance read failed — cannot verify position, refusing to SELL');
+            return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+              error: 'CTF balance read failed', executionTimeMs: Date.now() - startTime };
+          }
+          currentBalance = held;
+        } catch {
+          this.log('⚠️ CTF balance query failed — cannot verify position, refusing to SELL');
+          return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+            error: 'CTF balance query failed', executionTimeMs: Date.now() - startTime };
+        }
+      }
 
-      // Get current price for the token
+      // ---- ZERO BALANCE: position already resolved ----
+      if (currentBalance <= DUST_EPSILON) {
+        if (leg1.exitPending && leg1.exitSubmitPrice !== undefined && leg1.exitSubmitShares !== undefined) {
+          // Delayed settlement confirmation — finalize with stored accounting.
+          const soldPrice = leg1.exitSubmitPrice;
+          const loss = (leg1.price - soldPrice) * leg1.exitSubmitShares
+            + estimateTakerFee(leg1.price * leg1.exitSubmitShares, this.config.feeRateBps)
+            + estimateTakerFee(soldPrice * leg1.exitSubmitShares, this.config.feeRateBps);
+          this.stats.totalProfit -= Math.abs(loss);
+          this.log(`✅ Exit confirmed (delayed): ${leg1.exitSubmitShares.toFixed(2)} ${leg1.side} @ ~${soldPrice.toFixed(4)} | Loss: $${loss.toFixed(2)}`);
+        } else {
+          // Resolved without known exit attempt — no PnL inventing.
+          this.log('Leg1 position resolved externally — exit PnL unavailable');
+        }
+        leg1.exitPending = undefined;
+        leg1.exitTradeIds = undefined;
+        leg1.exitSubmitPrice = undefined;
+        leg1.exitSubmitShares = undefined;
+        return { success: true, leg: 'exit', roundId: this.currentRound.roundId,
+          side: leg1.side, shares: currentBalance, executionTimeMs: Date.now() - startTime };
+      }
+
+      // ---- PENDING GUARD: do not duplicate if prior SELL is unresolved ----
+      if (leg1.exitPending) {
+        if (leg1.exitTradeIds && leg1.exitTradeIds.length > 0) {
+          try {
+            const statuses = await this.tradingService.getTradeStatuses(leg1.exitTradeIds);
+            const allFailed = statuses.length > 0 && statuses.every(s => s.status === 'FAILED');
+            if (allFailed) {
+              this.log('All prior SELL trades definitively FAILED — clearing pending state for retry');
+              leg1.exitPending = false;
+              leg1.exitTradeIds = undefined;
+              leg1.exitSubmitPrice = undefined;
+              leg1.exitSubmitShares = undefined;
+              // continue to fresh SELL below
+            } else {
+              this.log('Prior SELL pending (trades not all FAILED) — waiting for settlement');
+              return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+                error: 'Prior SELL pending settlement', executionTimeMs: Date.now() - startTime };
+            }
+          } catch (err) {
+            this.log(`Trade status query failed — waiting: ${err instanceof Error ? err.message : String(err)}`);
+            return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+              error: 'Trade status query failed — waiting', executionTimeMs: Date.now() - startTime };
+            }
+        } else {
+          // exitPending but no trade IDs — ambiguous, wait
+          this.log('Prior SELL pending (no trade IDs) — waiting for settlement');
+          return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+            error: 'Prior SELL pending — no trade IDs', executionTimeMs: Date.now() - startTime };
+        }
+      }
+
+      // ---- FRESH SELL using current on-chain balance ----
+      const exitAmount = currentBalance;
       const currentPrice = leg1.side === 'UP'
         ? (this.upAsks[0]?.price ?? 0.5)
         : (this.downAsks[0]?.price ?? 0.5);
-
-      const exitAmount = leg1.shares;
       const exitValue = exitAmount * currentPrice;
 
       if (exitValue < 1) {
-        this.log(`⚠️ Exit value ($${exitValue.toFixed(2)}) below $1 minimum - position is stuck dust; will attempt merge/redeem at expiry`);
-        this.emit('dustStuck', {
-          roundId: this.currentRound.roundId,
-          side: leg1.side,
-          shares: leg1.shares,
-          tokenId: leg1.tokenId,
-          exitValue,
-        });
-        return {
-          success: false,
-          leg: 'exit',
-          roundId: this.currentRound.roundId,
-          error: `Exit value ($${exitValue.toFixed(2)}) below Polymarket minimum ($1) - stuck dust, will attempt merge/redeem at expiry`,
-          executionTimeMs: Date.now() - startTime,
-        };
+        this.log(`⚠️ Exit value ($${exitValue.toFixed(2)}) below $1 minimum — stuck dust; will attempt merge/redeem at expiry`);
+        this.emit('dustStuck', { roundId: this.currentRound.roundId, side: leg1.side,
+          shares: leg1.shares, tokenId: leg1.tokenId, exitValue });
+        return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+          error: `Exit value ($${exitValue.toFixed(2)}) below Polymarket minimum ($1) — stuck dust`, executionTimeMs: Date.now() - startTime };
       }
 
-      // Market sell with a worst-price floor so the exit itself cannot sweep
-      // the book (PROBLEMS.md #2).
+      this.log(`Selling ${exitAmount.toFixed(2)} ${leg1.side} tokens...`);
       const exitFloor = currentPrice * (1 - this.config.maxSlippage);
       const result = await this.tradingService.createMarketOrder({
-        tokenId: leg1.tokenId,
-        side: 'SELL' as Side,
-        amount: exitAmount,
-        price: exitFloor,
-        orderType: 'FOK',
-      });
+        tokenId: leg1.tokenId, side: 'SELL' as Side,
+        amount: exitAmount, price: exitFloor, orderType: 'FOK' });
 
-      if (result.success) {
-        const soldPrice = currentPrice;  // Approximate
-        // AUDIT #3: exit economics include taker fees on BOTH notionals
-        // (entry buy fee was never booked either).
-        const loss = (leg1.price - soldPrice) * leg1.shares
-          + estimateTakerFee(leg1.price * leg1.shares, this.config.feeRateBps)
-          + estimateTakerFee(soldPrice * leg1.shares, this.config.feeRateBps);
-
-        this.log(`✅ Leg1 exit successful: sold ${leg1.shares}x ${leg1.side} @ ~${soldPrice.toFixed(4)} | Loss: $${loss.toFixed(2)}`);
-
-        // Update stats with the loss
-        this.stats.totalProfit -= Math.abs(loss);
-
-        return {
-          success: true,
-          leg: 'exit',
-          roundId: this.currentRound.roundId,
-          side: leg1.side,
-          price: soldPrice,
-          shares: leg1.shares,
-          orderId: result.orderId,
-          executionTimeMs: Date.now() - startTime,
-        };
-      } else {
+      if (!result.success) {
         this.log(`❌ Leg1 exit failed: ${result.errorMsg}`);
-        return {
-          success: false,
-          leg: 'exit',
-          roundId: this.currentRound.roundId,
-          error: result.errorMsg,
-          executionTimeMs: Date.now() - startTime,
-        };
+        return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+          error: result.errorMsg, executionTimeMs: Date.now() - startTime };
       }
+
+      // ---- RECORD PENDING ATTEMPT ----
+      leg1.exitPending = true;
+      leg1.exitTradeIds = result.tradeIds ?? [];
+      leg1.exitSubmitPrice = currentPrice;
+      leg1.exitSubmitShares = exitAmount;
+
+      // ---- POST-SUBMIT VERIFICATION ----
+      if (this.ctf) {
+        try {
+          const postPos = await this.ctf.getPositionBalanceByTokenIds(
+            this.market.conditionId,
+            { yesTokenId: this.market.upTokenId, noTokenId: this.market.downTokenId }
+          );
+          const postHeld = leg1.side === 'UP'
+            ? parseFloat(postPos.yesBalance)
+            : parseFloat(postPos.noBalance);
+          if (Number.isFinite(postHeld) && postHeld <= DUST_EPSILON) {
+            // Settlement confirmed immediately — finalize PnL.
+            const soldPrice = currentPrice;
+            const loss = (leg1.price - soldPrice) * exitAmount
+              + estimateTakerFee(leg1.price * exitAmount, this.config.feeRateBps)
+              + estimateTakerFee(soldPrice * exitAmount, this.config.feeRateBps);
+            this.stats.totalProfit -= Math.abs(loss);
+            leg1.exitPending = undefined;
+            leg1.exitTradeIds = undefined;
+            leg1.exitSubmitPrice = undefined;
+            leg1.exitSubmitShares = undefined;
+            this.log(`✅ Leg1 exit successful: ${exitAmount.toFixed(2)} ${leg1.side} @ ~${soldPrice.toFixed(4)} | Loss: $${loss.toFixed(2)}`);
+            return { success: true, leg: 'exit', roundId: this.currentRound.roundId,
+              side: leg1.side, price: soldPrice, shares: exitAmount, orderId: result.orderId,
+              executionTimeMs: Date.now() - startTime };
+          }
+        } catch {
+          // read failed — preserve pending, retry next cycle
+        }
+      }
+
+      // Settlement not yet confirmed — pending state retained for next cycle.
+      this.log('SELL submitted — awaiting settlement confirmation (retry next cycle)');
+      return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+        error: 'SELL submitted — awaiting settlement', executionTimeMs: Date.now() - startTime };
     } catch (error) {
       this.log(`❌ Leg1 exit error: ${error instanceof Error ? error.message : String(error)}`);
-      return {
-        success: false,
-        leg: 'exit',
-        roundId: this.currentRound.roundId,
+      return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
         error: error instanceof Error ? error.message : String(error),
-        executionTimeMs: Date.now() - startTime,
-      };
+        executionTimeMs: Date.now() - startTime };
     }
   }
 
