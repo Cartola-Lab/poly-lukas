@@ -1171,9 +1171,84 @@ export class SmartMoneyService {
     const walletCooldownMs = options.walletCooldownMs ?? 3600000;
     const feeRateBps = options.feeRateBps ?? 0;
 
-    // Audit #2: FIFO lots per token so copy closes report realized PnL
-    // instead of $0. Fill price estimated at the limit used (slippagePrice).
+    // FIFO accounting is applied only after factual settlement reconciliation.
     const pnlTracker = new CopyPnlTracker();
+
+    // Subscription-local state: no timers or persistence. Retain finalized IDs to
+    // reject a repeated order result even after its pending entry is removed.
+    const pendingFills = new Map<string, { tokenId: string; side: 'BUY' | 'SELL' }>();
+    const finalizedOrderIds = new Set<string>();
+    let flushPromise: Promise<void> | null = null;
+    const parseShares = (value: unknown): bigint => {
+      if (typeof value !== 'string' || !/^\d+(?:\.\d{1,2})?$/.test(value)) {
+        throw new Error(`Invalid factual shares: ${String(value)}`);
+      }
+      const [whole, fraction = ''] = value.split('.');
+      return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
+    };
+    const flushPendingFills = (): Promise<void> => {
+      if (flushPromise) return flushPromise;
+      // Defer work until the shared promise is installed, including reentrancy.
+      flushPromise = Promise.resolve().then(async () => {
+        for (const [orderId, fill] of [...pendingFills]) {
+          try {
+            const details = await this.tradingService.getOrderFillDetails(orderId);
+            const matched = parseShares(details.sizeMatched);
+            const ids = [...new Set(details.tradeIds)];
+            // Empty discovery is not evidence of terminality, even at zero matched.
+            if (ids.length === 0) continue;
+            const trades = await this.tradingService.getTradeStatuses(ids);
+            // Missing, duplicate, or unrelated records cannot prove completeness.
+            if (trades.length !== ids.length || new Set(trades.map(t => t.id)).size !== ids.length ||
+                trades.some(t => !ids.includes(t.id))) {
+              throw new Error('Incomplete or ambiguous child trade records');
+            }
+            const sizes = trades.map(t => parseShares(t.size));
+            const total = sizes.reduce((sum, size) => sum + size, 0n);
+            if (total < matched) continue;
+            if (total > matched) throw new Error('Child trade sizes exceed sizeMatched');
+            const success = trades.map(t => typeof t.transactionHash === 'string' && t.transactionHash.trim().length > 0);
+            if (trades.some((t, i) => !success[i] && t.status !== 'FAILED')) continue;
+
+            let settledUnits = 0n;
+            let notional = 0;
+            for (let i = 0; i < trades.length; i++) {
+              if (!success[i]) continue;
+              const rawPrice = trades[i].price;
+              const price = typeof rawPrice === 'string' && /^\d+(?:\.\d+)?$/.test(rawPrice) ? Number(rawPrice) : NaN;
+              if (!Number.isFinite(price) || price <= 0 || sizes[i] <= 0n) {
+                throw new Error('Invalid success child price or size');
+              }
+              settledUnits += sizes[i];
+              notional += Number(sizes[i]) / 100 * price;
+            }
+            const settledShares = Number(settledUnits) / 100;
+            const settledFee = estimateTakerFee(notional, feeRateBps);
+            if (settledUnits > BigInt(Number.MAX_SAFE_INTEGER) || !Number.isFinite(notional) ||
+                !Number.isFinite(settledFee)) throw new Error('Invalid settlement accounting totals');
+
+            // Claim before non-idempotent accounting and external callbacks.
+            pendingFills.delete(orderId);
+            finalizedOrderIds.add(orderId);
+            if (settledUnits === 0n) continue; // All children FAILED.
+            const close = pnlTracker.recordFill(fill.tokenId, fill.side, settledShares, notional / settledShares, settledFee);
+            stats.realizedPnlUsd = pnlTracker.totalRealizedUsd;
+            if (close.closedSize > 0) {
+              options.onCopyPnl?.({
+                tokenId: fill.tokenId,
+                side: fill.side,
+                closedSize: close.closedSize,
+                realizedUsd: close.realizedUsd,
+                totalRealizedUsd: pnlTracker.totalRealizedUsd,
+              });
+            }
+          } catch (error) {
+            console.warn(`[SmartMoneyService] Settlement reconciliation ${orderId}:`, error);
+          }
+        }
+      }).finally(() => { flushPromise = null; });
+      return flushPromise;
+    };
 
     if (!this.marketService && !this.liveQuoteWarningLogged) {
       this.liveQuoteWarningLogged = true;
@@ -1190,6 +1265,7 @@ export class SmartMoneyService {
         stats.tradesDetected++;
 
         try {
+          if (pendingFills.size > 0 || flushPromise) await flushPendingFills();
           // Check target
           const walletAddr = trade.traderAddress.toLowerCase();
           if (!targetAddresses.includes(walletAddr)) {
@@ -1351,17 +1427,13 @@ export class SmartMoneyService {
             health.copiesExecuted++;
             health.consecutiveFailures = 0;
             this.bumpWalletCounter(stats, walletAddr, 'executed');
-            // Audit #2: match this fill against tracked lots; report closes.
-            const close = pnlTracker.recordFill(tokenId, trade.side, copySize, slippagePrice, feeEstimate);
-            stats.realizedPnlUsd = pnlTracker.totalRealizedUsd;
-            if (close.closedSize > 0) {
-              options.onCopyPnl?.({
-                tokenId,
-                side: trade.side,
-                closedSize: close.closedSize,
-                realizedUsd: close.realizedUsd,
-                totalRealizedUsd: pnlTracker.totalRealizedUsd,
-              });
+            if (!dryRun) {
+              const orderId = typeof result.orderId === 'string' ? result.orderId.trim() : '';
+              if (!orderId) {
+                console.warn('[SmartMoneyService] Successful copy without usable orderId; accounting withheld');
+              } else if (!finalizedOrderIds.has(orderId) && !pendingFills.has(orderId)) {
+                pendingFills.set(orderId, { tokenId, side: trade.side });
+              }
             }
           } else {
             stats.tradesFailed++;
