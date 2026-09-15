@@ -272,7 +272,26 @@ export interface ArbitrageExecutionResult {
 type SellLegSettlement =
   | { state: 'PENDING' }
   | { state: 'TERMINAL_FAILED' }
-  | { state: 'TERMINAL_SUCCESS'; successShares: number; weightedPrice: number; txHashes: string[] };
+  | { state: 'TERMINAL_SUCCESS'; successShares: number; weightedPrice: number; txHashes: string[]; successUnits?: bigint };
+
+type PendingShortLeg = {
+  tokenId: string;
+  orderId?: string;
+  submission: 'NOT_SUBMITTED' | 'REJECTED' | 'SUBMITTED';
+  settlement?: SellLegSettlement;
+};
+type TerminalShortLeg = Exclude<SellLegSettlement, { state: 'PENDING' }> | { state: 'REJECTED' };
+type PendingShortArb = {
+  id: string;
+  legA: PendingShortLeg;
+  legB: PendingShortLeg;
+  terminalResult?: {
+    state: 'BALANCED_SUCCESS' | 'IMBALANCED' | 'NO_FILL' | 'SUBMISSION_REJECTED';
+    legA: TerminalShortLeg;
+    legB: TerminalShortLeg;
+  };
+  finalized?: boolean;
+};
 
 export interface ArbitrageServiceEvents {
   opportunity: (opportunity: ArbitrageOpportunity) => void;
@@ -320,6 +339,8 @@ export class ArbitrageService extends EventEmitter {
   };
 
   private isExecuting = false;
+  private pendingShortArbs = new Map<string, PendingShortArb>();
+  private shortArbFlushPromise: Promise<void> | null = null;
   private lastExecutionTime = 0;
   private lastRebalanceTime = 0;
   private balanceUpdateInterval: ReturnType<typeof setInterval> | null = null;
@@ -1665,7 +1686,7 @@ export class ArbitrageService extends EventEmitter {
     }
   }
 
-  private async reconcileSellLeg(orderId: string): Promise<SellLegSettlement> {
+  private async reconcileSellLeg(orderId: string, includeExactUnits = false): Promise<SellLegSettlement> {
     if (!this.tradingService) throw new Error('Trading not configured');
     const parseShares = (value: unknown): bigint => {
       if (typeof value !== 'string' || !/^\d+(?:\.\d{1,2})?$/.test(value)) {
@@ -1710,7 +1731,68 @@ export class ArbitrageService extends EventEmitter {
     if (!Number.isFinite(notional) || !Number.isFinite(weightedPrice) || weightedPrice <= 0) {
       throw new Error('Invalid SELL settlement totals');
     }
-    return { state: 'TERMINAL_SUCCESS', successShares, weightedPrice, txHashes: [...txHashes] };
+    return { state: 'TERMINAL_SUCCESS', successShares, weightedPrice, txHashes: [...txHashes],
+      ...(includeExactUnits ? { successUnits: units } : {}) };
+  }
+
+  private async reconcilePendingShortArb(pending: PendingShortArb): Promise<void> {
+    if (pending.finalized) return;
+    // A rejection is known non-submission, not a FAILED child trade. An unsubmitted
+    // leg remains unresolved because its submission decision may still be in flight.
+    const facts: TerminalShortLeg[] = [];
+    for (const leg of [pending.legA, pending.legB]) {
+      if (leg.submission === 'REJECTED') {
+        facts.push({ state: 'REJECTED' });
+        continue;
+      }
+      if (leg.submission === 'NOT_SUBMITTED') continue;
+      if (!leg.orderId?.trim()) throw new Error('Submitted short-arb leg has no orderId');
+      if (!leg.settlement || leg.settlement.state === 'PENDING') {
+        leg.settlement = await this.reconcileSellLeg(leg.orderId, true);
+      }
+      if (leg.settlement.state !== 'PENDING') facts.push(leg.settlement);
+    }
+    if (facts.length !== 2) return;
+    const [legA, legB] = facts;
+    const aSuccess = legA.state === 'TERMINAL_SUCCESS';
+    const bSuccess = legB.state === 'TERMINAL_SUCCESS';
+    if ((aSuccess && (typeof legA.successUnits !== 'bigint' || legA.successUnits <= 0n)) ||
+        (bSuccess && (typeof legB.successUnits !== 'bigint' || legB.successUnits <= 0n))) {
+      throw new Error('Missing exact short-arb settlement quantity');
+    }
+    let state: NonNullable<PendingShortArb['terminalResult']>['state'];
+    if (aSuccess && bSuccess && legA.successUnits === legB.successUnits) {
+      state = 'BALANCED_SUCCESS';
+    } else if (aSuccess || bSuccess) {
+      state = 'IMBALANCED';
+    } else if (legA.state === 'TERMINAL_FAILED' && legB.state === 'TERMINAL_FAILED') {
+      state = 'NO_FILL';
+    } else if (legA.state === 'REJECTED' || legB.state === 'REJECTED') {
+      state = 'SUBMISSION_REJECTED';
+    } else {
+      return;
+    }
+    // No awaits or notifications between claim and storage. Preserve terminal facts.
+    if (pending.finalized) return;
+    pending.finalized = true;
+    pending.terminalResult = { state, legA, legB };
+  }
+
+  private flushPendingShortArbs(): Promise<void> {
+    if (this.shortArbFlushPromise) return this.shortArbFlushPromise;
+    this.shortArbFlushPromise = Promise.resolve().then(async () => {
+      for (const [id, pending] of [...this.pendingShortArbs]) {
+        if (pending.finalized) continue;
+        try {
+          if (pending.id !== id) throw new Error('Short-arb pending ID mismatch');
+          await this.reconcilePendingShortArb(pending);
+        } catch (error) {
+          // One query/anomaly must not prevent independent operations progressing.
+          try { this.log(`Short-arb reconciliation ${id}: ${String(error)}`); } catch { /* remain pending */ }
+        }
+      }
+    }).finally(() => { this.shortArbFlushPromise = null; });
+    return this.shortArbFlushPromise;
   }
 
   private async executeShortArb(opportunity: ArbitrageOpportunity): Promise<ArbitrageExecutionResult> {
