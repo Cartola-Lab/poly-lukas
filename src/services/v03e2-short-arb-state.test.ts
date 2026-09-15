@@ -18,7 +18,7 @@ function fixture(a = 'SUCCESS', b = 'SUCCESS', sizeA = '4.25', sizeB = '4.25') {
     getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => trades[id])),
   };
   Object.assign(service, { tradingService: trading });
-  const pending: Pending = { id: 'op',
+  const pending: Pending = { id: 'op', conditionId: 'market',
     legA: { tokenId: 'yes', orderId: 'a', submission: 'SUBMITTED' },
     legB: { tokenId: 'no', orderId: 'b', submission: 'SUBMITTED' } };
   service['pendingShortArbs'].set(pending.id, pending);
@@ -93,7 +93,7 @@ describe('P0.3e-2 short-arb session state machine', () => {
   });
   it.each(['MATCHED', 'ERROR'])('independent operation progresses despite %s operation', async mode => {
     const h = fixture('MATCHED', 'MATCHED');
-    const other: Pending = { id: 'other', legA: { tokenId: 'x', orderId: 'c', submission: 'SUBMITTED' },
+    const other: Pending = { id: 'other', conditionId: 'other-market', legA: { tokenId: 'x', orderId: 'c', submission: 'SUBMITTED' },
       legB: { tokenId: 'y', orderId: 'd', submission: 'SUBMITTED' } };
     h.trades.c = { id: 'c', status: 'MINED', size: '3', price: '0.4', transactionHash: 'tx-c' };
     h.trades.d = { id: 'd', status: 'MINED', size: '3', price: '0.7', transactionHash: 'tx-d' };
@@ -165,7 +165,7 @@ describe('P0.3e-2 short-arb session state machine', () => {
     await h.flush(); expect(h.service.getStats()).toEqual(before);
     expect(emit).not.toHaveBeenCalled(); expect(recovery).not.toHaveBeenCalled();
   });
-  it('executeShortArb has no state machine integration', () => {
+  it('executeShortArb does not reconcile or consume terminal economics during submission', () => {
     const path = 'src/services/arbitrage-service.ts';
     const current = readFileSync(new URL('./arbitrage-service.ts', import.meta.url), 'utf8');
     const method = (source: string) => {
@@ -173,7 +173,7 @@ describe('P0.3e-2 short-arb session state machine', () => {
       const cls = ast.statements.find(ts.isClassDeclaration)!;
       return cls.members.find(m => ts.isMethodDeclaration(m) && m.name.getText(ast) === 'executeShortArb')!.getText(ast);
     };
-    expect(method(current)).not.toMatch(/pendingShortArbs|reconcilePendingShortArb|flushPendingShortArbs|reconcileSellLeg/);
-    expect(method(current)).toContain('const profit = opportunity.profitRate * size');
+    expect(method(current)).not.toMatch(/reconcilePendingShortArb|flushPendingShortArbs|reconcileSellLeg|consumeTerminalShortArbs|fixImbalanceIfNeeded/);
+    expect(method(current)).not.toContain('opportunity.profitRate');
   });
 });

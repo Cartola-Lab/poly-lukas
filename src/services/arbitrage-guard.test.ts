@@ -19,6 +19,7 @@ describe('ArbitrageService preExecutionGuard (audit #4)', () => {
   it('blocks execution when the guard returns a reason (no orders placed)', async () => {
     const svc = new ArbitrageService({ preExecutionGuard: () => 'risk-halted' });
     const result = await svc.execute(opp);
+    if (result.type === 'SHORT_SUBMISSION') throw new Error('Expected legacy long result');
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/risk-halted/);
     expect(result.size).toBe(0);
@@ -27,6 +28,7 @@ describe('ArbitrageService preExecutionGuard (audit #4)', () => {
   it('passes through to normal flow when the guard allows', async () => {
     const svc = new ArbitrageService({ preExecutionGuard: () => null });
     const result = await svc.execute(opp);
+    if (result.type === 'SHORT_SUBMISSION') throw new Error('Expected legacy long result');
     // No private key in test → trading-unconfigured error, NOT a guard block.
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/Trading not configured/);

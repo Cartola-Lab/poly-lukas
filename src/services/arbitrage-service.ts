@@ -269,6 +269,12 @@ export interface ArbitrageExecutionResult {
   executionTimeMs: number;
 }
 
+export interface ShortArbSubmissionAck {
+  type: 'SHORT_SUBMISSION';
+  status: 'SUBMITTED_PENDING' | 'SUBMISSION_REJECTED' | 'SUBMISSION_UNCERTAIN';
+  operationId: string;
+}
+
 type SellLegSettlement =
   | { state: 'PENDING' }
   | { state: 'TERMINAL_FAILED' }
@@ -277,12 +283,13 @@ type SellLegSettlement =
 type PendingShortLeg = {
   tokenId: string;
   orderId?: string;
-  submission: 'NOT_SUBMITTED' | 'REJECTED' | 'SUBMITTED';
+  submission: 'NOT_SUBMITTED' | 'REJECTED' | 'SUBMITTED' | 'UNCERTAIN';
   settlement?: SellLegSettlement;
 };
 type TerminalShortLeg = Exclude<SellLegSettlement, { state: 'PENDING' }> | { state: 'REJECTED' };
 type PendingShortArb = {
   id: string;
+  conditionId: string;
   legA: PendingShortLeg;
   legB: PendingShortLeg;
   terminalResult?: {
@@ -291,6 +298,7 @@ type PendingShortArb = {
     legB: TerminalShortLeg;
   };
   finalized?: boolean;
+  inventoryReconciled?: boolean;
 };
 
 export interface ArbitrageServiceEvents {
@@ -340,7 +348,9 @@ export class ArbitrageService extends EventEmitter {
 
   private isExecuting = false;
   private pendingShortArbs = new Map<string, PendingShortArb>();
+  private nextShortArbId = 0;
   private shortArbFlushPromise: Promise<void> | null = null;
+  private balanceRefreshVersion = 0;
   private lastExecutionTime = 0;
   private lastRebalanceTime = 0;
   private balanceUpdateInterval: ReturnType<typeof setInterval> | null = null;
@@ -456,7 +466,18 @@ export class ArbitrageService extends EventEmitter {
       this.log(`Total Capital: ${this.totalCapital.toFixed(2)}`);
 
       // Start balance update interval
-      this.balanceUpdateInterval = setInterval(() => this.updateBalance(), 30000);
+      this.balanceUpdateInterval = setInterval(async () => {
+        try {
+          await this.flushPendingShortArbs();
+        } catch (error) {
+          try { this.log(`Short-arb flush: ${String(error)}`); } catch { /* preserve future cycles */ }
+        }
+        try {
+          await this.updateBalance();
+        } catch (error) {
+          try { this.log(`Balance refresh: ${String(error)}`); } catch { /* preserve future cycles */ }
+        }
+      }, 30000);
 
       // Start rebalancer if enabled
       if (this.config.enableRebalancer) {
@@ -670,7 +691,7 @@ export class ArbitrageService extends EventEmitter {
   /**
    * Manually execute an arbitrage opportunity
    */
-  async execute(opportunity: ArbitrageOpportunity): Promise<ArbitrageExecutionResult> {
+  async execute(opportunity: ArbitrageOpportunity): Promise<ArbitrageExecutionResult | ShortArbSubmissionAck> {
     // Audit #4: risk gate first — cheapest check, no state touched.
     // recommendedSize is a PAIR COUNT, not USDC — convert to notional so the
     // per-trade USD cap compares like with like (long: pair cost; short:
@@ -709,6 +730,19 @@ export class ArbitrageService extends EventEmitter {
       };
     }
 
+    // Repeated requests for the same unresolved short are acknowledgements,
+    // not new attempts. Keep this ahead of both the lock and attempt counter.
+    if (opportunity.type === 'short') {
+      for (const pending of this.pendingShortArbs.values()) {
+        if ((!pending.finalized || pending.inventoryReconciled !== true) && pending.conditionId === this.market.conditionId &&
+            pending.legA.tokenId === this.market.yesTokenId && pending.legB.tokenId === this.market.noTokenId) {
+          return { type: 'SHORT_SUBMISSION', operationId: pending.id,
+            status: [pending.legA, pending.legB].some(leg => leg.submission === 'UNCERTAIN')
+              ? 'SUBMISSION_UNCERTAIN' : 'SUBMITTED_PENDING' };
+        }
+      }
+    }
+
     if (this.isExecuting) {
       return {
         success: false,
@@ -729,6 +763,12 @@ export class ArbitrageService extends EventEmitter {
       const result = opportunity.type === 'long'
         ? await this.executeLongArb(opportunity)
         : await this.executeShortArb(opportunity);
+
+      if (result.type === 'SHORT_SUBMISSION') {
+        // Preserve submission pacing without claiming economic success.
+        if (result.status !== 'SUBMISSION_REJECTED') this.lastExecutionTime = Date.now();
+        return result;
+      }
 
       if (result.success) {
         this.stats.executionsSucceeded++;
@@ -1505,26 +1545,41 @@ export class ArbitrageService extends EventEmitter {
   private async updateBalance(): Promise<void> {
     if (!this.ctf || !this.market) return;
 
+    const version = ++this.balanceRefreshVersion;
+    const conditionId = this.market.conditionId;
+    const tokenIds: TokenIds = {
+      yesTokenId: this.market.yesTokenId,
+      noTokenId: this.market.noTokenId,
+    };
+    // Only terminal operations known before this read can be released by it.
+    const awaitingInventory = [...this.pendingShortArbs.values()].filter(pending =>
+      pending.finalized && pending.inventoryReconciled !== true && pending.conditionId === conditionId &&
+      pending.legA.tokenId === tokenIds.yesTokenId && pending.legB.tokenId === tokenIds.noTokenId);
     try {
-      const tokenIds: TokenIds = {
-        yesTokenId: this.market.yesTokenId,
-        noTokenId: this.market.noTokenId,
-      };
-
       const [pUsdBalance, positions] = await Promise.all([
         this.ctf.getPusdBalance(),
-        this.ctf.getPositionBalanceByTokenIds(this.market.conditionId, tokenIds),
+        this.ctf.getPositionBalanceByTokenIds(conditionId, tokenIds),
       ]);
 
-      this.balance = {
-        usdc: parseFloat(pUsdBalance),
-        pUsdBalance: parseFloat(pUsdBalance),
-        yesTokens: parseFloat(positions.yesBalance),
-        noTokens: parseFloat(positions.noBalance),
+      const balances = [pUsdBalance, positions.yesBalance, positions.noBalance].map(value =>
+        typeof value === 'number' && Number.isFinite(value) ? value
+          : typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value) ? Number(value) : NaN);
+      if (!balances.every(value => Number.isFinite(value) && value >= 0)) throw new Error('Invalid factual balances');
+      // Discard stale overlapping reads and responses for a market no longer active.
+      if (version !== this.balanceRefreshVersion || this.market?.conditionId !== conditionId ||
+          this.market.yesTokenId !== tokenIds.yesTokenId || this.market.noTokenId !== tokenIds.noTokenId) return;
+      const balance = {
+        usdc: balances[0],
+        pUsdBalance: balances[0],
+        yesTokens: balances[1],
+        noTokens: balances[2],
         lastUpdate: Date.now(),
       };
-
+      this.balance = balance;
       this.emit('balanceUpdate', this.balance);
+      if (version !== this.balanceRefreshVersion || this.balance !== balance || this.market?.conditionId !== conditionId ||
+          this.market.yesTokenId !== tokenIds.yesTokenId || this.market.noTokenId !== tokenIds.noTokenId) return;
+      for (const pending of awaitingInventory) pending.inventoryReconciled = true;
     } catch (error) {
       this.emit('error', error as Error);
     }
@@ -1745,7 +1800,7 @@ export class ArbitrageService extends EventEmitter {
         facts.push({ state: 'REJECTED' });
         continue;
       }
-      if (leg.submission === 'NOT_SUBMITTED') continue;
+      if (leg.submission === 'NOT_SUBMITTED' || leg.submission === 'UNCERTAIN') continue;
       if (!leg.orderId?.trim()) throw new Error('Submitted short-arb leg has no orderId');
       if (!leg.settlement || leg.settlement.state === 'PENDING') {
         leg.settlement = await this.reconcileSellLeg(leg.orderId, true);
@@ -1776,6 +1831,7 @@ export class ArbitrageService extends EventEmitter {
     if (pending.finalized) return;
     pending.finalized = true;
     pending.terminalResult = { state, legA, legB };
+    pending.inventoryReconciled = !aSuccess && !bSuccess;
   }
 
   private flushPendingShortArbs(): Promise<void> {
@@ -1795,109 +1851,51 @@ export class ArbitrageService extends EventEmitter {
     return this.shortArbFlushPromise;
   }
 
-  private async executeShortArb(opportunity: ArbitrageOpportunity): Promise<ArbitrageExecutionResult> {
-    const startTime = Date.now();
-    const txHashes: string[] = [];
+  private async executeShortArb(opportunity: ArbitrageOpportunity): Promise<ShortArbSubmissionAck> {
+    const operationId = `short-${++this.nextShortArbId}`;
+    const ack = (status: ShortArbSubmissionAck['status']): ShortArbSubmissionAck => ({
+      type: 'SHORT_SUBMISSION', status, operationId,
+    });
     const size = opportunity.recommendedSize;
-
-    this.log(`\nExecuting Short Arb (Sell Pre-held Tokens)...`);
-
-    try {
-      const heldPairs = Math.min(this.balance.yesTokens, this.balance.noTokens);
-
-      if (heldPairs < size) {
-        return {
-          success: false,
-          type: 'short',
-          size,
-          profit: 0,
-          txHashes,
-          error: `Insufficient held tokens: have ${heldPairs.toFixed(2)}, need ${size.toFixed(2)}`,
-          executionTimeMs: Date.now() - startTime,
-        };
-      }
-
-      // Sell both legs sequentially with floor prices (PROBLEMS.md #2/#3).
-      const sellYesFloor = opportunity.priceCaps?.sellYes
-        ?? opportunity.effectivePrices.sellYes * (1 - this.config.maxSlippagePct);
-      const sellNoFloor = opportunity.priceCaps?.sellNo
-        ?? opportunity.effectivePrices.sellNo * (1 - this.config.maxSlippagePct);
-      this.log(`  1. Selling pre-held legs sequentially (floors YES=${sellYesFloor.toFixed(4)}, NO=${sellNoFloor.toFixed(4)})...`);
-      const sellYesResult = await this.tradingService!.createMarketOrder({
-        tokenId: this.market!.yesTokenId,
-        side: 'SELL',
-        amount: size,
-        price: sellYesFloor,
-        orderType: 'FOK',
-      });
-      if (!sellYesResult.success) {
-        return {
-          success: false,
-          type: 'short',
-          size,
-          profit: 0,
-          txHashes,
-          error: `Leg 1 (YES) failed: ${sellYesResult.errorMsg}`,
-          executionTimeMs: Date.now() - startTime,
-        };
-      }
-      const sellNoResult = await this.tradingService!.createMarketOrder({
-        tokenId: this.market!.noTokenId,
-        side: 'SELL',
-        amount: size,
-        price: sellNoFloor,
-        orderType: 'FOK',
-      });
-
-      const outcomes = this.market!.outcomes || ['YES', 'NO'];
-      this.log(`     ${outcomes[0]}: ${sellYesResult.success ? '✓' : '✗'}, ${outcomes[1]}: ${sellNoResult.success ? '✓' : '✗'}`);
-
-      // Sequential legs: only the second leg can fail here. Reconcile
-      // immediately instead of waiting for the next rebalancer cycle.
-      if (!sellNoResult.success) {
-        this.log(`  ⚠️ Leg 2 (NO) failed after YES sold - reconciling...`);
-        await this.fixImbalanceIfNeeded();
-        return {
-          success: false,
-          type: 'short',
-          size,
-          profit: 0,
-          txHashes,
-          error: `Leg 2 (NO) failed: ${sellNoResult.errorMsg}`,
-          executionTimeMs: Date.now() - startTime,
-        };
-      }
-
-      const profit = opportunity.profitRate * size;
-      this.log(`  ✅ Short Arb completed! Profit: ~$${profit.toFixed(2)}`);
-
-      // Post-fill reconciliation (PROBLEMS.md #10).
-      await this.updateBalance();
-      const residual = this.balance.yesTokens - this.balance.noTokens;
-      if (Math.abs(residual) > this.config.imbalanceThreshold) {
-        this.log(`  ⚠️ Residual imbalance after short arb: ${residual.toFixed(2)} - cleaning up...`);
-        await this.fixImbalanceIfNeeded();
-      }
-
-      return {
-        success: true,
-        type: 'short',
-        size,
-        profit,
-        txHashes,
-        executionTimeMs: Date.now() - startTime,
-      };
-    } catch (error: any) {
-      return {
-        success: false,
-        type: 'short',
-        size,
-        profit: 0,
-        txHashes,
-        error: error.message,
-        executionTimeMs: Date.now() - startTime,
-      };
+    const market = this.market;
+    const trading = this.tradingService;
+    const heldPairs = Math.min(this.balance.yesTokens, this.balance.noTokens);
+    const floors = [opportunity.priceCaps?.sellYes ?? opportunity.effectivePrices.sellYes * (1 - this.config.maxSlippagePct),
+      opportunity.priceCaps?.sellNo ?? opportunity.effectivePrices.sellNo * (1 - this.config.maxSlippagePct)];
+    if (!market || !trading || !Number.isFinite(size) || size <= 0 ||
+        !Number.isFinite(heldPairs) || heldPairs < size || floors.some(price => !Number.isFinite(price) || price <= 0)) {
+      return ack('SUBMISSION_REJECTED');
     }
+
+    const pending: PendingShortArb = { id: operationId, conditionId: market.conditionId,
+      legA: { tokenId: market.yesTokenId, submission: 'NOT_SUBMITTED' },
+      legB: { tokenId: market.noTokenId, submission: 'NOT_SUBMITTED' }, finalized: false };
+    this.pendingShortArbs.set(operationId, pending);
+    const legs = [pending.legA, pending.legB];
+    for (let i = 0; i < legs.length; i++) {
+      const leg = legs[i];
+      // Once the attempt starts, an exception cannot prove non-submission.
+      leg.submission = 'UNCERTAIN';
+      try {
+        const result = await trading.createMarketOrder({ tokenId: leg.tokenId,
+          side: 'SELL', amount: size, price: floors[i], orderType: 'FOK' });
+        const orderId = typeof result.orderId === 'string' ? result.orderId.trim() : '';
+        if (orderId) leg.orderId = orderId;
+        if (result.submissionState === 'REJECTED') {
+          leg.submission = 'REJECTED';
+          if (i === 0) {
+            this.pendingShortArbs.delete(operationId);
+            return ack('SUBMISSION_REJECTED');
+          }
+          return ack('SUBMITTED_PENDING');
+        }
+        if (result.submissionState !== 'ACCEPTED' || !orderId) return ack('SUBMISSION_UNCERTAIN');
+        leg.submission = 'SUBMITTED';
+      } catch {
+        return ack('SUBMISSION_UNCERTAIN');
+      }
+    }
+    return ack('SUBMITTED_PENDING');
   }
 
   private log(message: string): void {
