@@ -18,7 +18,7 @@ function fixture(a = 'SUCCESS', b = 'SUCCESS', sizeA = '4.25', sizeB = '4.25') {
     getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => trades[id])),
   };
   Object.assign(service, { tradingService: trading });
-  const pending: Pending = { id: 'op', conditionId: 'market',
+  const pending: Pending = { consumed: false, id: 'op', conditionId: 'market',
     legA: { tokenId: 'yes', orderId: 'a', submission: 'SUBMITTED' },
     legB: { tokenId: 'no', orderId: 'b', submission: 'SUBMITTED' } };
   service['pendingShortArbs'].set(pending.id, pending);
@@ -93,7 +93,7 @@ describe('P0.3e-2 short-arb session state machine', () => {
   });
   it.each(['MATCHED', 'ERROR'])('independent operation progresses despite %s operation', async mode => {
     const h = fixture('MATCHED', 'MATCHED');
-    const other: Pending = { id: 'other', conditionId: 'other-market', legA: { tokenId: 'x', orderId: 'c', submission: 'SUBMITTED' },
+    const other: Pending = { consumed: false, id: 'other', conditionId: 'other-market', legA: { tokenId: 'x', orderId: 'c', submission: 'SUBMITTED' },
       legB: { tokenId: 'y', orderId: 'd', submission: 'SUBMITTED' } };
     h.trades.c = { id: 'c', status: 'MINED', size: '3', price: '0.4', transactionHash: 'tx-c' };
     h.trades.d = { id: 'd', status: 'MINED', size: '3', price: '0.7', transactionHash: 'tx-d' };

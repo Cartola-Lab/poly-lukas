@@ -73,8 +73,8 @@ async function submit(h: ReturnType<typeof fixture>, op = opportunity): Promise<
   return result;
 }
 
-function noEconomy(h: ReturnType<typeof fixture>, attempts = 1, timestamp = h.pending.size ? 100000 : 0, refreshes = attempts) {
-  expect(h.service.getStats()).toMatchObject({ executionsAttempted: attempts, executionsSucceeded: 0, totalProfit: 0 });
+function noEconomy(h: ReturnType<typeof fixture>, attempts = 1, timestamp = h.pending.size ? 100000 : 0, refreshes = attempts, settledSuccesses = 0) {
+  expect(h.service.getStats()).toMatchObject({ executionsAttempted: attempts, executionsSucceeded: settledSuccesses, totalProfit: 0 });
   expect(h.execution).not.toHaveBeenCalled();
   expect(h.recovery).not.toHaveBeenCalled();
   expect(h.ctf.mergeByTokenIds).not.toHaveBeenCalled();
@@ -461,13 +461,13 @@ describe('short pacing through real automatic and scheduled paths', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(flush).toHaveBeenCalledTimes(1);
     expect(h.pending.get(first.operationId)?.finalized).toBe(false);
-    expect(h.pending.get(second.operationId)?.finalized).toBe(true);
+    expect(h.pending.has(second.operationId)).toBe(false);
     expect(h.service['shortArbFlushPromise']).toBeNull();
     expect(h.trading.getTradeStatuses.mock.invocationCallOrder.at(-1)).toBeLessThan(h.ctf.getPusdBalance.mock.invocationCallOrder.at(-1)!);
-    noEconomy(h, 2, 100000, 4);
+    noEconomy(h, 2, 100000, 4, 1);
     await vi.advanceTimersByTimeAsync(30000);
     expect(h.pending.get(first.operationId)?.finalized).toBe(true);
-    noEconomy(h, 2, 100000, 5);
+    noEconomy(h, 2, 100000, 5, 1);
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(4);
     await h.service.stop();
     expect(vi.getTimerCount()).toBe(0);
@@ -491,8 +491,8 @@ describe('short pacing through real automatic and scheduled paths', () => {
     expect(h.pending.get(ack.operationId)?.finalized).toBe(false);
     await vi.advanceTimersByTimeAsync(30000);
     expect(flush).toHaveBeenCalledTimes(2);
-    expect(h.pending.get(ack.operationId)?.finalized).toBe(true);
-    noEconomy(h, 1, 100000, 4);
+    expect(h.pending.has(ack.operationId)).toBe(false);
+    noEconomy(h, 1, 100000, 4, 1);
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(2);
   });
 });
@@ -602,7 +602,7 @@ describe('post-terminal inventory release', () => {
     expect(second.operationId).not.toBe(first.operationId);
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(4);
     expect(h.trading.getOrderFillDetails).toHaveBeenCalledTimes(2);
-    noEconomy(h, 2, releasedAt, 5);
+    noEconomy(h, 2, releasedAt, 5, 1);
   });
 
   it('a refresh before terminalization does not release the operation', async () => {

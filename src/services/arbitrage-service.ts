@@ -297,13 +297,33 @@ type PendingShortArb = {
     legA: TerminalShortLeg;
     legB: TerminalShortLeg;
   };
+  consumed: boolean;
   finalized?: boolean;
   inventoryReconciled?: boolean;
 };
 
+/** Factual notification only; no realized-profit contract. */
+export type ShortArbSettledLeg = Readonly<{
+  tokenId: string; orderId?: string; submission: 'SUBMITTED' | 'REJECTED';
+}> & (
+  | Readonly<{ state: 'REJECTED' | 'TERMINAL_FAILED' }>
+  | Readonly<{ state: 'TERMINAL_SUCCESS'; successShares: number;
+      /** Decimal integer string: 100 successUnits = 1 share. */
+      successUnits: string; weightedPrice: number; txHashes: readonly string[] }>
+);
+export interface ShortArbSettledEvent {
+  readonly operationId: string;
+  readonly conditionId: string;
+  readonly classification: NonNullable<PendingShortArb['terminalResult']>['state'];
+  readonly legA: ShortArbSettledLeg;
+  readonly legB: ShortArbSettledLeg;
+  readonly inventoryReconciled: boolean;
+}
+
 export interface ArbitrageServiceEvents {
   opportunity: (opportunity: ArbitrageOpportunity) => void;
   execution: (result: ArbitrageExecutionResult) => void;
+  shortArbSettled: (result: ShortArbSettledEvent) => void;
   balanceUpdate: (balance: BalanceState) => void;
   orderbookUpdate: (orderbook: OrderbookState) => void;
   rebalance: (result: RebalanceResult) => void;
@@ -349,6 +369,7 @@ export class ArbitrageService extends EventEmitter {
   private isExecuting = false;
   private pendingShortArbs = new Map<string, PendingShortArb>();
   private nextShortArbId = 0;
+  private shortArbConsuming = false;
   private shortArbFlushPromise: Promise<void> | null = null;
   private balanceRefreshVersion = 0;
   private lastExecutionTime = 0;
@@ -364,6 +385,7 @@ export class ArbitrageService extends EventEmitter {
     executionsAttempted: 0,
     executionsSucceeded: 0,
     totalProfit: 0,
+    shortArbTerminals: { BALANCED_SUCCESS: 0, IMBALANCED: 0, NO_FILL: 0, SUBMISSION_REJECTED: 0 },
     startTime: 0,
   };
 
@@ -477,6 +499,11 @@ export class ArbitrageService extends EventEmitter {
         } catch (error) {
           try { this.log(`Balance refresh: ${String(error)}`); } catch { /* preserve future cycles */ }
         }
+        try {
+          this.consumeTerminalShortArbs();
+        } catch (error) {
+          try { this.log(`Short-arb consumption: ${String(error)}`); } catch { /* preserve future cycles */ }
+        }
       }, 30000);
 
       // Start rebalancer if enabled
@@ -574,6 +601,7 @@ export class ArbitrageService extends EventEmitter {
   getStats() {
     return {
       ...this.stats,
+      shortArbTerminals: { ...this.stats.shortArbTerminals },
       runningTimeMs: this.isRunning ? Date.now() - this.stats.startTime : 0,
     };
   }
@@ -1851,6 +1879,80 @@ export class ArbitrageService extends EventEmitter {
     return this.shortArbFlushPromise;
   }
 
+  /** Session-local effects exactly once; notification attempted at most once.
+   * A throwing synchronous EventEmitter listener prevents later listeners running.
+   * No delivery acknowledgement or async-listener retry is provided.
+   */
+  private consumeTerminalShortArbs(): void {
+    // Nested passes must not consume operations created by a listener in this pass.
+    if (this.shortArbConsuming) return;
+    this.shortArbConsuming = true;
+    try {
+      for (const [id, pending] of [...this.pendingShortArbs]) {
+        if (this.pendingShortArbs.get(id) !== pending || pending.consumed === true) continue;
+        try {
+          if (pending.id !== id) throw new Error('Short-arb pending ID mismatch');
+          if (pending.finalized !== true) continue;
+          const terminal = pending.terminalResult;
+          if (!terminal) throw new Error('Missing short-arb terminal');
+          const validateLeg = (leg: PendingShortLeg, fact: TerminalShortLeg): void => {
+            if (!leg.tokenId?.trim()) throw new Error('Missing short-arb token');
+            if (fact.state === 'REJECTED') {
+              if (leg.submission !== 'REJECTED' || leg.settlement) throw new Error('Inconsistent rejected leg');
+              return;
+            }
+            if (leg.submission !== 'SUBMITTED' || !leg.orderId?.trim() || leg.settlement !== fact) {
+              throw new Error('Inconsistent submitted leg');
+            }
+            if (fact.state === 'TERMINAL_FAILED') return;
+            if (fact.state !== 'TERMINAL_SUCCESS' || typeof fact.successUnits !== 'bigint' || fact.successUnits <= 0n ||
+                !Number.isFinite(fact.successShares) || fact.successShares !== Number(fact.successUnits) / 100 ||
+                !Number.isFinite(fact.weightedPrice) || fact.weightedPrice <= 0 ||
+                !Array.isArray(fact.txHashes) || fact.txHashes.length === 0 ||
+                fact.txHashes.some(hash => typeof hash !== 'string' || !hash.trim())) {
+              throw new Error('Invalid successful short-arb facts');
+            }
+          };
+          validateLeg(pending.legA, terminal.legA);
+          validateLeg(pending.legB, terminal.legB);
+          const aSuccess = terminal.legA.state === 'TERMINAL_SUCCESS';
+          const bSuccess = terminal.legB.state === 'TERMINAL_SUCCESS';
+          const classification = terminal.legA.state === 'TERMINAL_SUCCESS' && terminal.legB.state === 'TERMINAL_SUCCESS' &&
+            terminal.legA.successUnits === terminal.legB.successUnits
+            ? 'BALANCED_SUCCESS' : aSuccess || bSuccess ? 'IMBALANCED'
+            : terminal.legA.state === 'TERMINAL_FAILED' && terminal.legB.state === 'TERMINAL_FAILED'
+              ? 'NO_FILL' : 'SUBMISSION_REJECTED';
+          if (terminal.state !== classification) throw new Error('Inconsistent short-arb classification');
+          if ((aSuccess || bSuccess) && pending.inventoryReconciled !== true) continue;
+          const snapshotLeg = (leg: PendingShortLeg, fact: TerminalShortLeg): ShortArbSettledLeg => {
+            const base = { tokenId: leg.tokenId, ...(leg.orderId ? { orderId: leg.orderId } : {}),
+              submission: fact.state === 'REJECTED' ? 'REJECTED' as const : 'SUBMITTED' as const };
+            if (fact.state !== 'TERMINAL_SUCCESS') return Object.freeze({ ...base, state: fact.state });
+            return Object.freeze({ ...base, state: fact.state, successShares: fact.successShares,
+              successUnits: fact.successUnits!.toString(), weightedPrice: fact.weightedPrice,
+              txHashes: Object.freeze([...fact.txHashes]) });
+          };
+          const legA = snapshotLeg(pending.legA, terminal.legA);
+          const legB = snapshotLeg(pending.legB, terminal.legB);
+          const snapshot: ShortArbSettledEvent = Object.freeze({ operationId: id, conditionId: pending.conditionId,
+            classification, legA, legB, inventoryReconciled: pending.inventoryReconciled === true });
+          pending.consumed = true;
+          try {
+            this.stats.shortArbTerminals[classification]++;
+            if (classification === 'BALANCED_SUCCESS') this.stats.executionsSucceeded++;
+            this.emit('shortArbSettled', snapshot);
+          } finally {
+            if (this.pendingShortArbs.get(id) === pending) this.pendingShortArbs.delete(id);
+          }
+        } catch (error) {
+          try { this.log(`Short-arb consumption ${id}: ${String(error)}`); } catch { /* isolate diagnostics */ }
+        }
+      }
+    } finally {
+      this.shortArbConsuming = false;
+    }
+  }
+
   private async executeShortArb(opportunity: ArbitrageOpportunity): Promise<ShortArbSubmissionAck> {
     const operationId = `short-${++this.nextShortArbId}`;
     const ack = (status: ShortArbSubmissionAck['status']): ShortArbSubmissionAck => ({
@@ -1869,7 +1971,7 @@ export class ArbitrageService extends EventEmitter {
 
     const pending: PendingShortArb = { id: operationId, conditionId: market.conditionId,
       legA: { tokenId: market.yesTokenId, submission: 'NOT_SUBMITTED' },
-      legB: { tokenId: market.noTokenId, submission: 'NOT_SUBMITTED' }, finalized: false };
+      legB: { tokenId: market.noTokenId, submission: 'NOT_SUBMITTED' }, finalized: false, consumed: false };
     this.pendingShortArbs.set(operationId, pending);
     const legs = [pending.legA, pending.legB];
     for (let i = 0; i < legs.length; i++) {

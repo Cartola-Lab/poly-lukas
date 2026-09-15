@@ -134,6 +134,8 @@ export type {
   ArbitrageServiceConfig,
   ArbitrageOpportunity as ArbitrageServiceOpportunity,
   ArbitrageExecutionResult,
+  ShortArbSettledEvent,
+  ShortArbSettledLeg,
   ArbitrageServiceEvents,
   OrderbookState,
   BalanceState,
