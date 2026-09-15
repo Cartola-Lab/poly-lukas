@@ -113,6 +113,8 @@ export interface Order {
 
 export interface OrderResult {
   success: boolean;
+  /** Market submission provenance only, never proof of economic settlement. */
+  submissionState?: 'ACCEPTED' | 'REJECTED' | 'UNCERTAIN';
   orderId?: string;
   orderIds?: string[];
   errorMsg?: string;
@@ -381,6 +383,7 @@ export class TradingService {
         : `Order shares (${params.amount.toFixed(2)}) are below local minimum (1 share)`;
       return {
         success: false,
+        submissionState: 'REJECTED',
         errorMsg: label,
       };
     }
@@ -415,6 +418,9 @@ export class TradingService {
 
         return {
           success,
+          submissionState: result.success === false ? 'REJECTED'
+            : result.success === true && typeof result.orderID === 'string' && result.orderID.trim().length > 0
+              ? 'ACCEPTED' : 'UNCERTAIN',
           orderId: result.orderID,
           orderIds: 'orderIDs' in result && Array.isArray(result.orderIDs) ? result.orderIDs : undefined,
           errorMsg: result.errorMsg,
@@ -424,6 +430,7 @@ export class TradingService {
       } catch (error) {
         return {
           success: false,
+          submissionState: 'UNCERTAIN',
           errorMsg: `Market order failed: ${error instanceof Error ? error.message : String(error)}`,
         };
       }
