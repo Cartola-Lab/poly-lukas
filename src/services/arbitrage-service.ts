@@ -367,6 +367,7 @@ export class ArbitrageService extends EventEmitter {
   };
 
   private isExecuting = false;
+  private rebalancerInventoryWrites = new Set<Pick<ArbitrageMarketConfig, 'conditionId' | 'yesTokenId' | 'noTokenId'>>();
   private pendingShortArbs = new Map<string, PendingShortArb>();
   private nextShortArbId = 0;
   private shortArbConsuming = false;
@@ -769,6 +770,13 @@ export class ArbitrageService extends EventEmitter {
               ? 'SUBMISSION_UNCERTAIN' : 'SUBMITTED_PENDING' };
         }
       }
+    }
+
+    // Admission refusal, not an economic execution result. No attempts or events.
+    const protectedShort = opportunity.type === 'long' ? this.getShortInventoryBlock(this.market) : undefined;
+    if (protectedShort) throw new Error(`Inventory write blocked by short ${protectedShort}`);
+    if (opportunity.type === 'short' && this.isRebalancerWriting(this.market)) {
+      throw new Error('Inventory write blocked by active rebalancer');
     }
 
     if (this.isExecuting) {
@@ -1493,8 +1501,26 @@ export class ArbitrageService extends EventEmitter {
     }
   }
 
+  private getShortInventoryBlock(market: ArbitrageMarketConfig | null): string | undefined {
+    if (!market) return;
+    for (const pending of this.pendingShortArbs.values()) {
+      if (pending.conditionId === market.conditionId && pending.legA.tokenId === market.yesTokenId &&
+          pending.legB.tokenId === market.noTokenId &&
+          (pending.finalized !== true || (pending.inventoryReconciled !== true &&
+            (pending.terminalResult?.legA.state === 'TERMINAL_SUCCESS' ||
+             pending.terminalResult?.legB.state === 'TERMINAL_SUCCESS')))) return pending.id;
+    }
+  }
+
+  private isRebalancerWriting(market: ArbitrageMarketConfig | null): boolean {
+    return !!market && [...this.rebalancerInventoryWrites].some(writer =>
+      writer.conditionId === market.conditionId && writer.yesTokenId === market.yesTokenId &&
+      writer.noTokenId === market.noTokenId);
+  }
+
   private async checkAndRebalance(): Promise<void> {
     if (!this.isRunning || this.isExecuting) return;
+    if (this.getShortInventoryBlock(this.market) || this.isRebalancerWriting(this.market)) return;
 
     // Check cooldown
     const timeSinceLastRebalance = Date.now() - this.lastRebalanceTime;
@@ -1503,11 +1529,22 @@ export class ArbitrageService extends EventEmitter {
     }
 
     await this.updateBalance();
+    // A short may start during the balance read or its synchronous notification.
+    if (this.getShortInventoryBlock(this.market) || this.isRebalancerWriting(this.market)) return;
     const action = this.calculateRebalanceAction();
 
-    if (action.type !== 'none' && action.amount >= this.config.minTradeSize) {
-      await this.rebalance(action);
-      this.lastRebalanceTime = Date.now();
+    if (action.type !== 'none' && action.amount >= this.config.minTradeSize && this.market) {
+      // Preparation may admit a short (the second guard aborts us). Once writing
+      // starts, claim before rebalance can yield inside an external submission.
+      const writer = { conditionId: this.market.conditionId,
+        yesTokenId: this.market.yesTokenId, noTokenId: this.market.noTokenId };
+      this.rebalancerInventoryWrites.add(writer);
+      try {
+        await this.rebalance(action);
+        this.lastRebalanceTime = Date.now();
+      } finally {
+        this.rebalancerInventoryWrites.delete(writer);
+      }
     }
   }
 

@@ -269,8 +269,7 @@ describe('P0.3e-3b real short submission lifecycle', () => {
     expect(h.service['lastExecutionTime']).toBe(0);
     expect(h.service['nextShortArbId']).toBe(1);
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(1);
-    const long = await h.service.execute({ ...opportunity, type: 'long' });
-    expect(long).toMatchObject({ success: false, error: 'Another execution in progress' });
+    await expect(h.service.execute({ ...opportunity, type: 'long' })).rejects.toThrow('Inventory write blocked');
     a.resolve(rejected);
     expect((await first).operationId).toBe(blocked.type === 'SHORT_SUBMISSION' && blocked.operationId);
     noEconomy(h);
@@ -362,10 +361,11 @@ describe('P0.3e-3b real short submission lifecycle', () => {
 });
 
 describe('long wrapper and real execution remain legacy results', () => {
-  it.each([false, true])('runs real buys and merge with existing short pending=%s', async existing => {
+  it.each([false, true])('runs real buys and merge with nonconflicting short pending=%s', async existing => {
     const h = fixture();
     if (existing) {
       await submit(h);
+      h.market.conditionId = 'other-condition';
       h.trading.createMarketOrder.mockClear().mockResolvedValue(accepted('long'));
     }
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '10', noBalance: '10' });
@@ -375,7 +375,7 @@ describe('long wrapper and real execution remain legacy results', () => {
     expect(result.executionTimeMs).toBeGreaterThanOrEqual(0);
     expect(h.trading.createMarketOrder).toHaveBeenNthCalledWith(1, { tokenId: 'yes', side: 'BUY', amount: 4, price: 0.41, orderType: 'FOK' });
     expect(h.trading.createMarketOrder).toHaveBeenNthCalledWith(2, { tokenId: 'no', side: 'BUY', amount: 5, price: 0.51, orderType: 'FOK' });
-    expect(h.ctf.mergeByTokenIds).toHaveBeenCalledWith('condition', { yesTokenId: 'yes', noTokenId: 'no' }, '10', { negRisk: false });
+    expect(h.ctf.mergeByTokenIds).toHaveBeenCalledWith(h.market.conditionId, { yesTokenId: 'yes', noTokenId: 'no' }, '10', { negRisk: false });
     expect(h.service.getStats()).toMatchObject({ executionsAttempted: existing ? 2 : 1, executionsSucceeded: 1, totalProfit: 1 });
     expect(h.execution).toHaveBeenCalledTimes(1);
     expect(h.execution).toHaveBeenCalledWith(result);
@@ -657,11 +657,17 @@ describe('post-terminal inventory release', () => {
     noEconomy(h, 2, 100000);
   });
 
-  it('long arb executes normally while a finalized refresh-pending short exists', async () => {
+  it('long arb waits for inventory reconciliation then executes normally', async () => {
     const h = fixture();
     const first = await submit(h);
     await h.flush();
     expect(h.pending.get(first.operationId)).toMatchObject({ finalized: true, inventoryReconciled: false });
+    const stats = h.service.getStats();
+    await expect(h.service.execute({ ...opportunity, type: 'long' })).rejects.toThrow('Inventory write blocked');
+    expect(h.service.getStats()).toEqual(stats);
+    expect(h.execution).not.toHaveBeenCalled();
+    expect(h.ctf.mergeByTokenIds).not.toHaveBeenCalled();
+    await h.service['updateBalance']();
     h.trading.createMarketOrder.mockClear().mockResolvedValue(accepted('long'));
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '10', noBalance: '10' });
     const result = await h.service.execute({ ...opportunity, type: 'long' });
