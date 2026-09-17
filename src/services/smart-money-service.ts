@@ -26,6 +26,7 @@
  * 验证跟单结果请使用 TradingService.getTrades()
  */
 
+import { ethers } from 'ethers';
 import type { WalletService, TimePeriod, PeriodLeaderboardEntry } from './wallet-service.js';
 import type { RealtimeServiceV2, ActivityTrade } from './realtime-service-v2.js';
 import type { TradingService, OrderResult } from './trading-service.js';
@@ -147,7 +148,27 @@ export interface SmartMoneyTrade {
 /**
  * Auto copy trading options
  */
+export type SmartMoneyInventoryQuery = Readonly<{ walletAddress: string; tokenIds: readonly string[] }>;
+export type SmartMoneyInventoryProtection = Readonly<{
+  blocked: true;
+  reason: 'SMART_MONEY_ACTIVE' | 'SMART_MONEY_UNCERTAIN' | 'SMART_MONEY_PENDING' | 'SMART_MONEY_OPEN_LOT';
+  operationId?: string;
+}>;
+type CopyInventoryWriter = { localOperationId: string; wallet: string; tokenId: string;
+  side: 'BUY' | 'SELL'; state: 'ACTIVE' | 'UNCERTAIN' };
+type CopyInventoryContext = {
+  wallet?: string;
+  writers: Map<string, CopyInventoryWriter>;
+  pending: Map<string, { tokenId: string; side: 'BUY' | 'SELL' }>;
+  tracker: CopyPnlTracker;
+};
+
 export interface AutoCopyTradingOptions {
+  /** Opt-in synchronous inventory admission, separate from economic risk gates. */
+  inventoryAdmissionGuard?: (query: SmartMoneyInventoryQuery & Readonly<{
+    side: 'BUY' | 'SELL'; source: 'SMART_MONEY';
+  }>) => string | undefined;
+
   /** Specific wallet addresses to follow */
   targetAddresses?: string[];
   /** Follow top N from leaderboard */
@@ -805,6 +826,73 @@ export class SmartMoneyService {
   private marketService: MarketService | null = null;
   private walletHealth: Map<string, CopyWalletHealth> = new Map();
   private liveQuoteWarningLogged = false;
+  // Opt-in session contexts only; no persistence or restart/recovery policy.
+  private inventoryContexts = new Set<CopyInventoryContext>();
+  private nextInventoryOperation = 0;
+
+  getInventoryProtection(query: SmartMoneyInventoryQuery): SmartMoneyInventoryProtection | undefined {
+    const wallet = this.inventoryWallet(query.walletAddress);
+    if (!query.tokenIds.length || query.tokenIds.some(t => typeof t !== 'string' || !t.trim())) {
+      throw new Error('Invalid inventory token identity');
+    }
+    for (const context of this.inventoryContexts) {
+      if (context.wallet !== wallet) continue;
+      for (const writer of context.writers.values()) {
+        if (query.tokenIds.includes(writer.tokenId)) return Object.freeze({ blocked: true,
+          reason: writer.state === 'ACTIVE' ? 'SMART_MONEY_ACTIVE' : 'SMART_MONEY_UNCERTAIN',
+          operationId: writer.localOperationId });
+      }
+      for (const [orderId, pending] of context.pending) {
+        if (query.tokenIds.includes(pending.tokenId)) return Object.freeze({
+          blocked: true, reason: 'SMART_MONEY_PENDING', operationId: orderId });
+      }
+      if (query.tokenIds.some(token => context.tracker.openLots(token).some(lot => lot.qty !== 0))) {
+        return Object.freeze({ blocked: true, reason: 'SMART_MONEY_OPEN_LOT' });
+      }
+    }
+  }
+
+  private inventoryWallet(address: string): string {
+    if (!ethers.utils.isAddress(address)) throw new Error('Invalid inventory wallet identity');
+    return ethers.utils.getAddress(address).toLowerCase();
+  }
+
+  private beginCopyInventory(context: CopyInventoryContext, tokenId: string, side: 'BUY' | 'SELL',
+    guard: NonNullable<AutoCopyTradingOptions['inventoryAdmissionGuard']>): CopyInventoryWriter | undefined {
+    try {
+      const wallet = this.inventoryWallet(this.tradingService.getAddress());
+      if (!tokenId.trim()) throw new Error('Invalid inventory token identity');
+      if (context.wallet && context.wallet !== wallet) throw new Error('Inventory wallet changed');
+      const query = Object.freeze({ walletAddress: wallet, tokenIds: Object.freeze([tokenId]),
+        side, source: 'SMART_MONEY' as const });
+      const reason = guard(query);
+      if (reason) throw new Error(reason);
+      // Recheck local state after the external callback (including reentrancy).
+      for (const current of this.inventoryContexts) {
+        if (current.wallet !== wallet) continue;
+        if ([...current.writers.values()].some(w => w.tokenId === tokenId) ||
+            [...current.pending.values()].some(p => p.tokenId === tokenId)) {
+          throw new Error('Smart Money submission or settlement pending');
+        }
+        const lots = current.tracker.openLots(tokenId);
+        // Only the opposite side may conclude an existing FIFO lifecycle.
+        // Another subscription's lots cannot be closed by this tracker.
+        if (lots.some(lot => lot.qty !== 0 &&
+            (current !== context || (side === 'BUY' ? lot.qty > 0 : lot.qty < 0)))) {
+          throw new Error('Smart Money position already open');
+        }
+      }
+      context.wallet = wallet;
+      const writer: CopyInventoryWriter = { localOperationId: `copy-${++this.nextInventoryOperation}`,
+        wallet, tokenId, side, state: 'ACTIVE' };
+      context.writers.set(writer.localOperationId, writer);
+      return writer;
+    } catch (error) {
+      // Operational refusal: never enter the failed-trade/accounting branch.
+      console.warn('[SmartMoneyService] Inventory admission blocked:', error);
+      return;
+    }
+  }
 
   constructor(
     walletService: WalletService,
@@ -1177,6 +1265,10 @@ export class SmartMoneyService {
     // Subscription-local state: no timers or persistence. Retain finalized IDs to
     // reject a repeated order result even after its pending entry is removed.
     const pendingFills = new Map<string, { tokenId: string; side: 'BUY' | 'SELL' }>();
+    const inventory = options.inventoryAdmissionGuard && !dryRun
+      ? { writers: new Map<string, CopyInventoryWriter>(), pending: pendingFills, tracker: pnlTracker } as CopyInventoryContext
+      : undefined;
+    if (inventory) this.inventoryContexts.add(inventory);
     const finalizedOrderIds = new Set<string>();
     let flushPromise: Promise<void> | null = null;
     const parseShares = (value: unknown): bigint => {
@@ -1191,6 +1283,8 @@ export class SmartMoneyService {
       // Defer work until the shared promise is installed, including reentrancy.
       flushPromise = Promise.resolve().then(async () => {
         for (const [orderId, fill] of [...pendingFills]) {
+          // A claimed but failed accounting transition stays protected, never replayed.
+          if (inventory && finalizedOrderIds.has(orderId)) continue;
           try {
             const details = await this.tradingService.getOrderFillDetails(orderId);
             const matched = parseShares(details.sizeMatched);
@@ -1228,10 +1322,15 @@ export class SmartMoneyService {
                 !Number.isFinite(settledFee)) throw new Error('Invalid settlement accounting totals');
 
             // Claim before non-idempotent accounting and external callbacks.
-            pendingFills.delete(orderId);
+            if (!inventory) pendingFills.delete(orderId);
             finalizedOrderIds.add(orderId);
-            if (settledUnits === 0n) continue; // All children FAILED.
+            if (settledUnits === 0n) {
+              pendingFills.delete(orderId);
+              continue; // All children FAILED.
+            }
             const close = pnlTracker.recordFill(fill.tokenId, fill.side, settledShares, notional / settledShares, settledFee);
+            // Keep pending ownership through recordFill, including reentrant observers.
+            pendingFills.delete(orderId);
             stats.realizedPnlUsd = pnlTracker.totalRealizedUsd;
             if (close.closedSize > 0) {
               options.onCopyPnl?.({
@@ -1411,13 +1510,33 @@ export class SmartMoneyService {
               copy: { size: copySize.toFixed(2), usdc: usdcAmount.toFixed(2) },
             });
           } else {
-            result = await this.tradingService.createMarketOrder({
-              tokenId,
-              side: trade.side,
-              amount: trade.side === 'BUY' ? usdcAmount : copySize,
-              price: slippagePrice,
-              orderType,
-            });
+            const writer = inventory
+              ? this.beginCopyInventory(inventory, tokenId, trade.side, options.inventoryAdmissionGuard!) : undefined;
+            if (inventory && !writer) return;
+            try {
+              result = await this.tradingService.createMarketOrder({
+                tokenId,
+                side: trade.side,
+                amount: trade.side === 'BUY' ? usdcAmount : copySize,
+                price: slippagePrice,
+                orderType,
+              });
+            } catch (error) {
+              if (writer) writer.state = 'UNCERTAIN';
+              throw error;
+            }
+            if (inventory && writer) {
+              const orderId = typeof result.orderId === 'string' ? result.orderId.trim() : '';
+              if (result.submissionState === 'REJECTED') {
+                inventory.writers.delete(writer.localOperationId);
+              } else if (result.submissionState === 'ACCEPTED' && orderId) {
+                // A reused order identity cannot prove ownership of this new attempt.
+                if (!finalizedOrderIds.has(orderId) && !pendingFills.has(orderId)) {
+                  pendingFills.set(orderId, { tokenId, side: trade.side });
+                  inventory.writers.delete(writer.localOperationId);
+                } else writer.state = 'UNCERTAIN';
+              } else writer.state = 'UNCERTAIN';
+            }
           }
 
           if (result.success) {
@@ -1427,7 +1546,7 @@ export class SmartMoneyService {
             health.copiesExecuted++;
             health.consecutiveFailures = 0;
             this.bumpWalletCounter(stats, walletAddr, 'executed');
-            if (!dryRun) {
+            if (!dryRun && !inventory) {
               const orderId = typeof result.orderId === 'string' ? result.orderId.trim() : '';
               if (!orderId) {
                 console.warn('[SmartMoneyService] Successful copy without usable orderId; accounting withheld');
