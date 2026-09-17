@@ -259,6 +259,29 @@ export interface AutoCopyTradingOptions {
   onError?: (error: Error) => void;
 }
 
+function normalizeAutoCopyOptions(options: AutoCopyTradingOptions) {
+  // One source of effective defaults for both session compatibility and execution.
+  return {
+    ...options,
+    targetAddresses: [...new Set((options.targetAddresses ?? []).map(a => a.toLowerCase()))].sort(),
+    topN: options.topN ?? 0,
+    minWalletPnl: options.minWalletPnl ?? 0,
+    sizeScale: options.sizeScale ?? 0.1,
+    maxSizePerTrade: options.maxSizePerTrade ?? 50,
+    maxSlippage: options.maxSlippage ?? 0.03,
+    orderType: options.orderType ?? 'FOK',
+    minTradeSize: options.minTradeSize ?? 10,
+    delay: options.delay ?? 0,
+    dryRun: options.dryRun ?? false,
+    maxStalenessMs: options.maxStalenessMs ?? 5000,
+    maxSpreadPct: options.maxSpreadPct ?? 0.02,
+    maxCopyPremiumPct: options.maxCopyPremiumPct ?? 0.01,
+    maxConsecutiveFailures: options.maxConsecutiveFailures ?? 3,
+    walletCooldownMs: options.walletCooldownMs ?? 3600000,
+    feeRateBps: options.feeRateBps ?? 0,
+  };
+}
+
 /**
  * Auto copy trading statistics
  */
@@ -301,6 +324,9 @@ export interface AutoCopyTradingSubscription {
   isActive: boolean;
   stats: AutoCopyTradingStats;
   stop: () => void;
+  resume: () => Promise<void>;
+  reconcile: () => Promise<void>;
+  dispose: () => void;
   getStats: () => AutoCopyTradingStats;
 }
 
@@ -829,6 +855,9 @@ export class SmartMoneyService {
   // Opt-in session contexts only; no persistence or restart/recovery policy.
   private inventoryContexts = new Set<CopyInventoryContext>();
   private nextInventoryOperation = 0;
+  private copySession?: AutoCopyTradingSubscription;
+  private copySessionInitialization?: Promise<AutoCopyTradingSubscription>;
+  private copySessionOptions?: AutoCopyTradingOptions;
 
   getInventoryProtection(query: SmartMoneyInventoryQuery): SmartMoneyInventoryProtection | undefined {
     const wallet = this.inventoryWallet(query.walletAddress);
@@ -858,14 +887,17 @@ export class SmartMoneyService {
   }
 
   private beginCopyInventory(context: CopyInventoryContext, tokenId: string, side: 'BUY' | 'SELL',
-    guard: NonNullable<AutoCopyTradingOptions['inventoryAdmissionGuard']>): CopyInventoryWriter | undefined {
+    guard: NonNullable<AutoCopyTradingOptions['inventoryAdmissionGuard']>,
+    isCurrent: () => boolean): CopyInventoryWriter | undefined {
     try {
       const wallet = this.inventoryWallet(this.tradingService.getAddress());
       if (!tokenId.trim()) throw new Error('Invalid inventory token identity');
       if (context.wallet && context.wallet !== wallet) throw new Error('Inventory wallet changed');
       const query = Object.freeze({ walletAddress: wallet, tokenIds: Object.freeze([tokenId]),
         side, source: 'SMART_MONEY' as const });
+      if (!isCurrent()) return;
       const reason = guard(query);
+      if (!isCurrent()) return;
       if (reason) throw new Error(reason);
       // Recheck local state after the external callback (including reentrancy).
       for (const current of this.inventoryContexts) {
@@ -882,6 +914,7 @@ export class SmartMoneyService {
           throw new Error('Smart Money position already open');
         }
       }
+      if (!isCurrent()) return;
       context.wallet = wallet;
       const writer: CopyInventoryWriter = { localOperationId: `copy-${++this.nextInventoryOperation}`,
         wallet, tokenId, side, state: 'ACTIVE' };
@@ -1106,14 +1139,19 @@ export class SmartMoneyService {
 
     // Start subscription if not active
     if (!this.activeSubscription) {
-      this.activeSubscription = this.realtimeService.subscribeAllActivity({
-        onTrade: (activityTrade: ActivityTrade) => {
-          this.handleActivityTrade(activityTrade, options);
-        },
-        onError: (error) => {
-          console.error('[SmartMoneyService] Subscription error:', error);
-        },
-      });
+      try {
+        this.activeSubscription = this.realtimeService.subscribeAllActivity({
+          onTrade: (activityTrade: ActivityTrade) => {
+            this.handleActivityTrade(activityTrade, options);
+          },
+          onError: (error) => {
+            console.error('[SmartMoneyService] Subscription error:', error);
+          },
+        });
+      } catch (error) {
+        this.tradeHandlers.delete(onTrade);
+        throw error;
+      }
     }
 
     return {
@@ -1203,7 +1241,37 @@ export class SmartMoneyService {
    * sub.stop();
    * ```
    */
-  async startAutoCopyTrading(options: AutoCopyTradingOptions): Promise<AutoCopyTradingSubscription> {
+  startAutoCopyTrading(options: AutoCopyTradingOptions): Promise<AutoCopyTradingSubscription> {
+    // Compare effective values; callback references are preserved unchanged.
+    const snapshot = normalizeAutoCopyOptions(options);
+    if (this.copySessionOptions) {
+      const previous = this.copySessionOptions;
+      const keys = new Set([...Object.keys(previous), ...Object.keys(snapshot)]) as Set<keyof AutoCopyTradingOptions>;
+      const compatible = [...keys].every(key => key === 'targetAddresses'
+        ? JSON.stringify(previous[key]) === JSON.stringify(snapshot[key])
+        : previous[key] === snapshot[key]);
+      if (!compatible) return Promise.reject(new Error('Incompatible auto-copy session options'));
+    }
+    if (this.copySessionInitialization) return this.copySessionInitialization;
+    if (this.copySession) {
+      const session = this.copySession;
+      return session.resume().then(() => session);
+    }
+    this.copySessionOptions = snapshot;
+    // Install the shared promise before resolving targets or installing a listener.
+    this.copySessionInitialization = Promise.resolve().then(() => this.createAutoCopySession(snapshot))
+      .then(async session => {
+        this.copySession = session;
+        await session.resume();
+        return session;
+      }).finally(() => {
+        this.copySessionInitialization = undefined;
+        if (!this.copySession) this.copySessionOptions = undefined;
+      });
+    return this.copySessionInitialization;
+  }
+
+  private async createAutoCopySession(options: ReturnType<typeof normalizeAutoCopyOptions>): Promise<AutoCopyTradingSubscription> {
     const startTime = Date.now();
 
     // Build target list
@@ -1217,7 +1285,7 @@ export class SmartMoneyService {
       const smartMoneyList = await this.getSmartMoneyList(options.topN);
       // P9: minimum profit filter also applies to leaderboard-resolved wallets
       // (explicit targetAddresses are opt-in and skip this gate).
-      const minWalletPnl = options.minWalletPnl ?? 0;
+      const minWalletPnl = options.minWalletPnl;
       const topAddresses = smartMoneyList
         .filter(w => w.pnl >= minWalletPnl)
         .map(w => w.address);
@@ -1243,21 +1311,10 @@ export class SmartMoneyService {
       perWallet: {},
     };
 
-    // Config
-    const sizeScale = options.sizeScale ?? 0.1;
-    const maxSizePerTrade = options.maxSizePerTrade ?? 50;
-    const maxSlippage = options.maxSlippage ?? 0.03;
-    const orderType = options.orderType ?? 'FOK';
-    const minTradeSize = options.minTradeSize ?? 10;
-    const sideFilter = options.sideFilter;
-    const delay = options.delay ?? 0;
-    const dryRun = options.dryRun ?? false;
-    const maxStalenessMs = options.maxStalenessMs ?? 5000;
-    const maxSpreadPct = options.maxSpreadPct ?? 0.02;
-    const maxCopyPremiumPct = options.maxCopyPremiumPct ?? 0.01;
-    const maxConsecutiveFailures = options.maxConsecutiveFailures ?? 3;
-    const walletCooldownMs = options.walletCooldownMs ?? 3600000;
-    const feeRateBps = options.feeRateBps ?? 0;
+    // Defaults have already been applied by the shared normalization step.
+    const { sizeScale, maxSizePerTrade, maxSlippage, orderType, minTradeSize, sideFilter,
+      delay, dryRun, maxStalenessMs, maxSpreadPct, maxCopyPremiumPct,
+      maxConsecutiveFailures, walletCooldownMs, feeRateBps } = options;
 
     // FIFO accounting is applied only after factual settlement reconciliation.
     const pnlTracker = new CopyPnlTracker();
@@ -1358,13 +1415,23 @@ export class SmartMoneyService {
       );
     }
 
-    // Subscribe
-    const subscription = this.subscribeSmartMoneyTrades(
-      async (trade: SmartMoneyTrade) => {
+    let active = false;
+    let disposed = false;
+    let generation = 0;
+    let listener: { unsubscribe: () => void } | undefined;
+    let resumePromise: Promise<void> | undefined;
+    const touchedTokens = new Set<string>();
+    // Disposal safety also applies to legacy sessions without inventory isolation.
+    const unsettledSubmissions = new Set<object>();
+    const processTrade = async (trade: SmartMoneyTrade, listenerGeneration: number) => {
+        const isCurrent = () => !disposed && active && listenerGeneration === generation;
+        if (!isCurrent()) return;
+        let submissionStarted = false;
         stats.tradesDetected++;
 
         try {
           if (pendingFills.size > 0 || flushPromise) await flushPendingFills();
+          if (!isCurrent()) return;
           // Check target
           const walletAddr = trade.traderAddress.toLowerCase();
           if (!targetAddresses.includes(walletAddr)) {
@@ -1423,6 +1490,7 @@ export class SmartMoneyService {
           // Delay (worsens staleness — live re-quote below compensates)
           if (delay > 0) {
             await new Promise(resolve => setTimeout(resolve, delay));
+            if (!isCurrent()) return;
           }
 
           // Token
@@ -1440,6 +1508,7 @@ export class SmartMoneyService {
           if (this.marketService) {
             try {
               const book = await this.marketService.getTokenOrderbook(tokenId);
+              if (!isCurrent()) return;
               const bestAsk = book.asks[0]?.price;
               const bestBid = book.bids[0]?.price;
               const bestAskSize = book.asks[0]?.size ?? 0;
@@ -1468,6 +1537,7 @@ export class SmartMoneyService {
             }
           }
 
+          if (!isCurrent()) return;
           if (quoteGuardFailed) {
             stats.tradesSkipped++;
             stats.quoteGuardSkipped++;
@@ -1491,6 +1561,7 @@ export class SmartMoneyService {
               usdcAmount,
               marketKey: trade.conditionId ?? trade.marketSlug ?? 'unknown',
             });
+            if (!isCurrent()) return;
             if (blockReason) {
               stats.tradesSkipped++;
               this.bumpWalletCounter(stats, walletAddr, 'skipped');
@@ -1498,8 +1569,10 @@ export class SmartMoneyService {
             }
           }
 
+          if (!isCurrent()) return;
           // Execute
           let result: OrderResult;
+          let submission: object | undefined;
 
           if (dryRun) {
             result = { success: true, orderId: `dry_run_${Date.now()}` };
@@ -1511,8 +1584,16 @@ export class SmartMoneyService {
             });
           } else {
             const writer = inventory
-              ? this.beginCopyInventory(inventory, tokenId, trade.side, options.inventoryAdmissionGuard!) : undefined;
+              ? this.beginCopyInventory(inventory, tokenId, trade.side, options.inventoryAdmissionGuard!, isCurrent) : undefined;
             if (inventory && !writer) return;
+            if (!isCurrent()) {
+              if (inventory && writer) inventory.writers.delete(writer.localOperationId);
+              return;
+            }
+            touchedTokens.add(tokenId);
+            submission = {};
+            unsettledSubmissions.add(submission);
+            submissionStarted = true;
             try {
               result = await this.tradingService.createMarketOrder({
                 tokenId,
@@ -1564,24 +1645,79 @@ export class SmartMoneyService {
             this.bumpWalletCounter(stats, walletAddr, 'failed');
           }
 
+          // Transport has returned and successor ownership has been installed.
+          // Keep ambiguous legacy responses as disposal blockers as well.
+          if (submission && (result.submissionState === 'REJECTED' ||
+              (typeof result.orderId === 'string' && result.orderId.trim() &&
+                (result.submissionState === 'ACCEPTED' || (!inventory && result.success))))) {
+            unsettledSubmissions.delete(submission);
+          }
           options.onTrade?.(trade, result);
         } catch (error) {
+          if (!submissionStarted && !isCurrent()) return;
           stats.tradesFailed++;
           options.onError?.(error instanceof Error ? error : new Error(String(error)));
         }
-      },
-      { filterAddresses: targetAddresses, minSize: minTradeSize }
-    );
+      };
 
-    return {
-      id: subscription.id,
+    const session: AutoCopyTradingSubscription = {
+      id: `smart_money_${startTime}`,
       targetAddresses,
       startTime,
-      isActive: true,
+      get isActive() { return active; },
       stats,
-      stop: () => subscription.unsubscribe(),
+      stop: () => {
+        if (!active && !resumePromise) return;
+        active = false;
+        generation++;
+        resumePromise = undefined;
+        const previous = listener;
+        listener = undefined;
+        previous?.unsubscribe();
+      },
+      resume: () => {
+        if (disposed) return Promise.reject(new Error('Auto-copy session disposed'));
+        if (resumePromise) return resumePromise;
+        if (active) return Promise.resolve();
+        const nextGeneration = ++generation;
+        const operation = Promise.resolve().then(() => {
+          if (disposed || nextGeneration !== generation) return;
+          try {
+            const installed = this.subscribeSmartMoneyTrades(
+              // Some providers deliver immediately while installing. Admit only
+              // after installation succeeds; failed/invalidated generations stay closed.
+              trade => active ? processTrade(trade, nextGeneration)
+                : Promise.resolve().then(() => processTrade(trade, nextGeneration)),
+              { filterAddresses: targetAddresses, minSize: minTradeSize });
+            if (disposed || nextGeneration !== generation) {
+              installed.unsubscribe();
+              return;
+            }
+            listener = installed;
+            active = true;
+          } catch (error) {
+            active = false;
+            generation++;
+            throw error;
+          }
+        }).finally(() => { if (resumePromise === operation) resumePromise = undefined; });
+        resumePromise = operation;
+        return operation;
+      },
+      reconcile: () => disposed ? Promise.reject(new Error('Auto-copy session disposed')) : flushPendingFills(),
+      dispose: () => {
+        if (disposed) return;
+        if (active || resumePromise || flushPromise || unsettledSubmissions.size || pendingFills.size ||
+            inventory?.writers.size || [...touchedTokens].some(token => pnlTracker.openLots(token).some(lot => lot.qty !== 0))) {
+          throw new Error('Auto-copy session still active or economically protected');
+        }
+        disposed = true;
+        generation++;
+        if (inventory) this.inventoryContexts.delete(inventory);
+      },
       getStats: () => ({ ...stats }),
     };
+    return session;
   }
 
   // ============================================================================
