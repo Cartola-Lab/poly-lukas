@@ -601,7 +601,7 @@ export interface DipArbSettleResult {
  * 待赎回的仓位
  * 用于跟踪市场结束后需要赎回的仓位
  */
-export interface DipArbPendingRedemption {
+export type DipArbPendingRedemption = {
   /** 市场配置 */
   market: DipArbMarketConfig;
   /** 轮次状态（包含持仓信息） */
@@ -614,7 +614,10 @@ export interface DipArbPendingRedemption {
   retryCount: number;
   /** 最后一次尝试时间 */
   lastRetryAt?: number;
-}
+} & (
+  | { state?: 'RETRYABLE' }
+  | { state: 'CONFIRMED_PAYOUT_PENDING'; transactionHash: string; historicalWallet: string }
+);
 
 /**
  * 市场轮换事件

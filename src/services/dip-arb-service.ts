@@ -39,7 +39,8 @@ import {
 } from './realtime-service-v2.js';
 import { TradingService, type MarketOrderParams, type OrderResult } from './trading-service.js';
 import { MarketService } from './market-service.js';
-import { CTFClient, type LifecycleRouting } from '../clients/ctf-client.js';
+import { CTFClient, MergeProvenanceError, RedeemProvenanceError, type MergeProvenance,
+  type MergeResult, type RedeemResult, type LifecycleRouting } from '../clients/ctf-client.js';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
 import { estimateTakerFee, calculateNetLongArbProfit } from '../utils/price-utils.js';
 import type { Side } from '../core/types.js';
@@ -79,7 +80,7 @@ import {
 export type DipArbInventoryQuery = Readonly<{ walletAddress: string; tokenIds: readonly string[] }>;
 export type DipArbClobWriter = 'LEG1' | 'LEG2' | 'EMERGENCY_EXIT' | 'SETTLE_SELL';
 export type DipArbInventoryAdmissionGuard = (query: DipArbInventoryQuery & Readonly<{
-  operationType: DipArbClobWriter;
+  operationType: DipArbClobWriter | 'MERGE' | 'REDEEM';
 }>) => string | undefined;
 export type DipArbInventoryProtection = Readonly<{ blocked: true; reason: string; operationId: string }>;
 type ClobScope = { originMarket: DipArbMarketConfig; wallet: string | undefined; market: DipArbMarketConfig; round: DipArbRoundState; trading: TradingService;
@@ -89,6 +90,11 @@ type ClobLifecycle = { operationId: string; wallet: string; tokenIds: readonly s
   submission: 'ACTIVE' | 'ACCEPTED' | 'UNCERTAIN' | 'EXISTING';
   lifecycle: 'WRITING' | 'PENDING' | 'POSITION'; orderId?: string; tradeIds: readonly string[] };
 class InventoryAdmissionRefusal extends Error {}
+type CtfScope = { ctf: CTFClient; market: DipArbMarketConfig; wallet: string;
+  guard: DipArbInventoryAdmissionGuard | undefined; round: DipArbRoundState | null;
+  originMarket: DipArbMarketConfig; foreground: boolean; running: boolean };
+type CtfLifecycle = { operationId: string; wallet: string; tokenIds: readonly string[];
+  state: 'ACTIVE' | MergeProvenance['state']; transactionHash?: string };
 export type DipArbInventoryDiagnostic = {
   status?: 'BLOCKED_INVENTORY';
   inventoryInterruption?: Readonly<{ status: 'BLOCKED_INVENTORY'; reason: string }>;
@@ -108,6 +114,8 @@ export class DipArbService extends EventEmitter {
 
   private inventoryAdmissionGuard?: DipArbInventoryAdmissionGuard;
   private clobLifecycles = new Map<string, ClobLifecycle>();
+  private ctfLifecycles = new Map<string, CtfLifecycle>();
+  private nextCtfOperation = 0;
   private nextClobOperation = 0;
   private seenClobOrders = new Set<string>();
   private closedInventoryLegs = new WeakSet<object>();
@@ -116,7 +124,7 @@ export class DipArbService extends EventEmitter {
   private clobReleaseFlights = new Map<DipArbRoundState, Map<string, Promise<void>>>();
 
   setInventoryAdmissionGuard(guard?: DipArbInventoryAdmissionGuard): void {
-    if (!guard && this.clobLifecycles.size) throw new Error('DipArb inventory lifecycle still protected');
+    if (!guard && (this.clobLifecycles.size || this.ctfLifecycles.size)) throw new Error('DipArb inventory lifecycle still protected');
     this.inventoryAdmissionGuard = guard;
     // Existing DipArb legs are identities, never attributed from aggregate wallet balances.
     if (guard && this.currentRound && this.tradingService) {
@@ -140,6 +148,11 @@ export class DipArbService extends EventEmitter {
     if (!query.tokenIds.length || query.tokenIds.some(t => typeof t !== 'string' || !t.trim())) {
       throw new Error('Invalid inventory token identity');
     }
+    for (const record of this.ctfLifecycles.values()) {
+      if (record.wallet === wallet && record.tokenIds.some(t => query.tokenIds.includes(t))) {
+        return Object.freeze({ blocked: true, reason: `DIP_ARB_CTF_${record.state}`, operationId: record.operationId });
+      }
+    }
     for (const record of this.clobLifecycles.values()) {
       if (record.wallet === wallet && record.tokenIds.some(t => query.tokenIds.includes(t))) {
         return Object.freeze({ blocked: true, reason: `DIP_ARB_${record.submission === 'UNCERTAIN'
@@ -151,6 +164,79 @@ export class DipArbService extends EventEmitter {
   private inventoryWallet(address: string): string {
     if (!ethers.utils.isAddress(address)) throw new InventoryAdmissionRefusal('Invalid inventory wallet identity');
     return ethers.utils.getAddress(address).toLowerCase();
+  }
+
+  private captureCtfScope(market: DipArbMarketConfig, round: DipArbRoundState | null, foreground = false): CtfScope {
+    const ctf = this.ctf!;
+    let wallet = '';
+    try { wallet = ctf.getAddress(); } catch { /* Admission fails closed when isolation is enabled. */ }
+    return { ctf, wallet, market: Object.freeze({ ...market }), originMarket: market, round, foreground,
+      guard: this.inventoryAdmissionGuard, running: this.isRunning };
+  }
+
+  private async writeCtf(scope: CtfScope, writer: 'MERGE' | 'REDEEM', amount?: string): Promise<MergeResult | RedeemResult> {
+    const tokenIds = Object.freeze({ yesTokenId: scope.market.upTokenId, noTokenId: scope.market.downTokenId });
+    const routing = this.toLifecycleRouting(scope.market);
+    // Preserve the existing opt-in admission contract, including legacy caller arguments.
+    if (!scope.guard) {
+      if (this.inventoryAdmissionGuard) throw new InventoryAdmissionRefusal('Inventory guard changed during preparation');
+      return writer === 'MERGE'
+        ? scope.ctf.mergeByTokenIds(scope.market.conditionId, tokenIds, amount!, routing)
+        : scope.ctf.redeemByTokenIds(scope.market.conditionId, tokenIds, undefined, routing);
+    }
+    const wallet = this.inventoryWallet(scope.wallet);
+    const tokens = Object.freeze([tokenIds.yesTokenId, tokenIds.noTokenId]);
+    const current = () => {
+      try {
+        return scope.ctf === this.ctf && scope.guard === this.inventoryAdmissionGuard &&
+          this.inventoryWallet(scope.ctf.getAddress()) === wallet && scope.running === this.isRunning &&
+          (!scope.foreground || (scope.originMarket === this.market && scope.round === this.currentRound)) &&
+          scope.originMarket.conditionId === scope.market.conditionId &&
+          scope.originMarket.upTokenId === tokens[0] && scope.originMarket.downTokenId === tokens[1] &&
+          scope.originMarket.negRisk === scope.market.negRisk;
+      } catch { return false; }
+    };
+    if (tokens.some(t => typeof t !== 'string' || !t.trim()) || !current() || this.admittingInventory) {
+      throw new InventoryAdmissionRefusal('Stale or invalid CTF inventory identity');
+    }
+    let reason: string | undefined;
+    this.admittingInventory = true;
+    try { reason = scope.guard(Object.freeze({ walletAddress: wallet, tokenIds: tokens, operationType: writer })); }
+    catch (error) { throw new InventoryAdmissionRefusal(error instanceof Error ? error.message : 'Inventory guard failed'); }
+    finally { this.admittingInventory = false; }
+    if (reason || !current()) throw new InventoryAdmissionRefusal(reason || 'CTF context changed during admission');
+    if ([...this.ctfLifecycles.values()].some(r => r.wallet === wallet && r.tokenIds.some(t => tokens.includes(t)))) {
+      throw new InventoryAdmissionRefusal('DipArb CTF lifecycle unresolved');
+    }
+    // An owned position may continue into CTF; an in-flight or ambiguous CLOB writer may not.
+    if ([...this.clobLifecycles.values()].some(r => r.wallet === wallet && r.tokenIds.some(t => tokens.includes(t)) &&
+      ((r.round !== scope.round && r.scope?.market.conditionId !== scope.market.conditionId) ||
+        r.submission === 'ACTIVE' || r.submission === 'UNCERTAIN' ||
+        r.writerType === 'EMERGENCY_EXIT' || r.writerType === 'SETTLE_SELL'))) {
+      throw new InventoryAdmissionRefusal('DipArb CLOB lifecycle unresolved');
+    }
+    const operationId = `dip-ctf-${++this.nextCtfOperation}`;
+    const record: CtfLifecycle = { operationId, wallet, tokenIds: tokens, state: 'ACTIVE' };
+    this.ctfLifecycles.set(operationId, record);
+    const observe = (provenance: MergeProvenance) => {
+      if (!this.ctfLifecycles.has(operationId)) return;
+      record.state = provenance.state;
+      if (provenance.transactionHash) record.transactionHash = provenance.transactionHash;
+      if (provenance.state === 'NOT_SUBMITTED' || provenance.state === 'CONFIRMED') this.ctfLifecycles.delete(operationId);
+    };
+    try {
+      const result = writer === 'MERGE'
+        ? await scope.ctf.mergeByTokenIds(scope.market.conditionId, tokenIds, amount!, routing, observe)
+        : await scope.ctf.redeemByTokenIds(scope.market.conditionId, tokenIds, undefined, routing, observe);
+      if (result.provenance) observe(result.provenance);
+      if (record.state !== 'CONFIRMED') throw new Error('CTF write lacks confirmed provenance');
+      return result;
+    } catch (error) {
+      if ((writer === 'MERGE' && error instanceof MergeProvenanceError) ||
+          (writer === 'REDEEM' && error instanceof RedeemProvenanceError)) observe(error.provenance);
+      else if (this.ctfLifecycles.has(operationId) && record.state === 'ACTIVE') record.state = 'UNCERTAIN';
+      throw error;
+    }
   }
 
   private inventoryBlocked<T extends object>(result: T, error: InventoryAdmissionRefusal): T & DipArbInventoryDiagnostic {
@@ -311,6 +397,10 @@ export class DipArbService extends EventEmitter {
 
   // Pending redemption state (for background redemption after market resolution)
   private pendingRedemptions: DipArbPendingRedemption[] = [];
+  private redemptionFlight?: Promise<void>;
+  private accountedRedeemTransactions = new Map<string, Readonly<DipArbSettleResult>>();
+  private confirmedRedeemLifecycles = new WeakMap<DipArbRoundState, Map<string, DipArbPendingRedemption>>();
+  private publicRedeemFlight?: Promise<DipArbSettleResult & DipArbInventoryDiagnostic>;
   private redeemCheckInterval: ReturnType<typeof setInterval> | null = null;
 
   // Orderbook state
@@ -654,15 +744,16 @@ export class DipArbService extends EventEmitter {
    */
   private async scanAndMergeExistingPairs(): Promise<void> {
     if (!this.ctf || !this.market) return;
+    const scope = this.captureCtfScope(this.market, this.currentRound, true);
 
     try {
       const tokenIds = {
-        yesTokenId: this.market.upTokenId,
-        noTokenId: this.market.downTokenId,
+        yesTokenId: scope.market.upTokenId,
+        noTokenId: scope.market.downTokenId,
       };
 
-      const balances = await this.ctf.getPositionBalanceByTokenIds(
-        this.market.conditionId,
+      const balances = await scope.ctf.getPositionBalanceByTokenIds(
+        scope.market.conditionId,
         tokenIds
       );
 
@@ -677,12 +768,7 @@ export class DipArbService extends EventEmitter {
         this.log(`🔄 Auto-merging ${pairsToMerge.toFixed(2)} pairs at startup...`);
 
         try {
-          const result = await this.ctf.mergeByTokenIds(
-            this.market.conditionId,
-            tokenIds,
-            pairsToMerge.toString(),
-            this.toLifecycleRouting(this.market)
-          );
+          const result = await this.writeCtf(scope, 'MERGE', pairsToMerge.toString());
 
           if (result.success) {
             this.log(`✅ Startup merge successful: ${pairsToMerge.toFixed(2)} pairs → $${result.usdcReceived || pairsToMerge.toFixed(2)} pUSD`);
@@ -691,6 +777,7 @@ export class DipArbService extends EventEmitter {
             this.log(`❌ Startup merge failed`);
           }
         } catch (mergeError) {
+          if (mergeError instanceof InventoryAdmissionRefusal) { this.inventoryBlocked({}, mergeError); return; }
           this.log(`❌ Startup merge error: ${mergeError instanceof Error ? mergeError.message : String(mergeError)}`);
         }
       } else if (upBalance > 0 || downBalance > 0) {
@@ -1209,7 +1296,7 @@ export class DipArbService extends EventEmitter {
    * Uses mergeByTokenIds with Polymarket token IDs for correct CLOB market handling.
    * This locks in profit immediately after Leg2 completes.
    */
-  async merge(): Promise<DipArbExecutionResult> {
+  async merge(): Promise<DipArbExecutionResult & DipArbInventoryDiagnostic> {
     const startTime = Date.now();
     const roundId = this.currentRound?.roundId || 'unknown';
 
@@ -1223,6 +1310,7 @@ export class DipArbService extends EventEmitter {
       };
     }
 
+    const scope = this.captureCtfScope(this.market, this.currentRound, true);
     // Merge the minimum of Leg1 and Leg2 shares (should be equal after our fix).
     // Reconcile against on-chain balances first so we never attempt to merge
     // more pairs than are actually held (PROBLEMS.md #10).
@@ -1232,9 +1320,9 @@ export class DipArbService extends EventEmitter {
     );
 
     try {
-      const positions = await this.ctf.getPositionBalanceByTokenIds(
-        this.market.conditionId,
-        { yesTokenId: this.market.upTokenId, noTokenId: this.market.downTokenId }
+      const positions = await scope.ctf.getPositionBalanceByTokenIds(
+        scope.market.conditionId,
+        { yesTokenId: scope.market.upTokenId, noTokenId: scope.market.downTokenId }
       );
       const heldPairs = Math.min(
         parseFloat(positions.yesBalance) || 0,
@@ -1259,20 +1347,9 @@ export class DipArbService extends EventEmitter {
     }
 
     try {
-      // Use mergeByTokenIds with Polymarket token IDs
-      const tokenIds = {
-        yesTokenId: this.market.upTokenId,
-        noTokenId: this.market.downTokenId,
-      };
-
       this.log(`🔄 Merging ${shares.toFixed(1)} UP + DOWN → pUSD...`);
 
-      const result = await this.ctf.mergeByTokenIds(
-        this.market.conditionId,
-        tokenIds,
-        shares.toString(),
-        this.toLifecycleRouting(this.market)
-      );
+      const result = await this.writeCtf(scope, 'MERGE', shares.toString());
 
       if (result.success) {
         this.log(`✅ Merge successful: ${shares.toFixed(1)} pairs → $${result.usdcReceived || shares.toFixed(2)} pUSD`);
@@ -1288,6 +1365,8 @@ export class DipArbService extends EventEmitter {
         executionTimeMs: Date.now() - startTime,
       };
     } catch (error) {
+      if (error instanceof InventoryAdmissionRefusal) return this.inventoryBlocked({ success: false, leg: 'merge' as const,
+        roundId, error: error.message, executionTimeMs: Date.now() - startTime }, error);
       const errorMsg = error instanceof Error ? error.message : String(error);
       this.log(`❌ Merge failed: ${errorMsg}`);
       return {
@@ -2135,13 +2214,14 @@ export class DipArbService extends EventEmitter {
 
         // Check if we have any position in this market
         try {
+          const scope = this.captureCtfScope(market, market.conditionId === this.market?.conditionId ? this.currentRound : null);
           const tokenIds = {
             yesTokenId: market.upTokenId,
             noTokenId: market.downTokenId,
           };
 
-          const balances = await this.ctf.getPositionBalanceByTokenIds(
-            market.conditionId,
+          const balances = await scope.ctf.getPositionBalanceByTokenIds(
+            scope.market.conditionId,
             tokenIds
           );
 
@@ -2150,7 +2230,7 @@ export class DipArbService extends EventEmitter {
 
           // If we have any tokens, check if market is resolved
           if (upBalance > 0.01 || downBalance > 0.01) {
-            const resolution = await this.ctf.getMarketResolution(market.conditionId, this.toLifecycleRouting(market));
+            const resolution = await scope.ctf.getMarketResolution(scope.market.conditionId, this.toLifecycleRouting(scope.market));
 
             if (resolution.isResolved) {
               // Check if we have winning tokens
@@ -2159,7 +2239,7 @@ export class DipArbService extends EventEmitter {
               if (winningBalance > 0.01) {
                 // Add to pending redemption queue
                 const pending: DipArbPendingRedemption = {
-                  market,
+                  market: scope.market,
                   round: {
                     roundId: `recovery-${market.slug}`,
                     priceToBeat: 0,
@@ -2184,16 +2264,12 @@ export class DipArbService extends EventEmitter {
 
               // Try to merge immediately
               try {
-                const result = await this.ctf.mergeByTokenIds(
-                  market.conditionId,
-                  tokenIds,
-                  pairsToMerge.toString(),
-                  this.toLifecycleRouting(market)
-                );
+                const result = await this.writeCtf(scope, 'MERGE', pairsToMerge.toString());
                 if (result.success) {
                   this.log(`✅ Merged ${pairsToMerge.toFixed(2)} pairs from ${market.slug}`);
                 }
               } catch (mergeErr) {
+                if (mergeErr instanceof InventoryAdmissionRefusal) { this.inventoryBlocked({}, mergeErr); continue; }
                 this.log(`⚠️ Failed to merge ${market.slug}: ${mergeErr instanceof Error ? mergeErr.message : String(mergeErr)}`);
               }
             }
@@ -2370,6 +2446,59 @@ export class DipArbService extends EventEmitter {
    * Called periodically by redeemCheckInterval
    */
   private async processPendingRedemptions(): Promise<void> {
+    if (this.redemptionFlight || this.publicRedeemFlight) return;
+    const flight = Promise.resolve().then(() => this.processPendingRedemptionsOnce());
+    this.redemptionFlight = flight;
+    try { await flight; }
+    finally { if (this.redemptionFlight === flight) this.redemptionFlight = undefined; }
+  }
+
+  private removePendingRedemption(pending: DipArbPendingRedemption): void {
+    const index = this.pendingRedemptions.indexOf(pending);
+    if (index !== -1) this.pendingRedemptions.splice(index, 1);
+  }
+
+  private redeemLifecycleKey(market: DipArbMarketConfig): string {
+    return JSON.stringify([market.conditionId, market.upTokenId, market.downTokenId]);
+  }
+
+  private confirmRedeem(pending: DipArbPendingRedemption, wallet: string, txHash: string, payout?: string): void {
+    if (!this.pendingRedemptions.includes(pending)) return;
+    Object.assign(pending, { state: 'CONFIRMED_PAYOUT_PENDING', transactionHash: txHash, historicalWallet: wallet });
+    let lifecycles = this.confirmedRedeemLifecycles.get(pending.round);
+    if (!lifecycles) this.confirmedRedeemLifecycles.set(pending.round, lifecycles = new Map());
+    lifecycles.set(this.redeemLifecycleKey(pending.market), pending);
+    if (payout !== undefined) this.finalizeRedeem(pending, txHash, payout);
+  }
+
+  private confirmedRedeemResult(pending: DipArbPendingRedemption): DipArbSettleResult {
+    if (pending.state !== 'CONFIRMED_PAYOUT_PENDING') throw new Error('Redeem is not confirmed');
+    const finalized = this.accountedRedeemTransactions.get(pending.transactionHash.toLowerCase());
+    if (finalized) return { ...finalized };
+    return { success: false, strategy: 'redeem', market: pending.market, txHash: pending.transactionHash,
+      amountReceived: undefined, error: 'CONFIRMED_PAYOUT_PENDING', executionTimeMs: 0 };
+  }
+
+  private finalizeRedeem(pending: DipArbPendingRedemption, txHash: string, payout: string): void {
+    if (!this.pendingRedemptions.includes(pending)) return;
+    const identity = txHash.toLowerCase();
+    if (this.accountedRedeemTransactions.has(identity)) {
+      this.removePendingRedemption(pending);
+      return;
+    }
+    const amountReceived = parseFloat(payout);
+    const result: DipArbSettleResult = { success: true, strategy: 'redeem', market: pending.market,
+      txHash, amountReceived, executionTimeMs: 0 };
+    this.stats.totalProfit += amountReceived;
+    this.accountedRedeemTransactions.set(identity, Object.freeze({ ...result }));
+    this.removePendingRedemption(pending);
+    // No await or consumer code between accounting, the tombstone and dequeue.
+    try { this.emit('settled', result); } catch { /* Accounting is already final. */ }
+    try { this.log(`Redemption successful: ${pending.market.slug} | Amount: $${amountReceived.toFixed(2)}`); }
+    catch { /* Telemetry cannot retry a confirmed transaction. */ }
+  }
+
+  private async processPendingRedemptionsOnce(): Promise<void> {
     if (this.pendingRedemptions.length === 0) {
       return;
     }
@@ -2377,8 +2506,33 @@ export class DipArbService extends EventEmitter {
     const now = Date.now();
     const waitMs = (this.autoRotateConfig.redeemWaitMinutes || 5) * 60 * 1000;
 
-    for (let i = this.pendingRedemptions.length - 1; i >= 0; i--) {
-      const pending = this.pendingRedemptions[i];
+    for (const pending of [...this.pendingRedemptions].reverse()) {
+      if (!this.pendingRedemptions.includes(pending)) continue;
+      const confirmed = this.confirmedRedeemLifecycles.get(pending.round)?.get(this.redeemLifecycleKey(pending.market));
+      // Only pre-submission duplicates use lifecycle identity. Confirmed items
+      // have their own factual transaction identity, even in the same round.
+      if (pending.state !== 'CONFIRMED_PAYOUT_PENDING' && confirmed && confirmed !== pending) {
+        this.removePendingRedemption(pending);
+        continue;
+      }
+      if (pending.state === 'CONFIRMED_PAYOUT_PENDING') {
+        const hash = pending.transactionHash;
+        const wallet = pending.historicalWallet;
+        if (this.accountedRedeemTransactions.has(hash.toLowerCase())) {
+          this.removePendingRedemption(pending);
+          continue;
+        }
+        try {
+          if (!this.ctf) continue;
+          const payout = await this.ctf.getRedeemPayout(hash, wallet);
+          if (!this.pendingRedemptions.includes(pending) || pending.transactionHash !== hash ||
+              pending.historicalWallet !== wallet) continue;
+          if (payout.state === 'PAYOUT_KNOWN' && payout.transactionHash.toLowerCase() === hash.toLowerCase()) {
+            this.finalizeRedeem(pending, hash, payout.pusdReceived);
+          }
+        } catch { /* Keep confirmed evidence and retry only this read in a later cycle. */ }
+        continue;
+      }
       const timeSinceEnd = now - pending.marketEndTime;
 
       // Skip if not enough time has passed since market end
@@ -2394,6 +2548,11 @@ export class DipArbService extends EventEmitter {
       pending.retryCount++;
       pending.lastRetryAt = now;
 
+      let scope: CtfScope | undefined;
+      let redeemInvoked = false;
+      const hasUnresolvedCtf = () => !!scope && [...this.ctfLifecycles.values()].some(record =>
+        record.wallet === scope!.wallet.toLowerCase() && record.tokenIds.some(token =>
+          token === scope!.market.upTokenId || token === scope!.market.downTokenId));
       try {
         if (!this.ctf) {
           this.log(`Cannot redeem ${pending.market.slug}: CTF client not available`);
@@ -2401,7 +2560,9 @@ export class DipArbService extends EventEmitter {
         }
 
         // Check if market is resolved
-        const resolution = await this.ctf.getMarketResolution(pending.market.conditionId, this.toLifecycleRouting(pending.market));
+        scope = this.captureCtfScope(pending.market, pending.round);
+        const resolution = await scope.ctf.getMarketResolution(scope.market.conditionId, this.toLifecycleRouting(scope.market));
+        if (!this.pendingRedemptions.includes(pending)) continue;
 
         if (!resolution.isResolved) {
           this.log(`Pending redemption ${pending.market.slug}: market not yet resolved (retry ${pending.retryCount})`);
@@ -2409,52 +2570,35 @@ export class DipArbService extends EventEmitter {
           // Give up after too many retries (10 minutes of trying)
           if (pending.retryCount > 20) {
             this.log(`Giving up on redemption ${pending.market.slug}: too many retries`);
-            this.pendingRedemptions.splice(i, 1);
-            this.emit('settled', {
-              success: false,
-              strategy: 'redeem',
-              market: pending.market,
-              error: 'Market not resolved after max retries',
-              executionTimeMs: 0,
-            } as DipArbSettleResult);
+            this.removePendingRedemption(pending);
+            // An unresolved market only exhausts the queue; no redeem occurred.
           }
           continue;
         }
 
         // Market is resolved, try to redeem using Polymarket token IDs
         this.log(`Redeeming ${pending.market.slug}...`);
-        const tokenIds = {
-          yesTokenId: pending.market.upTokenId,
-          noTokenId: pending.market.downTokenId,
-        };
-        const result = await this.ctf.redeemByTokenIds(pending.market.conditionId, tokenIds, undefined, this.toLifecycleRouting(pending.market));
+        redeemInvoked = true;
+        const result = await this.writeCtf(scope, 'REDEEM');
 
-        // Remove from queue
-        this.pendingRedemptions.splice(i, 1);
-
-        const settleResult: DipArbSettleResult = {
-          success: result.success,
-          strategy: 'redeem',
-          market: pending.market,
-          txHash: result.txHash,
-          amountReceived: result.usdcReceived ? parseFloat(result.usdcReceived) : undefined,
-          executionTimeMs: 0,
-        };
-
-        this.emit('settled', settleResult);
-        this.log(`Redemption successful: ${pending.market.slug} | Amount: $${settleResult.amountReceived?.toFixed(2) || 'N/A'}`);
-
-        // Update stats
-        if (settleResult.amountReceived) {
-          this.stats.totalProfit += settleResult.amountReceived;
-        }
+        this.confirmRedeem(pending, scope.wallet, result.txHash, result.usdcReceived);
       } catch (error) {
+        if (error instanceof RedeemProvenanceError && error.provenance.state === 'CONFIRMED') {
+          if (!this.pendingRedemptions.includes(pending)) continue;
+          const txHash = error.provenance.transactionHash ?? '';
+          this.confirmRedeem(pending, scope!.wallet, txHash, error.usdcReceived);
+          continue;
+        }
+        if (error instanceof InventoryAdmissionRefusal) { this.inventoryBlocked({}, error); continue; }
         this.log(`Redemption error for ${pending.market.slug}: ${error instanceof Error ? error.message : String(error)}`);
 
         // Give up after too many retries
         if (pending.retryCount > 20) {
           this.log(`Giving up on redemption ${pending.market.slug}: error after max retries`);
-          this.pendingRedemptions.splice(i, 1);
+          this.removePendingRedemption(pending);
+          // Factual non-confirmation suppresses settlement even without an inventory guard.
+          if (error instanceof RedeemProvenanceError && error.provenance.state !== 'CONFIRMED') continue;
+          if (!redeemInvoked || hasUnresolvedCtf()) continue;
           this.emit('settled', {
             success: false,
             strategy: 'redeem',
@@ -2600,21 +2744,43 @@ export class DipArbService extends EventEmitter {
     return available.length > 0 ? available[0] : null;
   }
 
-  private async settleByRedeem(): Promise<DipArbSettleResult> {
-    const startTime = Date.now();
-
-    if (!this.ctf || !this.market) {
+  private async settleByRedeem(): Promise<DipArbSettleResult & DipArbInventoryDiagnostic> {
+    if (!this.ctf || !this.market || !this.currentRound) {
       return {
         success: false,
         strategy: 'redeem',
         error: 'CTF client or market not available',
-        executionTimeMs: Date.now() - startTime,
+        executionTimeMs: 0,
       };
     }
+    const scope = this.captureCtfScope(this.market, this.currentRound, true);
+    // Public calls and the queue share one transport/finalization critical section.
+    while (this.publicRedeemFlight || this.redemptionFlight) {
+      try { await (this.publicRedeemFlight ?? this.redemptionFlight); } catch { /* Recheck captured lifecycle. */ }
+    }
+    const flight = Promise.resolve().then(() => this.settleCapturedRedeem(scope));
+    this.publicRedeemFlight = flight;
+    try { return await flight; }
+    finally { if (this.publicRedeemFlight === flight) this.publicRedeemFlight = undefined; }
+  }
 
+  private async settleCapturedRedeem(scope: CtfScope): Promise<DipArbSettleResult & DipArbInventoryDiagnostic> {
+    const startTime = Date.now();
+    const prior = this.confirmedRedeemLifecycles.get(scope.round!)?.get(this.redeemLifecycleKey(scope.market));
+    if (prior) return this.confirmedRedeemResult(prior);
+    const confirmed = (txHash: string, payout?: string): DipArbSettleResult => {
+      const pending = this.pendingRedemptions.find(p => p.round === scope.round &&
+        this.redeemLifecycleKey(p.market) === this.redeemLifecycleKey(scope.market)) ?? {
+        market: scope.market, round: scope.round!, marketEndTime: scope.market.endTime.getTime(),
+        addedAt: Date.now(), retryCount: 0,
+      };
+      if (!this.pendingRedemptions.includes(pending)) this.pendingRedemptions.push(pending);
+      this.confirmRedeem(pending, scope.wallet, txHash, payout);
+      return this.confirmedRedeemResult(pending);
+    };
     try {
       // Check market resolution first
-      const resolution = await this.ctf.getMarketResolution(this.market.conditionId, this.toLifecycleRouting(this.market));
+      const resolution = await scope.ctf.getMarketResolution(scope.market.conditionId, this.toLifecycleRouting(scope.market));
 
       if (!resolution.isResolved) {
         return {
@@ -2625,22 +2791,15 @@ export class DipArbService extends EventEmitter {
         };
       }
 
-      // Redeem winning tokens using Polymarket token IDs
-      const tokenIds = {
-        yesTokenId: this.market.upTokenId,
-        noTokenId: this.market.downTokenId,
-      };
+      const result = await this.writeCtf(scope, 'REDEEM');
 
-      const result = await this.ctf.redeemByTokenIds(this.market.conditionId, tokenIds, undefined, this.toLifecycleRouting(this.market));
-
-      return {
-        success: result.success,
-        strategy: 'redeem',
-        txHash: result.txHash,
-        amountReceived: result.usdcReceived ? parseFloat(result.usdcReceived) : undefined,
-        executionTimeMs: Date.now() - startTime,
-      };
+      return confirmed(result.txHash, result.usdcReceived);
     } catch (error) {
+      if (error instanceof RedeemProvenanceError && error.provenance.state === 'CONFIRMED') {
+        return confirmed(error.provenance.transactionHash ?? '', error.usdcReceived);
+      }
+      if (error instanceof InventoryAdmissionRefusal) return this.inventoryBlocked({ success: false, strategy: 'redeem' as const,
+        error: error.message, executionTimeMs: Date.now() - startTime }, error);
       return {
         success: false,
         strategy: 'redeem',
