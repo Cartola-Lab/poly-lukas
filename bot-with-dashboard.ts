@@ -1,3 +1,4 @@
+import type { AutoCopyTradingOptions } from './src/services/smart-money-service.js';
 /**
  * Bot with Dashboard - Wrapper that runs the bot with real-time monitoring UI
  * 
@@ -627,7 +628,35 @@ async function reconcilePnl() {
 // v3.2: Smart Money full auto-copy — mirrors bot-config.ts. The service
 // handles stale-print skipping, live re-quotes, per-wallet circuit breaker;
 // riskGuard gates BUY copies; onCopyPnl books realized FIFO PnL.
-// dryRun is captured at subscription start → must restart on mode flip.
+// Session options and callbacks retain their identity across pause/resume.
+const smartMoneyCallbacks: Pick<AutoCopyTradingOptions, 'onTrade' | 'onCopyPnl' | 'onError' | 'inventoryAdmissionGuard'> = {
+  onTrade: (trade, result) => {
+    if (result.success && trade.side === 'BUY') {
+      recordEntry('smartMoney');
+      log('TRADE', `Copied BUY from ${trade.traderAddress.slice(0, 8)}... (${trade.size.toFixed(1)} sh @ ${trade.price})`);
+      if (CONFIG.dryRun && state.paper) {
+        state.paper.trades++;
+        state.paper.totalVolume += trade.size * trade.price;
+        updateDashboard();
+      }
+    }
+  },
+  onCopyPnl: (info) => {
+    log('TRADE', `Copy closed ${info.closedSize.toFixed(2)} sh — PnL $${info.realizedUsd.toFixed(2)}`);
+    recordRealized(info.realizedUsd);
+    recordTradeForHistory({ strategy: 'smartMoney', market: info.tokenId.slice(0, 12), side: info.side, size: info.closedSize, price: 0, profit: info.realizedUsd });
+    if (CONFIG.dryRun && state.paper) {
+      state.paper.pnl += info.realizedUsd;
+      state.paper.balance += info.realizedUsd;
+    }
+  },
+  onError: (err) => log('ERROR', `Copy trading error: ${err.message}`),
+  inventoryAdmissionGuard: query => {
+    if (!arbService) return 'Inventory protection service unavailable';
+    return arbService.getShortInventoryProtection(query)?.reason;
+  },
+};
+
 async function startSmartMoneyCopy(sdk: PolymarketSDK) {
   if (!CONFIG.smartMoney.enabled || state.followedWallets.length === 0) return;
   if (copySubscription?.isActive) return;
@@ -641,27 +670,7 @@ async function startSmartMoneyCopy(sdk: PolymarketSDK) {
       delay: CONFIG.smartMoney.delay,
       dryRun: CONFIG.dryRun,          // service simulates fills AND closes
       preExecutionGuard: riskGuard,   // BUY copies only (service bypasses SELLs)
-      onTrade: (trade, result) => {
-        if (result.success && trade.side === 'BUY') {
-          recordEntry('smartMoney');
-          log('TRADE', `Copied BUY from ${trade.traderAddress.slice(0, 8)}... (${trade.size.toFixed(1)} sh @ ${trade.price})`);
-          if (CONFIG.dryRun && state.paper) {
-            state.paper.trades++;
-            state.paper.totalVolume += trade.size * trade.price;
-            updateDashboard();
-          }
-        }
-      },
-      onCopyPnl: (info) => {
-        log('TRADE', `Copy closed ${info.closedSize.toFixed(2)} sh — PnL $${info.realizedUsd.toFixed(2)}`);
-        recordRealized(info.realizedUsd);
-        recordTradeForHistory({ strategy: 'smartMoney', market: info.tokenId.slice(0, 12), side: info.side, size: info.closedSize, price: 0, profit: info.realizedUsd });
-        if (CONFIG.dryRun && state.paper) {
-          state.paper.pnl += info.realizedUsd;
-          state.paper.balance += info.realizedUsd;
-        }
-      },
-      onError: (err) => log('ERROR', `Copy trading error: ${err.message}`),
+      ...smartMoneyCallbacks,
     });
     log('WALLET', `Auto-copy ${CONFIG.dryRun ? '(dry-run)' : '(LIVE)'} active for ${state.followedWallets.length} wallets`);
   } catch (err) {
@@ -670,8 +679,7 @@ async function startSmartMoneyCopy(sdk: PolymarketSDK) {
 }
 
 function stopSmartMoneyCopy() {
-  if (copySubscription?.isActive) copySubscription.stop();
-  copySubscription = null;
+  copySubscription?.stop();
 }
 
 // P0.3c-1: session-local settlement facts only. Terminal records remain here
@@ -1219,7 +1227,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
 
 
 
-async function setupArbitrage(_sdk: PolymarketSDK) {
+async function setupArbitrage(sdk: PolymarketSDK) {
   // Always setup service and listeners
   log('ARB', 'Setting up Arbitrage Service...');
 
@@ -1236,7 +1244,8 @@ async function setupArbitrage(_sdk: PolymarketSDK) {
     enableRebalancer: !CONFIG.dryRun && CONFIG.arbitrage.enableRebalancer,
     enableLogging: true,
     preExecutionGuard: riskGuard, // v3.2 AUDIT #4: risk limits gate arb too
-    shortInventoryAdmission: query => dashboardInventoryConflict(query),
+    shortInventoryAdmission: query => dashboardInventoryConflict(query)
+      ?? sdk.smartMoney.getInventoryProtection(query)?.reason,
   });
 
   arbService.on('opportunity', (opp) => {
@@ -1881,8 +1890,8 @@ async function main() {
   await setupSwap();
   await setupBinanceAnalysis(sdk);
   await refreshExposure(sdk); // v3.2: seed exposure BEFORE strategies start
-  await setupSmartMoney(sdk);
   await setupArbitrage(sdk);
+  await setupSmartMoney(sdk);
   await setupDipArb(sdk);
 
   // v3.2: exposure is chain-seeded every 60s; PnL reconciled every 5 min;

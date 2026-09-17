@@ -1,3 +1,4 @@
+import type { AutoCopyTradingOptions } from './src/services/smart-money-service.js';
 /**
  * Polymarket Complete Trading Bot v3.0
  *
@@ -557,6 +558,26 @@ async function reconcilePnl() {
 // 1. SMART MONEY STRATEGY
 // ============================================================================
 
+const smartMoneyCallbacks: Pick<AutoCopyTradingOptions, 'onTrade' | 'onCopyPnl' | 'onError' | 'inventoryAdmissionGuard'> = {
+  onTrade: (trade, result) => {
+    if (result.success) {
+      log('TRADE', `Copied ${trade.side} from ${trade.traderAddress.slice(0, 8)}...`);
+    }
+  },
+  // Audit #2: record realized PnL when copies close, not $0 per copy.
+  // recordTrade now fires per close, so win/loss streaks are meaningful.
+  onCopyPnl: (info) => {
+    log('TRADE', `Copy closed ${info.closedSize.toFixed(2)} @ PnL $${info.realizedUsd.toFixed(2)}`);
+    recordTrade(info.realizedUsd, 'smartMoney');
+  },
+  onError: (err) => log('ERROR', `Copy error: ${err.message}`),
+  inventoryAdmissionGuard: query => {
+    if (!CONFIG.arbitrage.enabled) return undefined;
+    if (!arbService) return 'Inventory protection service unavailable';
+    return arbService.getShortInventoryProtection(query)?.reason;
+  },
+};
+
 async function setupSmartMoney(sdk: PolymarketSDK) {
   if (!CONFIG.smartMoney.enabled) return;
   log('WALLET', '🔍 Setting up Smart Money with ENHANCED quality filtering...');
@@ -616,18 +637,7 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
       delay: CONFIG.smartMoney.delay,
       dryRun: false,
       preExecutionGuard: riskGuard, // Audit #4: risk limits gate copy BUYs
-      onTrade: (trade, result) => {
-        if (result.success) {
-          log('TRADE', `Copied ${trade.side} from ${trade.traderAddress.slice(0, 8)}...`);
-        }
-      },
-      // Audit #2: record realized PnL when copies close, not $0 per copy.
-      // recordTrade now fires per close, so win/loss streaks are meaningful.
-      onCopyPnl: (info) => {
-        log('TRADE', `Copy closed ${info.closedSize.toFixed(2)} @ PnL $${info.realizedUsd.toFixed(2)}`);
-        recordTrade(info.realizedUsd, 'smartMoney');
-      },
-      onError: (err) => log('ERROR', `Copy error: ${err.message}`),
+      ...smartMoneyCallbacks,
     });
   }
 }
@@ -651,6 +661,7 @@ async function setupArbitrage(sdk: PolymarketSDK) {
     autoExecute: !CONFIG.dryRun && CONFIG.arbitrage.autoExecute,
     enableRebalancer: !CONFIG.dryRun && CONFIG.arbitrage.enableRebalancer,
     enableLogging: true,
+    shortInventoryAdmission: query => sdk.smartMoney.getInventoryProtection(query)?.reason,
     preExecutionGuard: riskGuard, // Audit #4: risk limits gate arb too
   });
 
@@ -1056,8 +1067,8 @@ async function main() {
   await analyzeTopWallets(sdk);
   await queryOnchainData(sdk);
   await refreshExposure(sdk); // P7: seed exposure before strategies start
-  await setupSmartMoney(sdk);
   await setupArbitrage(sdk);
+  await setupSmartMoney(sdk);
   await setupDipArb(sdk);
   await setupDirectTrading(sdk);
 
