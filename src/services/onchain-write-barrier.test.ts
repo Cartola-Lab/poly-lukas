@@ -5,7 +5,12 @@ const key = '0x' + '11'.repeat(32);
 const condition = '0x' + '22'.repeat(32);
 const address = '0x' + '33'.repeat(20);
 const ids = { yesTokenId: '1', noTokenId: '2' };
-const receipt = { status: 1, transactionHash: condition, gasUsed: BigNumber.from(21000), logs: [] };
+const receipt = { status: 1, transactionHash: condition, gasUsed: BigNumber.from(21000), logs: [{
+  address: '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB', logIndex: 0,
+  topics: [utils.id('Transfer(address,address,uint256)'), utils.hexZeroPad('0x00', 32),
+    utils.hexZeroPad(new Wallet(key).address, 32)],
+  data: utils.defaultAbiCoder.encode(['uint256'], [100_000_000]),
+}] };
 let send: MockInstance<Wallet['sendTransaction']>;
 
 beforeEach(() => {

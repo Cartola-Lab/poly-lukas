@@ -111,6 +111,65 @@ const ERC20_ABI = [
   'function decimals() view returns (uint8)',
 ];
 
+const PUSD_TRANSFER = new ethers.utils.Interface([
+  'event Transfer(address indexed from, address indexed to, uint256 amount)',
+]);
+
+/** Receipt-scoped credit only; absence or ambiguity is never a zero payout. */
+function redeemPusdReceived(receipt: ethers.providers.TransactionReceipt, wallet: string): string {
+  if (!Array.isArray(receipt.logs)) throw new Error('Redeem receipt logs unavailable');
+  const topic = PUSD_TRANSFER.getEventTopic('Transfer').toLowerCase();
+  // A logIndex identifies one fact, including logs excluded by the payout filter.
+  const seen = new Map<number, string>();
+  const unique: ethers.providers.Log[] = [];
+  const hex = (value: unknown, bytes?: number): string => {
+    if (typeof value !== 'string' || !/^0x(?:[0-9a-fA-F]{2})*$/.test(value) ||
+        (bytes !== undefined && value.length !== 2 + bytes * 2)) {
+      throw new Error('Malformed receipt log identity');
+    }
+    return value.toLowerCase();
+  };
+  for (const log of receipt.logs) {
+    if (!log || !Number.isSafeInteger(log.logIndex) || log.logIndex < 0 ||
+        !Array.isArray(log.topics) || log.removed) throw new Error('Invalid receipt log identity');
+    const transactionHash = log.transactionHash === undefined ? null : hex(log.transactionHash, 32);
+    if (transactionHash !== null && transactionHash !== receipt.transactionHash.toLowerCase()) {
+      throw new Error('Receipt log transaction mismatch');
+    }
+    const fingerprint = JSON.stringify([hex(log.address, 20), log.topics.map(t => hex(t, 32)),
+      hex(log.data), log.logIndex, transactionHash]);
+    if (seen.has(log.logIndex)) {
+      if (seen.get(log.logIndex) !== fingerprint) throw new Error('Conflicting receipt log identity');
+      continue;
+    }
+    seen.set(log.logIndex, fingerprint);
+    unique.push(log);
+  }
+  let total = ethers.BigNumber.from(0);
+  let found = false;
+  for (const log of unique) {
+    if (typeof log.address !== 'string' || log.address.toLowerCase() !== PUSD.toLowerCase()) continue;
+    if (!Array.isArray(log.topics) || log.topics[0]?.toLowerCase() !== topic) continue;
+    if (log.topics.length !== 3 || log.topics.slice(1).some(t =>
+      typeof t !== 'string' || !/^0x0{24}[0-9a-fA-F]{40}$/.test(t))) {
+      throw new Error('Malformed pUSD Transfer topics');
+    }
+    const from = ethers.utils.getAddress('0x' + log.topics[1].slice(-40));
+    const to = ethers.utils.getAddress('0x' + log.topics[2].slice(-40));
+    if (from !== ethers.constants.AddressZero || to.toLowerCase() !== wallet.toLowerCase()) continue;
+    if (typeof log.data !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(log.data) ||
+        !Number.isSafeInteger(log.logIndex) || log.logIndex < 0 || log.removed ||
+        (log.transactionHash !== undefined && log.transactionHash.toLowerCase() !== receipt.transactionHash.toLowerCase())) {
+      throw new Error('Malformed or inconsistent pUSD mint log');
+    }
+    const amount: ethers.BigNumber = PUSD_TRANSFER.parseLog(log).args.amount;
+    found = true;
+    total = total.add(amount);
+  }
+  if (!found) throw new Error('Confirmed redeem receipt has no identifiable pUSD mint');
+  return ethers.utils.formatUnits(total, USDC_DECIMALS);
+}
+
 // ===== Types =====
 
 export interface CTFConfig {
@@ -736,10 +795,10 @@ export class CTFClient {
       confirmed = true;
       const provenance = notify('CONFIRMED');
 
-      // 1:1 payout for the winning side; pUSD is the user-facing output asset.
+      usdcReceived = redeemPusdReceived(receipt, this.wallet.address);
+      // Preserve legacy position reporting separately from the receipt-scoped payout.
       const winningBalanceWei = winningOutcome === 'YES' ? yesBalanceWei : noBalanceWei;
       const winningBalance = ethers.utils.formatUnits(winningBalanceWei, USDC_DECIMALS);
-      usdcReceived = winningBalance;
 
       return {
         success: true,

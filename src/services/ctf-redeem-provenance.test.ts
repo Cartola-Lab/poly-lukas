@@ -12,6 +12,12 @@ const legacyCtf = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
 const key = '0x' + '11'.repeat(32);
 const condition = '0x' + '33'.repeat(32);
 const owner = new Wallet(key).address;
+const transferEvent = new utils.Interface(['event Transfer(address indexed from, address indexed to, uint256 amount)']);
+function mintLog(amount = '12.5', logIndex = 0, to = owner, from = '0x' + '00'.repeat(20)) {
+  return { address: config.collateral, logIndex,
+    ...transferEvent.encodeEventLog(transferEvent.getEvent('Transfer'), [from, to, utils.parseUnits(amount, 6)]) };
+}
+
 const ids = { yesTokenId: '9000000000000000001', noTokenId: '9000000000000000002' };
 
 const erc20 = new utils.Interface([
@@ -80,7 +86,7 @@ beforeEach(() => {
   });
   send.mockReset().mockResolvedValue({
     hash: '0x' + '22'.repeat(32),
-    wait: async () => ({ status: 1, transactionHash: '0x' + '22'.repeat(32), gasUsed: BigNumber.from(21000), logs: [] }),
+    wait: async () => ({ status: 1, transactionHash: '0x' + '22'.repeat(32), gasUsed: BigNumber.from(21000), logs: [mintLog()] }),
   });
   vi.spyOn(Wallet.prototype, 'sendTransaction').mockImplementation(send);
 });
@@ -103,10 +109,106 @@ const invoke = (ctf: Awaited<ReturnType<typeof setup>>['ctf'], observer?: (p: an
   ctf.redeemByTokenIds(condition, ids, undefined, { negRisk: false }, observer);
 
 describe('CTF redeem factual provenance', () => {
+  const conflicts = [
+    ['recipient', mintLog('12.5', 0, standardAdapter)],
+    ['amount', mintLog('7.25', 0)],
+    ['token', { ...mintLog(), address: legacyCtf }],
+    ['from', mintLog('12.5', 0, owner, standardAdapter)],
+    ['signature', { ...mintLog(), topics: [utils.id('Approval(address,address,uint256)'), ...mintLog().topics.slice(1)] }],
+    ['transaction', { ...mintLog(), transactionHash: '0x' + '44'.repeat(32) }],
+  ] as const;
+  for (const reversed of [false, true]) {
+    it.each(conflicts)('rejects conflicting %s before payout filtering (reversed=' + reversed + ')', async (_field, conflict) => {
+      const { ctf } = await setup('LIVE');
+      const { RedeemProvenanceError } = await import('../clients/ctf-client.js');
+      operatorApproved = true;
+      const logs = [mintLog(), conflict];
+      if (reversed) logs.reverse();
+      send.mockResolvedValueOnce({ hash, wait: async () => ({ status: 1, transactionHash: hash,
+        gasUsed: BigNumber.from(21000), logs }) });
+      const error = await invoke(ctf).catch(error => error);
+      expect(error).toBeInstanceOf(RedeemProvenanceError);
+      expect(error.provenance).toEqual({ state: 'CONFIRMED', transactionHash: hash });
+      expect(error.usdcReceived).toBeUndefined();
+    });
+  }
+  it('deduplicates identical and canonically equivalent complete log content', async () => {
+    const { ctf } = await setup('LIVE');
+    operatorApproved = true;
+    const log = { ...mintLog(), transactionHash: hash };
+    const upper = (s: string) => '0x' + s.slice(2).toUpperCase();
+    const equivalent = { ...log, address: upper(log.address), topics: log.topics.map(upper),
+      data: upper(log.data), transactionHash: upper(hash) };
+    send.mockResolvedValueOnce({ hash, wait: async () => ({ status: 1, transactionHash: hash,
+      gasUsed: BigNumber.from(21000), logs: [log, { ...log }, equivalent, mintLog('1.25', 1)] }) });
+    expect((await invoke(ctf)).usdcReceived).toBe('13.75');
+  });
+  it.each([undefined, -1, 0.5, Number.MAX_SAFE_INTEGER + 1])('rejects invalid logIndex %s even in economic noise', async logIndex => {
+    const { ctf } = await setup('LIVE');
+    operatorApproved = true;
+    send.mockResolvedValueOnce({ hash, wait: async () => ({ status: 1, transactionHash: hash,
+      gasUsed: BigNumber.from(21000), logs: [mintLog(), { ...mintLog('1', 1, standardAdapter), logIndex }] }) });
+    await expect(invoke(ctf)).rejects.toMatchObject({ name: 'RedeemProvenanceError',
+      provenance: { state: 'CONFIRMED', transactionHash: hash }, usdcReceived: undefined });
+  });
+  it.each([false, true])('uses receipt payout independently of snapshot (negRisk=%s)', async negRisk => {
+    const { ctf } = await setup('LIVE');
+    operatorApproved = true;
+    yesBalance = '20000000';
+    const result = await ctf.redeemByTokenIds(condition, ids, undefined, { negRisk });
+    expect(result.usdcReceived).toBe('12.5');
+    expect(result.tokensRedeemed).toBe('20.0');
+    expect(result.provenance?.state).toBe('CONFIRMED');
+  });
+  it.each(['0', '7.25'])('reports actual mint %s despite snapshot 12.5', async amount => {
+    const { ctf } = await setup('LIVE');
+    operatorApproved = true;
+    send.mockResolvedValueOnce({ hash, wait: async () => ({ status: 1, transactionHash: hash,
+      gasUsed: BigNumber.from(21000), logs: [mintLog(amount)] }) });
+    expect((await invoke(ctf)).usdcReceived).toBe(utils.formatUnits(utils.parseUnits(amount, 6), 6));
+  });
+  it('filters unrelated transfers and sums distinct mint logs exactly, deduplicating logIndex', async () => {
+    const { ctf } = await setup('LIVE');
+    operatorApproved = true;
+    const large = mintLog('9007199254740993.123456', 4);
+    const logs = [
+      { ...mintLog('999', 0), address: legacyCtf },
+      mintLog('999', 1, owner, standardAdapter),
+      mintLog('999', 2, standardAdapter),
+      { ...mintLog('999', 3), topics: ['0x' + 'aa'.repeat(32)] },
+      { ...large, address: config.collateral.toLowerCase() }, large,
+      mintLog('0.000001', 5),
+    ];
+    send.mockResolvedValueOnce({ hash, wait: async () => ({ status: 1, transactionHash: hash,
+      gasUsed: BigNumber.from(21000), logs }) });
+    expect((await invoke(ctf)).usdcReceived).toBe('9007199254740993.123457');
+  });
+  it.each([
+    [],
+    [{ ...mintLog(), data: '0x01' }],
+    [{ ...mintLog(), topics: mintLog().topics.slice(0, 2) }],
+    [{ ...mintLog(), logIndex: undefined }],
+    [mintLog('1', 0), mintLog('2', 0)],
+    [{ ...mintLog(), transactionHash: '0x' + '44'.repeat(32) }],
+    [{ ...mintLog(), address: legacyCtf }],
+    [mintLog('1', 0, standardAdapter)],
+    [mintLog('1', 0, owner, standardAdapter)],
+  ])('keeps confirmed amount unknown for absent or invalid mint evidence %#', async (...entries) => {
+    const { ctf } = await setup('LIVE');
+    const { RedeemProvenanceError } = await import('../clients/ctf-client.js');
+    operatorApproved = true;
+    send.mockResolvedValueOnce({ hash, wait: async () => ({ status: 1, transactionHash: hash,
+      gasUsed: BigNumber.from(21000), logs: entries }) });
+    const error = await invoke(ctf).catch(error => error);
+    expect(error).toBeInstanceOf(RedeemProvenanceError);
+    expect(error.provenance).toEqual({ state: 'CONFIRMED', transactionHash: hash });
+    expect(error.usdcReceived).toBeUndefined();
+  });
   it('preserves the normal economic value when result construction fails after confirmation', async () => {
     const { ctf } = await setup('LIVE');
     const { RedeemProvenanceError } = await import('../clients/ctf-client.js');
     operatorApproved = true;
+    yesBalance = '20000000';
     const normal = await invoke(ctf);
     expect(normal.usdcReceived).toBe('12.5');
     const normalReads = reads.length;
@@ -114,7 +216,7 @@ describe('CTF redeem factual provenance', () => {
     ctfBalanceReadCount = 0;
     const cause = new Error('receipt gas formatting failed');
     send.mockResolvedValueOnce({ hash, wait: async () => ({
-      status: 1, transactionHash: hash, logs: [],
+      status: 1, transactionHash: hash, logs: [mintLog()],
       gasUsed: { toString() { throw cause; } },
     }) });
     const observer = vi.fn();
@@ -132,11 +234,11 @@ describe('CTF redeem factual provenance', () => {
     expect(ctfBalanceReadCount).toBe(2);
     expect(send).toHaveBeenCalledTimes(2);
   });
-  it('retains CONFIRMED without inventing an economic value when its formatting fails', async () => {
+  it('retains CONFIRMED without inventing an economic value when receipt amount extraction fails', async () => {
     const { ctf } = await setup('LIVE');
     const { RedeemProvenanceError } = await import('../clients/ctf-client.js');
     operatorApproved = true;
-    const cause = new Error('winning balance formatting failed');
+    const cause = new Error('receipt amount extraction failed');
     const original = BigNumber.prototype.toString;
     let failFormatting = false;
     vi.spyOn(BigNumber.prototype, 'toString').mockImplementation(function (this: BigNumber) {
@@ -221,7 +323,7 @@ describe('CTF redeem factual provenance', () => {
     await waiting;
     expect(observer).toHaveBeenCalledWith({ state: 'SUBMITTED', transactionHash: hash });
     expect(Object.isFrozen(observer.mock.calls[0][0])).toBe(true);
-    release({ status: 1, transactionHash: hash, gasUsed: BigNumber.from(21000), logs: [] });
+    release({ status: 1, transactionHash: hash, gasUsed: BigNumber.from(21000), logs: [mintLog()] });
     expect(await running).toMatchObject({ success: true, txHash: hash, tokensRedeemed: '12.5',
       usdcReceived: '12.5', yesTokensConsumed: '12.5', noTokensConsumed: '0.25',
       provenance: { state: 'CONFIRMED', transactionHash: hash } });
@@ -262,7 +364,7 @@ describe('CTF redeem factual provenance', () => {
     const { RedeemProvenanceError } = await import('../clients/ctf-client.js');
     operatorApproved = true;
     const receiptHash = '0x' + '44'.repeat(32);
-    const receipt = { status: 1, transactionHash: receiptHash, gasUsed: BigNumber.from(21000), logs: [] };
+    const receipt = { status: 1, transactionHash: receiptHash, gasUsed: BigNumber.from(21000), logs: [mintLog()] };
     const wait = vi.fn().mockResolvedValue(receipt);
     send.mockResolvedValueOnce({ hash, wait });
     const observer = vi.fn();

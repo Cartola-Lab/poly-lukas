@@ -304,7 +304,12 @@ describe('V2.3A negRisk routing propagation (offline CLOB fixtures)', () => {
     });
     const send = vi.spyOn(Wallet.prototype, 'sendTransaction').mockResolvedValue({
       hash: '0x' + '22'.repeat(32),
-      wait: async () => ({ status: 1, transactionHash: '0x' + '22'.repeat(32), gasUsed: BigNumber.from(21000), logs: [] }),
+      wait: async () => ({ status: 1, transactionHash: '0x' + '22'.repeat(32), gasUsed: BigNumber.from(21000), logs: [{
+        address: '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB', logIndex: 0,
+        topics: [utils.id('Transfer(address,address,uint256)'), utils.hexZeroPad('0x00', 32),
+          utils.hexZeroPad(new Wallet(key).address, 32)],
+        data: utils.defaultAbiCoder.encode(['uint256'], [100_000_000]),
+      }] }),
     } as never);
 
     const key = '0x' + '11'.repeat(32);

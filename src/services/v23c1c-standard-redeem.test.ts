@@ -12,6 +12,12 @@ const legacyCtf = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
 const key = '0x' + '11'.repeat(32);
 const condition = '0x' + '33'.repeat(32);
 const owner = new Wallet(key).address;
+const transferEvent = new utils.Interface(['event Transfer(address indexed from, address indexed to, uint256 amount)']);
+function mintLog(amount = '12.5', logIndex = 0, to = owner, from = '0x' + '00'.repeat(20)) {
+  return { address: config.collateral, logIndex,
+    ...transferEvent.encodeEventLog(transferEvent.getEvent('Transfer'), [from, to, utils.parseUnits(amount, 6)]) };
+}
+
 const ids = { yesTokenId: '9000000000000000001', noTokenId: '9000000000000000002' };
 
 const erc20 = new utils.Interface([
@@ -80,7 +86,7 @@ beforeEach(() => {
   });
   send.mockReset().mockResolvedValue({
     hash: '0x' + '22'.repeat(32),
-    wait: async () => ({ status: 1, transactionHash: '0x' + '22'.repeat(32), gasUsed: BigNumber.from(21000), logs: [] }),
+    wait: async () => ({ status: 1, transactionHash: '0x' + '22'.repeat(32), gasUsed: BigNumber.from(21000), logs: [mintLog()] }),
   });
   vi.spyOn(Wallet.prototype, 'sendTransaction').mockImplementation(send);
 });
