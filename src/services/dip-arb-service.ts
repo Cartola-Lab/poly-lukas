@@ -29,6 +29,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { ethers } from 'ethers';
 import {
   RealtimeServiceV2,
   type MarketSubscription,
@@ -36,7 +37,7 @@ import {
   type Subscription,
   type CryptoPrice,
 } from './realtime-service-v2.js';
-import { TradingService, type MarketOrderParams } from './trading-service.js';
+import { TradingService, type MarketOrderParams, type OrderResult } from './trading-service.js';
 import { MarketService } from './market-service.js';
 import { CTFClient, type LifecycleRouting } from '../clients/ctf-client.js';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
@@ -75,6 +76,27 @@ import {
   isDipArbLeg1Signal,
 } from './dip-arb-types.js';
 
+export type DipArbInventoryQuery = Readonly<{ walletAddress: string; tokenIds: readonly string[] }>;
+export type DipArbClobWriter = 'LEG1' | 'LEG2' | 'EMERGENCY_EXIT' | 'SETTLE_SELL';
+export type DipArbInventoryAdmissionGuard = (query: DipArbInventoryQuery & Readonly<{
+  operationType: DipArbClobWriter;
+}>) => string | undefined;
+export type DipArbInventoryProtection = Readonly<{ blocked: true; reason: string; operationId: string }>;
+type ClobScope = { originMarket: DipArbMarketConfig; wallet: string | undefined; market: DipArbMarketConfig; round: DipArbRoundState; trading: TradingService;
+  ctf: CTFClient | null; running: boolean; invocation: symbol; guard: DipArbInventoryAdmissionGuard | undefined };
+type ClobLifecycle = { operationId: string; wallet: string; tokenIds: readonly string[];
+  writerType: DipArbClobWriter | 'POSITION'; invocation?: symbol; round: DipArbRoundState; scope?: ClobScope;
+  submission: 'ACTIVE' | 'ACCEPTED' | 'UNCERTAIN' | 'EXISTING';
+  lifecycle: 'WRITING' | 'PENDING' | 'POSITION'; orderId?: string; tradeIds: readonly string[] };
+class InventoryAdmissionRefusal extends Error {}
+export type DipArbInventoryDiagnostic = {
+  status?: 'BLOCKED_INVENTORY';
+  inventoryInterruption?: Readonly<{ status: 'BLOCKED_INVENTORY'; reason: string }>;
+};
+function isInventoryRefusal(result: unknown): boolean {
+  return !!result && typeof result === 'object' && 'status' in result && result.status === 'BLOCKED_INVENTORY';
+}
+
 // ===== DipArbService =====
 
 export class DipArbService extends EventEmitter {
@@ -83,6 +105,189 @@ export class DipArbService extends EventEmitter {
   private tradingService: TradingService | null = null;
   private marketService: MarketService;
   private ctf: CTFClient | null = null;
+
+  private inventoryAdmissionGuard?: DipArbInventoryAdmissionGuard;
+  private clobLifecycles = new Map<string, ClobLifecycle>();
+  private nextClobOperation = 0;
+  private seenClobOrders = new Set<string>();
+  private closedInventoryLegs = new WeakSet<object>();
+  private admittingInventory = false;
+  private protectedClobReconciliation?: Promise<void>;
+  private clobReleaseFlights = new Map<DipArbRoundState, Map<string, Promise<void>>>();
+
+  setInventoryAdmissionGuard(guard?: DipArbInventoryAdmissionGuard): void {
+    if (!guard && this.clobLifecycles.size) throw new Error('DipArb inventory lifecycle still protected');
+    this.inventoryAdmissionGuard = guard;
+    // Existing DipArb legs are identities, never attributed from aggregate wallet balances.
+    if (guard && this.currentRound && this.tradingService) {
+      const wallet = this.inventoryWallet(this.tradingService.getAddress());
+      for (const leg of [this.currentRound.leg1, this.currentRound.leg2]) {
+        if (!leg || this.closedInventoryLegs.has(leg) || leg.shares <= 0 || [...this.clobLifecycles.values()].some(r =>
+          r.round === this.currentRound && r.tokenIds.includes(leg.tokenId))) continue;
+        const operationId = `dip-clob-${++this.nextClobOperation}`;
+        this.clobLifecycles.set(operationId, { operationId, wallet, tokenIds: Object.freeze([leg.tokenId]),
+          writerType: 'POSITION', round: this.currentRound,
+          scope: this.market ? { originMarket: this.market, market: { ...this.market }, wallet,
+            round: this.currentRound, trading: this.tradingService, ctf: this.ctf,
+            running: this.isRunning, invocation: Symbol(), guard } : undefined,
+          submission: leg.exitPending ? 'UNCERTAIN' : 'EXISTING', lifecycle: 'POSITION', tradeIds: [] });
+      }
+    }
+  }
+
+  getInventoryProtection(query: DipArbInventoryQuery): DipArbInventoryProtection | undefined {
+    const wallet = this.inventoryWallet(query.walletAddress);
+    if (!query.tokenIds.length || query.tokenIds.some(t => typeof t !== 'string' || !t.trim())) {
+      throw new Error('Invalid inventory token identity');
+    }
+    for (const record of this.clobLifecycles.values()) {
+      if (record.wallet === wallet && record.tokenIds.some(t => query.tokenIds.includes(t))) {
+        return Object.freeze({ blocked: true, reason: `DIP_ARB_${record.submission === 'UNCERTAIN'
+          ? 'UNCERTAIN' : record.lifecycle}`, operationId: record.operationId });
+      }
+    }
+  }
+
+  private inventoryWallet(address: string): string {
+    if (!ethers.utils.isAddress(address)) throw new InventoryAdmissionRefusal('Invalid inventory wallet identity');
+    return ethers.utils.getAddress(address).toLowerCase();
+  }
+
+  private inventoryBlocked<T extends object>(result: T, error: InventoryAdmissionRefusal): T & DipArbInventoryDiagnostic {
+    try { this.emit('inventoryBlocked', Object.freeze({ reason: error.message })); } catch { /* diagnostic only */ }
+    return { ...result, status: 'BLOCKED_INVENTORY' };
+  }
+
+  private clobWalletSnapshot(trading: TradingService | null): string {
+    try { return trading?.getAddress() ?? ''; } catch { return ''; }
+  }
+
+  private async submitClob(scope: ClobScope, writerType: DipArbClobWriter, params: MarketOrderParams): Promise<OrderResult> {
+    if (!scope.guard) return scope.trading.createMarketOrder(params);
+    const wallet = this.inventoryWallet(scope.wallet ?? '');
+    const token = params.tokenId;
+    const current = () => scope.originMarket === this.market && scope.market.upTokenId === this.market.upTokenId &&
+      scope.market.downTokenId === this.market.downTokenId && scope.round === this.currentRound &&
+      scope.running === this.isRunning && scope.guard === this.inventoryAdmissionGuard &&
+      scope.trading === this.tradingService && this.inventoryWallet(this.clobWalletSnapshot(scope.trading)) === wallet;
+    if (!token?.trim() || ![scope.market.upTokenId, scope.market.downTokenId].includes(token) || !current() || this.admittingInventory) throw new InventoryAdmissionRefusal('Stale or reentrant inventory admission');
+    const leg1 = scope.round.leg1, leg2 = scope.round.leg2, phase = scope.round.phase;
+    let reason: string | undefined;
+    this.admittingInventory = true;
+    try { reason = scope.guard(Object.freeze({ walletAddress: wallet, tokenIds: Object.freeze([token]), operationType: writerType })); }
+    catch (error) { throw new InventoryAdmissionRefusal(error instanceof Error ? error.message : 'Inventory guard failed'); }
+    finally { this.admittingInventory = false; }
+    if (reason || !current() || scope.round.leg1 !== leg1 || scope.round.leg2 !== leg2 || scope.round.phase !== phase) throw new InventoryAdmissionRefusal(reason || 'Inventory context changed during admission');
+    for (const prior of this.clobLifecycles.values()) {
+      if (prior.wallet !== wallet || !prior.tokenIds.includes(token)) continue;
+      if (prior.round !== scope.round || prior.submission === 'ACTIVE' || prior.submission === 'UNCERTAIN' ||
+          (prior.writerType === 'EMERGENCY_EXIT' || prior.writerType === 'SETTLE_SELL') ||
+          (params.side === 'BUY' && prior.invocation !== scope.invocation)) {
+        throw new InventoryAdmissionRefusal('DipArb inventory lifecycle unresolved');
+      }
+    }
+    const operationId = `dip-clob-${++this.nextClobOperation}`;
+    const record: ClobLifecycle = { operationId, wallet, tokenIds: Object.freeze([token]), writerType,
+      round: scope.round, scope, invocation: scope.invocation, submission: 'ACTIVE', lifecycle: 'WRITING', tradeIds: [] };
+    this.clobLifecycles.set(operationId, record);
+    try {
+      const result = await scope.trading.createMarketOrder(params);
+      const orderId = typeof result.orderId === 'string' ? result.orderId.trim() : '';
+      if (result.submissionState === 'REJECTED') this.clobLifecycles.delete(operationId);
+      else if (result.submissionState === 'ACCEPTED' && orderId && !this.seenClobOrders.has(`${wallet}:${orderId}`)) {
+        this.seenClobOrders.add(`${wallet}:${orderId}`);
+        record.submission = 'ACCEPTED'; record.lifecycle = 'PENDING'; record.orderId = orderId;
+        record.tradeIds = Object.freeze([...(result.tradeIds ?? [])]);
+      } else {
+        record.submission = 'UNCERTAIN'; record.lifecycle = 'PENDING';
+        // Preserve a unique factual order identity for later read-only resolution.
+        if (result.submissionState === 'UNCERTAIN' && orderId && !this.seenClobOrders.has(`${wallet}:${orderId}`)) {
+          this.seenClobOrders.add(`${wallet}:${orderId}`);
+          record.orderId = orderId;
+          record.tradeIds = Object.freeze([...(result.tradeIds ?? [])]);
+        }
+      }
+      return result;
+    } catch (error) { record.submission = 'UNCERTAIN'; record.lifecycle = 'PENDING'; throw error; }
+  }
+
+  // Exclusively a protection proof; never books fills, fees, proceeds or PnL.
+  private reconcileProtectedClobLifecycles(): Promise<void> {
+    if (this.protectedClobReconciliation) return this.protectedClobReconciliation;
+    const run = async () => {
+      const visited = new Map<DipArbRoundState, Set<string>>();
+      for (const record of [...this.clobLifecycles.values()]) {
+        if (!this.clobLifecycles.has(record.operationId) || !record.scope ||
+            record.submission === 'ACTIVE' || (record.submission !== 'EXISTING' && !record.orderId)) continue;
+        let tokens = visited.get(record.round);
+        if (!tokens) visited.set(record.round, tokens = new Set());
+        for (const token of record.tokenIds) {
+          if (tokens.has(token)) continue;
+          tokens.add(token);
+          await this.releaseClobAfterExit(record.scope, token);
+        }
+      }
+    };
+    const flight = Promise.resolve().then(run).finally(() => {
+      if (this.protectedClobReconciliation === flight) this.protectedClobReconciliation = undefined;
+    });
+    this.protectedClobReconciliation = flight;
+    return flight;
+  }
+
+  private releaseClobAfterExit(scope: ClobScope, token: string): Promise<void> {
+    let flights = this.clobReleaseFlights.get(scope.round);
+    if (!flights) this.clobReleaseFlights.set(scope.round, flights = new Map());
+    const key = `${scope.wallet}:${token}`;
+    const existing = flights.get(key);
+    if (existing) return existing;
+    const flight = Promise.resolve().then(() => this.proveClobRelease(scope, token)).finally(() => {
+      flights!.delete(key);
+      if (!flights!.size) this.clobReleaseFlights.delete(scope.round);
+    });
+    flights.set(key, flight);
+    return flight;
+  }
+
+  private async proveClobRelease(scope: ClobScope, token: string): Promise<void> {
+    if (!scope.guard || !scope.ctf) return;
+    try {
+      const wallet = this.inventoryWallet(scope.wallet ?? '');
+      if (this.inventoryWallet(scope.trading.getAddress()) !== wallet) return;
+      if (this.inventoryWallet(scope.ctf.getAddress()) !== wallet) return;
+      const records = [...this.clobLifecycles.values()].filter(r => r.wallet === wallet && r.round === scope.round && r.tokenIds.includes(token));
+      if (!records.length || records.some(r => r.submission === 'ACTIVE' || (r.submission === 'UNCERTAIN' && !r.orderId))) return;
+      const initialRecords = new Set(this.clobLifecycles.values());
+      for (const record of records) {
+        if (record.submission === 'EXISTING') continue;
+        if (!record.orderId) return;
+        const details = await scope.trading.getOrderFillDetails(record.orderId);
+        const ids = [...new Set([...record.tradeIds, ...details.tradeIds])];
+        record.tradeIds = Object.freeze(ids);
+        if (!ids.length) return;
+        const trades = await scope.trading.getTradeStatuses(ids);
+        if (ids.some(id => !details.tradeIds.includes(id))) return;
+        if (trades.length !== ids.length || new Set(trades.map(t => t.id)).size !== ids.length ||
+          trades.some(t => !ids.includes(t.id) || !(t.transactionHash?.trim() || t.status === 'FAILED'))) return;
+        const units = (value: unknown) => {
+          if (typeof value !== 'string' || !/^\d+(?:\.\d{1,2}0*)?$/.test(value)) throw new Error('Invalid shares');
+          const [whole, fraction = ''] = value.split('.'); return BigInt(whole) * 100n + BigInt(fraction.slice(0, 2).padEnd(2, '0'));
+        };
+        if (trades.reduce((n, t) => n + units(t.size), 0n) !== units(details.sizeMatched)) return;
+      }
+      const balances = await scope.ctf.getPositionBalanceByTokenIds(scope.market.conditionId,
+        { yesTokenId: scope.market.upTokenId, noTokenId: scope.market.downTokenId });
+      const held = token === scope.market.upTokenId ? balances.yesBalance
+        : token === scope.market.downTokenId ? balances.noBalance : undefined;
+      if (typeof held !== 'string' || !/^0(?:\.0+)?$/.test(held) || [...this.clobLifecycles.values()].some(r => r.wallet === wallet &&
+        r.tokenIds.includes(token) && !initialRecords.has(r))) return;
+      if (this.inventoryWallet(scope.trading.getAddress()) !== wallet || this.inventoryWallet(scope.ctf.getAddress()) !== wallet) return;
+      for (const record of records) this.clobLifecycles.delete(record.operationId);
+      for (const leg of [scope.round.leg1, scope.round.leg2]) {
+        if (leg?.tokenId === token) this.closedInventoryLegs.add(leg);
+      }
+    } catch { /* Insufficient facts retain protection. */ }
+  }
 
   // Configuration
   private config: DipArbConfigInternal;
@@ -173,13 +378,14 @@ export class DipArbService extends EventEmitter {
    */
   private async reconcileLegShares(
     estimatedShares: number,
-    legSide: DipArbSide
+    legSide: DipArbSide,
+    market = this.market, ctf = this.ctf
   ): Promise<number> {
-    if (!this.ctf || !this.market) return estimatedShares;
+    if (!ctf || !market) return estimatedShares;
     try {
-      const positions = await this.ctf.getPositionBalanceByTokenIds(
-        this.market.conditionId,
-        { yesTokenId: this.market.upTokenId, noTokenId: this.market.downTokenId }
+      const positions = await ctf.getPositionBalanceByTokenIds(
+        market.conditionId,
+        { yesTokenId: market.upTokenId, noTokenId: market.downTokenId }
       );
       // NOTE: CTF position IDs map UP→yes / DOWN→no for UpDown markets.
       const held = legSide === 'UP'
@@ -583,10 +789,15 @@ export class DipArbService extends EventEmitter {
   /**
    * Execute Leg1 trade
    */
-  async executeLeg1(signal: DipArbLeg1Signal): Promise<DipArbExecutionResult> {
+  async executeLeg1(signal: DipArbLeg1Signal): Promise<DipArbExecutionResult & DipArbInventoryDiagnostic> {
+    const originMarket = this.market, round = this.currentRound, trading = this.tradingService, ctf = this.ctf;
+    const guard = this.inventoryAdmissionGuard, running = this.isRunning, invocation = Symbol();
+    const market = guard && originMarket ? { ...originMarket } : originMarket;
+    const wallet = guard ? this.clobWalletSnapshot(trading) : undefined;
+    if (guard) signal = { ...signal };
     const startTime = Date.now();
 
-    if (!this.tradingService || !this.market || !this.currentRound) {
+    if (!trading || !market || !round) {
       this.isExecuting = false;  // Reset in case handleSignal() set it
       return {
         success: false,
@@ -603,7 +814,7 @@ export class DipArbService extends EventEmitter {
       strategy: 'dipArb',
       side: 'BUY',
       usdcAmount: signal.shares * signal.targetPrice,
-      marketKey: this.market.conditionId,
+      marketKey: market.conditionId,
     });
     if (blockReason) {
       this.isExecuting = false;
@@ -617,6 +828,7 @@ export class DipArbService extends EventEmitter {
     }
 
     try {
+      if (guard && signal.roundId !== round.roundId) throw new InventoryAdmissionRefusal('Stale round signal');
       this.isExecuting = true;  // Also set here for manual mode (when not called from handleSignal)
 
       // 计算拆分订单参数
@@ -654,6 +866,7 @@ export class DipArbService extends EventEmitter {
       let totalAmountSpent = 0;
       let lastOrderId: string | undefined;
       let failedOrders = 0;
+      let inventoryInterruption: DipArbInventoryDiagnostic['inventoryInterruption'];
 
       // 执行多笔订单
       for (let i = 0; i < splitCount; i++) {
@@ -671,7 +884,16 @@ export class DipArbService extends EventEmitter {
           this.log(`Leg1 order ${i + 1}/${splitCount}: ${sharesPerOrder.toFixed(2)} shares @ ${signal.targetPrice.toFixed(4)}`);
         }
 
-        const result = await this.tradingService.createMarketOrder(orderParams);
+        let result: OrderResult;
+        try {
+          result = await this.submitClob({ originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'LEG1', orderParams);
+        } catch (error) {
+          if (!(error instanceof InventoryAdmissionRefusal) || totalSharesFilled <= 0) throw error;
+          // Stop acquisition, then consume the preceding fills through the normal path once.
+          inventoryInterruption = Object.freeze({ status: 'BLOCKED_INVENTORY', reason: error.message });
+          this.inventoryBlocked({}, error);
+          break;
+        }
 
         if (result.success) {
           totalSharesFilled += sharesPerOrder;
@@ -696,7 +918,7 @@ export class DipArbService extends EventEmitter {
         const avgPrice = totalAmountSpent / totalSharesFilled;
 
         // Reconcile estimated fills against on-chain reality (PROBLEMS.md #10).
-        const reconciledShares = await this.reconcileLegShares(totalSharesFilled, signal.dipSide);
+        const reconciledShares = await this.reconcileLegShares(totalSharesFilled, signal.dipSide, market, ctf);
         const fillRatio = totalSharesFilled > 0 ? reconciledShares / totalSharesFilled : 1;
         const reconciledSpent = totalAmountSpent * fillRatio;
         if (reconciledShares < totalSharesFilled) {
@@ -705,14 +927,14 @@ export class DipArbService extends EventEmitter {
         }
 
         // Record leg1 fill
-        this.currentRound.leg1 = {
+        round.leg1 = {
           side: signal.dipSide,
           price: totalAmountSpent / totalSharesFilled,
           shares: totalSharesFilled,
           timestamp: Date.now(),
           tokenId: signal.tokenId,
         };
-        this.currentRound.phase = 'leg1_filled';
+        round.phase = 'leg1_filled';
         this.stats.leg1Filled++;
 
         this.lastExecutionTime = Date.now();
@@ -733,6 +955,7 @@ export class DipArbService extends EventEmitter {
 
         return {
           success: true,
+          ...(inventoryInterruption ? { inventoryInterruption } : {}),
           leg: 'leg1',
           roundId: signal.roundId,
           side: signal.dipSide,
@@ -751,6 +974,7 @@ export class DipArbService extends EventEmitter {
         };
       }
     } catch (error) {
+      if (error instanceof InventoryAdmissionRefusal) return this.inventoryBlocked({ success: false, leg: 'leg1' as const, roundId: round!.roundId, error: error.message, executionTimeMs: Date.now() - startTime }, error);
       return {
         success: false,
         leg: 'leg1',
@@ -766,10 +990,15 @@ export class DipArbService extends EventEmitter {
   /**
    * Execute Leg2 trade
    */
-  async executeLeg2(signal: DipArbLeg2Signal): Promise<DipArbExecutionResult> {
+  async executeLeg2(signal: DipArbLeg2Signal): Promise<DipArbExecutionResult & DipArbInventoryDiagnostic> {
+    const originMarket = this.market, round = this.currentRound, trading = this.tradingService, ctf = this.ctf;
+    const guard = this.inventoryAdmissionGuard, running = this.isRunning, invocation = Symbol();
+    const market = guard && originMarket ? { ...originMarket } : originMarket;
+    const wallet = guard ? this.clobWalletSnapshot(trading) : undefined;
+    if (guard) signal = { ...signal };
     const startTime = Date.now();
 
-    if (!this.tradingService || !this.market || !this.currentRound) {
+    if (!trading || !market || !round) {
       this.isExecuting = false;  // Reset in case handleSignal() set it
       return {
         success: false,
@@ -781,6 +1010,7 @@ export class DipArbService extends EventEmitter {
     }
 
     try {
+      if (guard && signal.roundId !== round.roundId) throw new InventoryAdmissionRefusal('Stale round signal');
       this.isExecuting = true;  // Also set here for manual mode (when not called from handleSignal)
 
       // 计算拆分订单参数
@@ -801,6 +1031,7 @@ export class DipArbService extends EventEmitter {
       let totalAmountSpent = 0;
       let lastOrderId: string | undefined;
       let failedOrders = 0;
+      let inventoryInterruption: DipArbInventoryDiagnostic['inventoryInterruption'];
 
       // 执行多笔订单
       for (let i = 0; i < splitCount; i++) {
@@ -817,7 +1048,16 @@ export class DipArbService extends EventEmitter {
           this.log(`Leg2 order ${i + 1}/${splitCount}: ${sharesPerOrder.toFixed(2)} shares @ ${signal.targetPrice.toFixed(4)}`);
         }
 
-        const result = await this.tradingService.createMarketOrder(orderParams);
+        let result: OrderResult;
+        try {
+          result = await this.submitClob({ originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'LEG2', orderParams);
+        } catch (error) {
+          if (!(error instanceof InventoryAdmissionRefusal) || totalSharesFilled <= 0) throw error;
+          // Stop acquisition, then consume the preceding fills through the normal path once.
+          inventoryInterruption = Object.freeze({ status: 'BLOCKED_INVENTORY', reason: error.message });
+          this.inventoryBlocked({}, error);
+          break;
+        }
 
         if (result.success) {
           totalSharesFilled += sharesPerOrder;
@@ -842,8 +1082,8 @@ export class DipArbService extends EventEmitter {
         // Reconcile estimated fills against on-chain reality, then clamp the
         // hedge to the ACTUAL Leg1 size so the pair stays 1:1 (PROBLEMS.md #10).
         // Leg2 must never exceed what Leg1 really holds.
-        const leg1Actual = this.currentRound.leg1?.shares ?? totalSharesFilled;
-        const reconciledLeg2 = await this.reconcileLegShares(totalSharesFilled, signal.hedgeSide);
+        const leg1Actual = round.leg1?.shares ?? totalSharesFilled;
+        const reconciledLeg2 = await this.reconcileLegShares(totalSharesFilled, signal.hedgeSide, market, ctf);
         const effectiveLeg2 = Math.min(reconciledLeg2, leg1Actual);
         if (effectiveLeg2 < totalSharesFilled) {
           const ratio = effectiveLeg2 / totalSharesFilled;
@@ -861,19 +1101,19 @@ export class DipArbService extends EventEmitter {
           };
         }
         const avgPrice = totalAmountSpent / totalSharesFilled;
-        const leg1Price = this.currentRound.leg1?.price || 0;
+        const leg1Price = round.leg1?.price || 0;
         const actualTotalCost = leg1Price + avgPrice;
 
         // Record leg2 fill
-        this.currentRound.leg2 = {
+        round.leg2 = {
           side: signal.hedgeSide,
           price: avgPrice,
           shares: totalSharesFilled,
           timestamp: Date.now(),
           tokenId: signal.tokenId,
         };
-        this.currentRound.phase = 'completed';
-        this.currentRound.totalCost = actualTotalCost;
+        round.phase = 'completed';
+        round.totalCost = actualTotalCost;
         // AUDIT #3: book NET profit (taker fee on both legs' notional comes
         // out of the $1 payout — same as the fee-aware entry gates above and
         // arb-service). No gas term: this path has no gas config.
@@ -883,7 +1123,7 @@ export class DipArbService extends EventEmitter {
           this.config.feeRateBps,
           0
         );
-        this.currentRound.profit = booked.netPerUnit;
+        round.profit = booked.netPerUnit;
 
         this.stats.leg2Filled++;
         this.stats.roundsSuccessful++;
@@ -895,7 +1135,7 @@ export class DipArbService extends EventEmitter {
         // Detailed execution logging
         const slippage = ((avgPrice - signal.currentPrice) / signal.currentPrice * 100);
         const execTimeMs = Date.now() - startTime;
-        const profitPerShare = this.currentRound.profit;
+        const profitPerShare = round.profit;
         const totalProfit = profitPerShare * totalSharesFilled;
 
         this.log(`✅ Leg2 FILLED: ${signal.hedgeSide} x${totalSharesFilled.toFixed(1)} @ ${avgPrice.toFixed(4)}`);
@@ -912,18 +1152,18 @@ export class DipArbService extends EventEmitter {
         const roundResult: DipArbRoundResult = {
           roundId: signal.roundId,
           status: 'completed',
-          leg1: this.currentRound.leg1,
-          leg2: this.currentRound.leg2,
-          totalCost: this.currentRound.totalCost,
-          profit: this.currentRound.profit,
-          profitRate: calculateDipArbProfitRate(this.currentRound.totalCost),
+          leg1: round.leg1,
+          leg2: round.leg2,
+          totalCost: round.totalCost,
+          profit: round.profit,
+          profitRate: calculateDipArbProfitRate(round.totalCost),
           merged: false,
         };
 
         this.emit('roundComplete', roundResult);
 
         // Auto merge if enabled
-        if (this.config.autoMerge) {
+        if (this.config.autoMerge && (!guard || (round === this.currentRound && originMarket === this.market))) {
           const mergeResult = await this.merge();
           roundResult.merged = mergeResult.success;
           roundResult.mergeTxHash = mergeResult.txHash;
@@ -931,6 +1171,7 @@ export class DipArbService extends EventEmitter {
 
         return {
           success: true,
+          ...(inventoryInterruption ? { inventoryInterruption } : {}),
           leg: 'leg2',
           roundId: signal.roundId,
           side: signal.hedgeSide,
@@ -949,6 +1190,7 @@ export class DipArbService extends EventEmitter {
         };
       }
     } catch (error) {
+      if (error instanceof InventoryAdmissionRefusal) return this.inventoryBlocked({ success: false, leg: 'leg2' as const, roundId: round!.roundId, error: error.message, executionTimeMs: Date.now() - startTime }, error);
       return {
         success: false,
         leg: 'leg2',
@@ -1177,6 +1419,8 @@ export class DipArbService extends EventEmitter {
   // ===== Private: Round Management =====
 
   private async checkAndStartNewRound(): Promise<void> {
+    // Existing orderbook cycle also services lifecycles whose original round has ended.
+    if (this.clobLifecycles.size) await this.reconcileProtectedClobLifecycles();
     if (!this.market) return;
 
     // If no current round or current round is completed/expired, start new round
@@ -1251,25 +1495,27 @@ export class DipArbService extends EventEmitter {
         }
 
         // Try to sell Leg1 position
+        const expiringRound = this.currentRound;
         const exitResult = await this.emergencyExitLeg1();
+        if (isInventoryRefusal(exitResult)) return;
 
         if (exitResult?.success) {
-          this.currentRound.phase = 'expired';
+          expiringRound.phase = 'expired';
           this.stats.roundsExpired++;
           this.stats.roundsCompleted++;
         }
         // On !success: phase stays 'leg1_filled', retry on next signal.
 
         const result: DipArbRoundResult = {
-          roundId: this.currentRound.roundId,
+          roundId: expiringRound.roundId,
           status: 'expired',
-          leg1: this.currentRound.leg1,
+          leg1: expiringRound.leg1,
           merged: false,
           exitResult,  // Include exit result for tracking
         };
 
         this.emit('roundComplete', result);
-        this.log(`Round expired: ${this.currentRound.roundId} | Exit: ${exitResult?.success ? 'SUCCESS' : 'FAILED'}`);
+        this.log(`Round expired: ${expiringRound.roundId} | Exit: ${exitResult?.success ? 'SUCCESS' : 'FAILED'}`);
       }
     }
   }
@@ -1279,36 +1525,41 @@ export class DipArbService extends EventEmitter {
    * Sells the Leg1 tokens at market price to avoid unhedged exposure
    */
   private async emergencyExitLeg1(): Promise<DipArbExecutionResult | null> {
-    if (!this.tradingService || !this.market || !this.currentRound?.leg1) {
+    const originMarket = this.market, round = this.currentRound, trading = this.tradingService, ctf = this.ctf;
+    const guard = this.inventoryAdmissionGuard, running = this.isRunning, invocation = Symbol();
+    const market = guard && originMarket ? { ...originMarket } : originMarket;
+    const wallet = guard ? this.clobWalletSnapshot(trading) : undefined;
+    if (!trading || !market || !round?.leg1) {
       this.log('Cannot exit Leg1: no trading service or position');
       return null;
     }
 
-    const leg1 = this.currentRound.leg1;
+    const leg1 = round.leg1;
+    const legToken = leg1.tokenId, legSide = leg1.side;
     const startTime = Date.now();
     const DUST_EPSILON = 0.001;
 
     try {
       // ---- PRE-SUBMIT: read CTF balance as single source of truth ----
       let currentBalance = leg1.shares; // fallback when CTF unavailable
-      if (this.ctf) {
+      if (ctf) {
         try {
-          const pos = await this.ctf.getPositionBalanceByTokenIds(
-            this.market.conditionId,
-            { yesTokenId: this.market.upTokenId, noTokenId: this.market.downTokenId }
+          const pos = await ctf.getPositionBalanceByTokenIds(
+            market.conditionId,
+            { yesTokenId: market.upTokenId, noTokenId: market.downTokenId }
           );
-          const held = leg1.side === 'UP'
+          const held = legSide === 'UP'
             ? parseFloat(pos.yesBalance)
             : parseFloat(pos.noBalance);
           if (!Number.isFinite(held)) {
             this.log('⚠️ CTF balance read failed — cannot verify position, refusing to SELL');
-            return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+            return { success: false, leg: 'exit', roundId: round.roundId,
               error: 'CTF balance read failed', executionTimeMs: Date.now() - startTime };
           }
           currentBalance = held;
         } catch {
           this.log('⚠️ CTF balance query failed — cannot verify position, refusing to SELL');
-          return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+          return { success: false, leg: 'exit', roundId: round.roundId,
             error: 'CTF balance query failed', executionTimeMs: Date.now() - startTime };
         }
       }
@@ -1322,7 +1573,7 @@ export class DipArbService extends EventEmitter {
             + estimateTakerFee(leg1.price * leg1.exitSubmitShares, this.config.feeRateBps)
             + estimateTakerFee(soldPrice * leg1.exitSubmitShares, this.config.feeRateBps);
           this.stats.totalProfit -= Math.abs(loss);
-          this.log(`✅ Exit confirmed (delayed): ${leg1.exitSubmitShares.toFixed(2)} ${leg1.side} @ ~${soldPrice.toFixed(4)} | Loss: $${loss.toFixed(2)}`);
+          this.log(`✅ Exit confirmed (delayed): ${leg1.exitSubmitShares.toFixed(2)} ${legSide} @ ~${soldPrice.toFixed(4)} | Loss: $${loss.toFixed(2)}`);
         } else {
           // Resolved without known exit attempt — no PnL inventing.
           this.log('Leg1 position resolved externally — exit PnL unavailable');
@@ -1331,18 +1582,35 @@ export class DipArbService extends EventEmitter {
         leg1.exitTradeIds = undefined;
         leg1.exitSubmitPrice = undefined;
         leg1.exitSubmitShares = undefined;
-        return { success: true, leg: 'exit', roundId: this.currentRound.roundId,
-          side: leg1.side, shares: currentBalance, executionTimeMs: Date.now() - startTime };
+        if (guard && currentBalance === 0) await this.releaseClobAfterExit({originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation}, legToken);
+        return { success: true, leg: 'exit', roundId: round.roundId,
+          side: legSide, shares: currentBalance, executionTimeMs: Date.now() - startTime };
       }
 
       // ---- PENDING GUARD: do not duplicate if prior SELL is unresolved ----
       if (leg1.exitPending) {
-        if (leg1.exitTradeIds && leg1.exitTradeIds.length > 0) {
+        const attempts = guard ? [...this.clobLifecycles.values()].filter(record =>
+          record.round === round && record.wallet === this.inventoryWallet(wallet ?? '') &&
+          record.tokenIds.includes(legToken) && record.writerType === 'EMERGENCY_EXIT') : [];
+        const attempt = attempts.length === 1 ? attempts[0] : undefined;
+        const childIds = guard ? (attempt?.submission === 'ACCEPTED' ? [...new Set(attempt.tradeIds)] : [])
+          : leg1.exitTradeIds;
+        if (childIds && childIds.length > 0) {
           try {
-            const statuses = await this.tradingService.getTradeStatuses(leg1.exitTradeIds);
-            const allFailed = statuses.length > 0 && statuses.every(s => s.status === 'FAILED');
+            const statuses = await trading.getTradeStatuses(childIds);
+            const allFailed = statuses.length > 0 && statuses.every(s => s.status === 'FAILED') &&
+              (!guard || (statuses.length === childIds.length && new Set(statuses.map(s => s.id)).size === childIds.length &&
+                statuses.every(s => childIds.includes(s.id)) && attempt!.tradeIds.every(id => childIds.includes(id))));
             if (allFailed) {
               this.log('All prior SELL trades definitively FAILED — clearing pending state for retry');
+              if (guard) {
+                // Delete only the captured failed attempt. A concurrent cleanup/retry owns its own state.
+                if (this.clobLifecycles.get(attempt!.operationId) !== attempt || !leg1.exitPending) {
+                  return this.inventoryBlocked({ success: false, leg: 'exit' as const, roundId: round.roundId,
+                    executionTimeMs: Date.now() - startTime }, new InventoryAdmissionRefusal('Exit attempt changed during reconciliation'));
+                }
+                this.clobLifecycles.delete(attempt!.operationId);
+              }
               leg1.exitPending = false;
               leg1.exitTradeIds = undefined;
               leg1.exitSubmitPrice = undefined;
@@ -1350,46 +1618,46 @@ export class DipArbService extends EventEmitter {
               // continue to fresh SELL below
             } else {
               this.log('Prior SELL pending (trades not all FAILED) — waiting for settlement');
-              return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+              return { success: false, leg: 'exit', roundId: round.roundId,
                 error: 'Prior SELL pending settlement', executionTimeMs: Date.now() - startTime };
             }
           } catch (err) {
             this.log(`Trade status query failed — waiting: ${err instanceof Error ? err.message : String(err)}`);
-            return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+            return { success: false, leg: 'exit', roundId: round.roundId,
               error: 'Trade status query failed — waiting', executionTimeMs: Date.now() - startTime };
             }
         } else {
           // exitPending but no trade IDs — ambiguous, wait
           this.log('Prior SELL pending (no trade IDs) — waiting for settlement');
-          return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+          return { success: false, leg: 'exit', roundId: round.roundId,
             error: 'Prior SELL pending — no trade IDs', executionTimeMs: Date.now() - startTime };
         }
       }
 
       // ---- FRESH SELL using current on-chain balance ----
       const exitAmount = currentBalance;
-      const currentPrice = leg1.side === 'UP'
+      const currentPrice = legSide === 'UP'
         ? (this.upAsks[0]?.price ?? 0.5)
         : (this.downAsks[0]?.price ?? 0.5);
       const exitValue = exitAmount * currentPrice;
 
       if (exitValue < 1) {
         this.log(`⚠️ Exit value ($${exitValue.toFixed(2)}) below $1 minimum — stuck dust; will attempt merge/redeem at expiry`);
-        this.emit('dustStuck', { roundId: this.currentRound.roundId, side: leg1.side,
-          shares: leg1.shares, tokenId: leg1.tokenId, exitValue });
-        return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+        this.emit('dustStuck', { roundId: round.roundId, side: legSide,
+          shares: leg1.shares, tokenId: legToken, exitValue });
+        return { success: false, leg: 'exit', roundId: round.roundId,
           error: `Exit value ($${exitValue.toFixed(2)}) below Polymarket minimum ($1) — stuck dust`, executionTimeMs: Date.now() - startTime };
       }
 
-      this.log(`Selling ${exitAmount.toFixed(2)} ${leg1.side} tokens...`);
+      this.log(`Selling ${exitAmount.toFixed(2)} ${legSide} tokens...`);
       const exitFloor = currentPrice * (1 - this.config.maxSlippage);
-      const result = await this.tradingService.createMarketOrder({
-        tokenId: leg1.tokenId, side: 'SELL' as Side,
+      const result = await this.submitClob({ originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'EMERGENCY_EXIT', {
+        tokenId: legToken, side: 'SELL' as Side,
         amount: exitAmount, price: exitFloor, orderType: 'FOK' });
 
       if (!result.success) {
         this.log(`❌ Leg1 exit failed: ${result.errorMsg}`);
-        return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+        return { success: false, leg: 'exit', roundId: round.roundId,
           error: result.errorMsg, executionTimeMs: Date.now() - startTime };
       }
 
@@ -1400,13 +1668,13 @@ export class DipArbService extends EventEmitter {
       leg1.exitSubmitShares = exitAmount;
 
       // ---- POST-SUBMIT VERIFICATION ----
-      if (this.ctf) {
+      if (ctf) {
         try {
-          const postPos = await this.ctf.getPositionBalanceByTokenIds(
-            this.market.conditionId,
-            { yesTokenId: this.market.upTokenId, noTokenId: this.market.downTokenId }
+          const postPos = await ctf.getPositionBalanceByTokenIds(
+            market.conditionId,
+            { yesTokenId: market.upTokenId, noTokenId: market.downTokenId }
           );
-          const postHeld = leg1.side === 'UP'
+          const postHeld = legSide === 'UP'
             ? parseFloat(postPos.yesBalance)
             : parseFloat(postPos.noBalance);
           if (Number.isFinite(postHeld) && postHeld <= DUST_EPSILON) {
@@ -1420,9 +1688,10 @@ export class DipArbService extends EventEmitter {
             leg1.exitTradeIds = undefined;
             leg1.exitSubmitPrice = undefined;
             leg1.exitSubmitShares = undefined;
-            this.log(`✅ Leg1 exit successful: ${exitAmount.toFixed(2)} ${leg1.side} @ ~${soldPrice.toFixed(4)} | Loss: $${loss.toFixed(2)}`);
-            return { success: true, leg: 'exit', roundId: this.currentRound.roundId,
-              side: leg1.side, price: soldPrice, shares: exitAmount, orderId: result.orderId,
+            if (guard && postHeld === 0) await this.releaseClobAfterExit({originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation}, legToken);
+            this.log(`✅ Leg1 exit successful: ${exitAmount.toFixed(2)} ${legSide} @ ~${soldPrice.toFixed(4)} | Loss: $${loss.toFixed(2)}`);
+            return { success: true, leg: 'exit', roundId: round.roundId,
+              side: legSide, price: soldPrice, shares: exitAmount, orderId: result.orderId,
               executionTimeMs: Date.now() - startTime };
           }
         } catch {
@@ -1432,11 +1701,12 @@ export class DipArbService extends EventEmitter {
 
       // Settlement not yet confirmed — pending state retained for next cycle.
       this.log('SELL submitted — awaiting settlement confirmation (retry next cycle)');
-      return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+      return { success: false, leg: 'exit', roundId: round.roundId,
         error: 'SELL submitted — awaiting settlement', executionTimeMs: Date.now() - startTime };
     } catch (error) {
+      if (error instanceof InventoryAdmissionRefusal) return this.inventoryBlocked({ success: false, leg: 'exit' as const, roundId: round!.roundId, error: error.message, executionTimeMs: Date.now() - startTime }, error);
       this.log(`❌ Leg1 exit error: ${error instanceof Error ? error.message : String(error)}`);
-      return { success: false, leg: 'exit', roundId: this.currentRound.roundId,
+      return { success: false, leg: 'exit', roundId: round.roundId,
         error: error instanceof Error ? error.message : String(error),
         executionTimeMs: Date.now() - startTime };
     }
@@ -1786,7 +2056,7 @@ export class DipArbService extends EventEmitter {
       result = await this.executeLeg2(signal);
     }
 
-    this.emit('execution', result);
+    if (!isInventoryRefusal(result)) this.emit('execution', result);
   }
 
   // ===== Public API: Auto-Rotate =====
@@ -1972,7 +2242,7 @@ export class DipArbService extends EventEmitter {
    * - 'redeem': 等待市场结算后 redeem（需要等待结算完成）
    * - 'sell': 直接卖出 token（更快但可能有滑点）
    */
-  async settle(strategy: 'redeem' | 'sell' = 'redeem'): Promise<DipArbSettleResult> {
+  async settle(strategy: 'redeem' | 'sell' = 'redeem'): Promise<DipArbSettleResult & DipArbInventoryDiagnostic> {
     const startTime = Date.now();
 
     if (!this.market || !this.currentRound) {
@@ -2248,7 +2518,7 @@ export class DipArbService extends EventEmitter {
         } else {
           // For sell strategy, execute immediately
           const settleResult = await this.settle('sell');
-          this.emit('settled', settleResult);
+          if (!isInventoryRefusal(settleResult)) this.emit('settled', settleResult);
         }
       }
 
@@ -2381,9 +2651,13 @@ export class DipArbService extends EventEmitter {
   }
 
   private async settleBySell(): Promise<DipArbSettleResult> {
+    const originMarket = this.market, round = this.currentRound, trading = this.tradingService, ctf = this.ctf;
+    const guard = this.inventoryAdmissionGuard, running = this.isRunning, invocation = Symbol();
+    const market = guard && originMarket ? { ...originMarket } : originMarket;
+    const wallet = guard ? this.clobWalletSnapshot(trading) : undefined;
     const startTime = Date.now();
 
-    if (!this.tradingService || !this.market || !this.currentRound) {
+    if (!trading || !market || !round) {
       return {
         success: false,
         strategy: 'sell',
@@ -2392,36 +2666,38 @@ export class DipArbService extends EventEmitter {
       };
     }
 
+    const leg1 = round.leg1 ? { ...round.leg1 } : undefined;
+    const leg2 = round.leg2 ? { ...round.leg2 } : undefined;
     try {
       let totalReceived = 0;
 
       // Sell leg1 position if exists
-      if (this.currentRound.leg1) {
-        const leg1Shares = this.currentRound.leg1.shares;
-        const result = await this.tradingService.createMarketOrder({
-          tokenId: this.currentRound.leg1.tokenId,
+      if (leg1) {
+        const leg1Shares = leg1.shares;
+        const result = await this.submitClob({ originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'SETTLE_SELL', {
+          tokenId: leg1.tokenId,
           side: 'SELL' as Side,
           amount: leg1Shares,
         });
 
         if (result.success) {
-          totalReceived += leg1Shares * (this.currentRound.leg1.side === 'UP'
+          totalReceived += leg1Shares * (leg1.side === 'UP'
             ? (this.upAsks[0]?.price ?? 0.5)
             : (this.downAsks[0]?.price ?? 0.5));
         }
       }
 
       // Sell leg2 position if exists
-      if (this.currentRound.leg2) {
-        const leg2Shares = this.currentRound.leg2.shares;
-        const result = await this.tradingService.createMarketOrder({
-          tokenId: this.currentRound.leg2.tokenId,
+      if (leg2) {
+        const leg2Shares = leg2.shares;
+        const result = await this.submitClob({ originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'SETTLE_SELL', {
+          tokenId: leg2.tokenId,
           side: 'SELL' as Side,
           amount: leg2Shares,
         });
 
         if (result.success) {
-          totalReceived += leg2Shares * (this.currentRound.leg2.side === 'UP'
+          totalReceived += leg2Shares * (leg2.side === 'UP'
             ? (this.upAsks[0]?.price ?? 0.5)
             : (this.downAsks[0]?.price ?? 0.5));
         }
@@ -2434,6 +2710,7 @@ export class DipArbService extends EventEmitter {
         executionTimeMs: Date.now() - startTime,
       };
     } catch (error) {
+      if (error instanceof InventoryAdmissionRefusal) return this.inventoryBlocked({ success: false, strategy: 'sell' as const, error: error.message, executionTimeMs: Date.now() - startTime }, error);
       return {
         success: false,
         strategy: 'sell',
