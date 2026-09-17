@@ -172,7 +172,24 @@ export interface SplitResult {
   gasUsed?: string;
 }
 
+export type MergeProvenance = Readonly<{
+  state: 'NOT_SUBMITTED' | 'SUBMITTED' | 'CONFIRMED' | 'UNCERTAIN';
+  transactionHash?: string;
+}>;
+
+export type MergeProvenanceObserver = (snapshot: MergeProvenance) => void;
+
+export class MergeProvenanceError extends Error {
+  readonly provenance: MergeProvenance;
+  constructor(cause: unknown, provenance: MergeProvenance) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = 'MergeProvenanceError';
+    this.provenance = Object.freeze({ ...provenance });
+  }
+}
+
 export interface MergeResult {
+  provenance?: MergeProvenance;
   success: boolean;
   txHash: string;
   amount: string;
@@ -310,7 +327,8 @@ export async function sendPusdApproveTx(
 export async function sendCtfOperatorApprovalTx(
   signer: Wallet,
   provider: ethers.providers.Provider,
-  operatorAddress: string
+  operatorAddress: string,
+  propagateFailure = false
 ): Promise<ApprovalTxResult> {
   const conditionalTokens = new Contract(CTF_CONTRACT, ERC1155_ABI, signer);
   const gasPrice = await provider.getGasPrice();
@@ -323,6 +341,7 @@ export async function sendCtfOperatorApprovalTx(
     await tx.wait();
     return { contract: operatorAddress, txHash: tx.hash, success: true };
   } catch (err) {
+    if (propagateFailure) throw err;
     return {
       contract: operatorAddress,
       success: false,
@@ -533,72 +552,110 @@ export class CTFClient {
   private async standardMergePositions(
     conditionId: string,
     amountWei: ethers.BigNumber,
-    adapter: { name: string; address: string }
+    adapter: { name: string; address: string },
+    onProvenance?: MergeProvenanceObserver
   ): Promise<MergeResult> {
-    // ERC1155 operator approval: the adapter pulls YES + NO from the EOA.
-    const conditionalTokens = new Contract(CTF_CONTRACT, ERC1155_ABI, this.provider);
-    const isOperator = await conditionalTokens.isApprovedForAll(this.wallet.address, adapter.address);
-    if (!isOperator) {
-      await sendCtfOperatorApprovalTx(this.wallet, this.provider, adapter.address);
-    }
-
-    const lifecycleAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
-    const tx = await lifecycleAdapter.mergePositions(
-      USDC_CONTRACT,
-      ethers.constants.HashZero,
-      conditionId,
-      [1, 2],
-      amountWei,
-      await this.getGasOptions()
-    );
-
-    const receipt = await tx.wait();
-
-    return {
-      success: true,
-      txHash: receipt.transactionHash,
-      amount: ethers.utils.formatUnits(amountWei, USDC_DECIMALS),
-      usdcReceived: ethers.utils.formatUnits(amountWei, USDC_DECIMALS),
-      gasUsed: receipt.gasUsed.toString(),
+    let attempted = false;
+    let submissionReturned = false;
+    let confirmed = false;
+    let transactionHash: string | undefined;
+    const notify = (state: MergeProvenance['state']): MergeProvenance => {
+      const snapshot = Object.freeze({ state, ...(transactionHash ? { transactionHash } : {}) });
+      try { onProvenance?.(snapshot); } catch { /* diagnostic only */ }
+      return snapshot;
     };
+    try {
+      const conditionalTokens = new Contract(CTF_CONTRACT, ERC1155_ABI, this.provider);
+      const isOperator = await conditionalTokens.isApprovedForAll(this.wallet.address, adapter.address);
+      if (!isOperator) {
+        const approval = await sendCtfOperatorApprovalTx(this.wallet, this.provider, adapter.address, true);
+        if (!approval.success) throw new Error(approval.error || 'Merge operator approval failed');
+      }
+      const lifecycleAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
+      const gasOptions = await this.getGasOptions();
+      // Exceptions beyond this boundary cannot generally exclude a broadcast.
+      attempted = true;
+      const tx = await lifecycleAdapter.mergePositions(
+        USDC_CONTRACT, ethers.constants.HashZero, conditionId, [1, 2], amountWei, gasOptions
+      );
+      submissionReturned = true;
+      if (typeof tx?.hash === 'string' && /^0x[0-9a-fA-F]{64}$/.test(tx.hash)) {
+        transactionHash = tx.hash;
+        notify('SUBMITTED');
+      }
+      const receipt = await tx.wait();
+      if (receipt?.status !== 1 || !transactionHash || typeof receipt.transactionHash !== 'string' ||
+          !/^0x[0-9a-fA-F]{64}$/.test(receipt.transactionHash) ||
+          receipt.transactionHash.toLowerCase() !== transactionHash.toLowerCase()) {
+        throw new Error('Merge receipt does not prove confirmation');
+      }
+      confirmed = true;
+      const provenance = notify('CONFIRMED');
+      return {
+        success: true, provenance,
+        txHash: receipt.transactionHash,
+        amount: ethers.utils.formatUnits(amountWei, USDC_DECIMALS),
+        usdcReceived: ethers.utils.formatUnits(amountWei, USDC_DECIMALS),
+        gasUsed: receipt.gasUsed.toString(),
+      };
+    } catch (cause) {
+      const state = confirmed ? 'CONFIRMED'
+        : !attempted || (!submissionReturned && cause instanceof WriteBlockedError)
+          ? 'NOT_SUBMITTED' : 'UNCERTAIN';
+      throw new MergeProvenanceError(cause, notify(state));
+    }
   }
 
-  async merge(conditionId: string, amount: string, routing?: LifecycleRouting): Promise<MergeResult> {
-    const adapter = this.resolveStandardMergeAdapter(routing);
-    const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
+  async merge(conditionId: string, amount: string, routing?: LifecycleRouting, onProvenance?: MergeProvenanceObserver): Promise<MergeResult> {
+    try {
+      const adapter = this.resolveStandardMergeAdapter(routing);
+      const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
-    const balances = await this.getPositionBalance(conditionId);
-    const yesBalance = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
-    const noBalance = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
+      const balances = await this.getPositionBalance(conditionId);
+      const yesBalance = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
+      const noBalance = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
 
-    if (yesBalance.lt(amountWei) || noBalance.lt(amountWei)) {
-      throw new Error(
-        `Insufficient token balance. Need ${amount} of each. Have: YES=${balances.yesBalance}, NO=${balances.noBalance}`
-      );
+      if (yesBalance.lt(amountWei) || noBalance.lt(amountWei)) {
+        throw new Error(
+          `Insufficient token balance. Need ${amount} of each. Have: YES=${balances.yesBalance}, NO=${balances.noBalance}`
+        );
+      }
+
+      return await this.standardMergePositions(conditionId, amountWei, adapter, onProvenance);
+    } catch (cause) {
+      if (cause instanceof MergeProvenanceError) throw cause;
+      const error = new MergeProvenanceError(cause, { state: 'NOT_SUBMITTED' });
+      try { onProvenance?.(error.provenance); } catch { /* diagnostic only */ }
+      throw error;
     }
-
-    return this.standardMergePositions(conditionId, amountWei, adapter);
   }
 
-  async mergeByTokenIds(conditionId: string, tokenIds: TokenIds, amount: string, routing?: LifecycleRouting): Promise<MergeResult> {
-    // V2.3C1b/C2c: both market types must merge through a V2 collateral
-    // adapter via mergeByTokenIds. Standard uses CtfCollateralAdapter; neg-risk
-    // uses NegRiskCtfCollateralAdapter. Unknown routing fails closed.
-    // Generic merge() for neg-risk remains blocked.
-    const adapter = resolveLifecycleAdapter(routing); // fails closed on non-boolean routing
-    const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
+  async mergeByTokenIds(conditionId: string, tokenIds: TokenIds, amount: string, routing?: LifecycleRouting, onProvenance?: MergeProvenanceObserver): Promise<MergeResult> {
+    try {
+      // V2.3C1b/C2c: both market types must merge through a V2 collateral
+      // adapter via mergeByTokenIds. Standard uses CtfCollateralAdapter; neg-risk
+      // uses NegRiskCtfCollateralAdapter. Unknown routing fails closed.
+      // Generic merge() for neg-risk remains blocked.
+      const adapter = resolveLifecycleAdapter(routing); // fails closed on non-boolean routing
+      const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
-    const balances = await this.getPositionBalanceByTokenIds(conditionId, tokenIds);
-    const yesBalance = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
-    const noBalance = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
+      const balances = await this.getPositionBalanceByTokenIds(conditionId, tokenIds);
+      const yesBalance = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
+      const noBalance = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
 
-    if (yesBalance.lt(amountWei) || noBalance.lt(amountWei)) {
-      throw new Error(
-        `Insufficient token balance. Need ${amount} of each. Have: YES=${balances.yesBalance}, NO=${balances.noBalance}`
-      );
+      if (yesBalance.lt(amountWei) || noBalance.lt(amountWei)) {
+        throw new Error(
+          `Insufficient token balance. Need ${amount} of each. Have: YES=${balances.yesBalance}, NO=${balances.noBalance}`
+        );
+      }
+
+      return await this.standardMergePositions(conditionId, amountWei, adapter, onProvenance);
+    } catch (cause) {
+      if (cause instanceof MergeProvenanceError) throw cause;
+      const error = new MergeProvenanceError(cause, { state: 'NOT_SUBMITTED' });
+      try { onProvenance?.(error.provenance); } catch { /* diagnostic only */ }
+      throw error;
     }
-
-    return this.standardMergePositions(conditionId, amountWei, adapter);
   }
 
   /**
