@@ -103,6 +103,84 @@ const invoke = (ctf: Awaited<ReturnType<typeof setup>>['ctf'], observer?: (p: an
   ctf.redeemByTokenIds(condition, ids, undefined, { negRisk: false }, observer);
 
 describe('CTF redeem factual provenance', () => {
+  it('preserves the normal economic value when result construction fails after confirmation', async () => {
+    const { ctf } = await setup('LIVE');
+    const { RedeemProvenanceError } = await import('../clients/ctf-client.js');
+    operatorApproved = true;
+    const normal = await invoke(ctf);
+    expect(normal.usdcReceived).toBe('12.5');
+    const normalReads = reads.length;
+    reads.length = 0;
+    ctfBalanceReadCount = 0;
+    const cause = new Error('receipt gas formatting failed');
+    send.mockResolvedValueOnce({ hash, wait: async () => ({
+      status: 1, transactionHash: hash, logs: [],
+      gasUsed: { toString() { throw cause; } },
+    }) });
+    const observer = vi.fn();
+    const error = await invoke(ctf, observer).catch(error => error);
+    expect(error).toBeInstanceOf(RedeemProvenanceError);
+    expect(error.provenance).toEqual({ state: 'CONFIRMED', transactionHash: hash });
+    expect(error.usdcReceived).toBe(normal.usdcReceived);
+    expect(error.cause).toBe(cause);
+    expect(error.message).toBe(cause.message);
+    expect(Object.isFrozen(error.provenance)).toBe(true);
+    expect(Reflect.set(error, 'usdcReceived', '999')).toBe(false);
+    expect(error.usdcReceived).toBe('12.5');
+    expect(observer.mock.calls.map(([p]) => p.state)).toEqual(['SUBMITTED', 'CONFIRMED', 'CONFIRMED']);
+    expect(reads).toHaveLength(normalReads);
+    expect(ctfBalanceReadCount).toBe(2);
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+  it('retains CONFIRMED without inventing an economic value when its formatting fails', async () => {
+    const { ctf } = await setup('LIVE');
+    const { RedeemProvenanceError } = await import('../clients/ctf-client.js');
+    operatorApproved = true;
+    const cause = new Error('winning balance formatting failed');
+    const original = BigNumber.prototype.toString;
+    let failFormatting = false;
+    vi.spyOn(BigNumber.prototype, 'toString').mockImplementation(function (this: BigNumber) {
+      if (failFormatting) { failFormatting = false; throw cause; }
+      return original.call(this);
+    });
+    const error = await invoke(ctf, p => {
+      if (p.state === 'CONFIRMED') failFormatting = true;
+    }).catch(error => error);
+    failFormatting = false;
+    expect(error).toBeInstanceOf(RedeemProvenanceError);
+    expect(error.provenance).toEqual({ state: 'CONFIRMED', transactionHash: hash });
+    expect(error.usdcReceived).toBeUndefined();
+    expect(error.cause).toBe(cause);
+    expect(error.message).toBe(cause.message);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+  it.each(['NOT_SUBMITTED', 'SUBMITTED', 'UNCERTAIN'] as const)(
+    '%s has no artificial economic fact and the legacy error constructor remains valid', async state => {
+      const { ctf } = await setup('LIVE');
+      const { RedeemProvenanceError } = await import('../clients/ctf-client.js');
+      const cause = new Error('transport failure');
+      const legacy = new RedeemProvenanceError(cause, { state, transactionHash: hash });
+      expect(legacy.usdcReceived).toBeUndefined();
+      expect(legacy.cause).toBe(cause);
+      expect(legacy.message).toBe(cause.message);
+      operatorApproved = true;
+      if (state === 'NOT_SUBMITTED') {
+        vi.mocked(providers.BaseProvider.prototype.call).mockRejectedValueOnce(cause);
+      } else {
+        send.mockResolvedValueOnce({ hash, wait: async () => { throw cause; } });
+      }
+      const observer = vi.fn();
+      const error = await invoke(ctf, observer).catch(error => error);
+      expect(error).toBeInstanceOf(RedeemProvenanceError);
+      expect(error.usdcReceived).toBeUndefined();
+      expect(error.cause).toBe(cause);
+      expect(error.provenance.state).toBe(state === 'NOT_SUBMITTED' ? state : 'UNCERTAIN');
+      if (state === 'SUBMITTED') {
+        expect(observer).toHaveBeenCalledWith({ state: 'SUBMITTED', transactionHash: hash });
+      }
+      for (const [snapshot] of observer.mock.calls) expect(snapshot.usdcReceived).toBeUndefined();
+    },
+  );
   it('local validation before submission is NOT_SUBMITTED', async () => {
     const { ctf } = await setup('LIVE');
     await expect(ctf.redeemByTokenIds(condition, ids)).rejects.toMatchObject({

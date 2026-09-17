@@ -210,10 +210,14 @@ export type RedeemProvenance = Readonly<{
 /** Classification concerns the redeem transaction only, never its approval. */
 export class RedeemProvenanceError extends Error {
   readonly provenance: RedeemProvenance;
-  constructor(cause: unknown, provenance: RedeemProvenance) {
+  readonly usdcReceived?: RedeemResult['usdcReceived'];
+  constructor(cause: unknown, provenance: RedeemProvenance, usdcReceived?: RedeemResult['usdcReceived']) {
     super(cause instanceof Error ? cause.message : String(cause), { cause });
     this.name = 'RedeemProvenanceError';
     this.provenance = Object.freeze({ ...provenance });
+    Object.defineProperty(this, 'usdcReceived', {
+      value: usdcReceived, enumerable: true, writable: false, configurable: false,
+    });
   }
 }
 
@@ -690,6 +694,7 @@ export class CTFClient {
     let confirmed = false;
     let submissionReturned = false;
     let transactionHash: string | undefined;
+    let usdcReceived: RedeemResult['usdcReceived'] | undefined;
     const notify = (state: RedeemProvenance['state']): RedeemProvenance => {
       const snapshot = Object.freeze({ state, ...(transactionHash ? { transactionHash } : {}) });
       try { onProvenance?.(snapshot); } catch { /* diagnostic only */ }
@@ -734,6 +739,7 @@ export class CTFClient {
       // 1:1 payout for the winning side; pUSD is the user-facing output asset.
       const winningBalanceWei = winningOutcome === 'YES' ? yesBalanceWei : noBalanceWei;
       const winningBalance = ethers.utils.formatUnits(winningBalanceWei, USDC_DECIMALS);
+      usdcReceived = winningBalance;
 
       return {
         success: true,
@@ -741,7 +747,7 @@ export class CTFClient {
         txHash: receipt.transactionHash,
         outcome: winningOutcome,
         tokensRedeemed: winningBalance,
-        usdcReceived: winningBalance,
+        usdcReceived,
         yesTokensConsumed: ethers.utils.formatUnits(yesBalanceWei, USDC_DECIMALS),
         noTokensConsumed: ethers.utils.formatUnits(noBalanceWei, USDC_DECIMALS),
         gasUsed: receipt.gasUsed.toString(),
@@ -752,7 +758,7 @@ export class CTFClient {
       const state = confirmed ? 'CONFIRMED'
         : !attempted || (!submissionReturned && cause instanceof WriteBlockedError)
           ? 'NOT_SUBMITTED' : 'UNCERTAIN';
-      throw new RedeemProvenanceError(cause, notify(state));
+      throw new RedeemProvenanceError(cause, notify(state), usdcReceived);
     }
   }
 
