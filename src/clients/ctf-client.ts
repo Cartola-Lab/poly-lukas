@@ -32,6 +32,7 @@ import { ethers, Contract, Wallet, BigNumber } from 'ethers';
 import { getContractConfig, COLLATERAL_TOKEN_DECIMALS } from '@polymarket/clob-client-v2';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
 import { protectWallet } from '../core/write-barrier.js';
+import { WriteBlockedError } from '../core/execution-mode.js';
 
 // ===== Contract Addresses (Polygon Mainnet) =====
 
@@ -184,7 +185,26 @@ export interface MergeResult {
   gasUsed?: string;
 }
 
+export type RedeemProvenance = Readonly<{
+  state: 'NOT_SUBMITTED' | 'SUBMITTED' | 'CONFIRMED' | 'UNCERTAIN';
+  transactionHash?: string;
+}>;
+
+/** Classification concerns the redeem transaction only, never its approval. */
+export class RedeemProvenanceError extends Error {
+  readonly provenance: RedeemProvenance;
+  constructor(cause: unknown, provenance: RedeemProvenance) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = 'RedeemProvenanceError';
+    this.provenance = Object.freeze({ ...provenance });
+  }
+}
+
+/** Synchronous diagnostic observer; observer failures cannot interrupt redemption. */
+export type RedeemProvenanceObserver = (snapshot: RedeemProvenance) => void;
+
 export interface RedeemResult {
+  provenance?: RedeemProvenance;
   success: boolean;
   txHash: string;
   /** Winning outcome (e.g., 'YES', 'NO', 'Up', 'Down', 'Team1', 'Team2') */
@@ -606,40 +626,77 @@ export class CTFClient {
     yesBalanceWei: ethers.BigNumber,
     noBalanceWei: ethers.BigNumber,
     winningOutcome: string,
-    adapter: { name: string; address: string }
+    adapter: { name: string; address: string },
+    onProvenance?: RedeemProvenanceObserver
   ): Promise<RedeemResult> {
-    // ERC1155 operator approval: the adapter pulls YES + NO from the EOA.
-    const conditionalTokens = new Contract(CTF_CONTRACT, ERC1155_ABI, this.provider);
-    const isOperator = await conditionalTokens.isApprovedForAll(this.wallet.address, adapter.address);
-    if (!isOperator) {
-      await sendCtfOperatorApprovalTx(this.wallet, this.provider, adapter.address);
-    }
-
-    const lifecycleAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
-    const tx = await lifecycleAdapter.redeemPositions(
-      USDC_CONTRACT,
-      ethers.constants.HashZero,
-      conditionId,
-      [1, 2],
-      await this.getGasOptions()
-    );
-
-    const receipt = await tx.wait();
-
-    // 1:1 payout for the winning side; pUSD is the user-facing output asset.
-    const winningBalanceWei = winningOutcome === 'YES' ? yesBalanceWei : noBalanceWei;
-    const winningBalance = ethers.utils.formatUnits(winningBalanceWei, USDC_DECIMALS);
-
-    return {
-      success: true,
-      txHash: receipt.transactionHash,
-      outcome: winningOutcome,
-      tokensRedeemed: winningBalance,
-      usdcReceived: winningBalance,
-      yesTokensConsumed: ethers.utils.formatUnits(yesBalanceWei, USDC_DECIMALS),
-      noTokensConsumed: ethers.utils.formatUnits(noBalanceWei, USDC_DECIMALS),
-      gasUsed: receipt.gasUsed.toString(),
+    let attempted = false;
+    let confirmed = false;
+    let submissionReturned = false;
+    let transactionHash: string | undefined;
+    const notify = (state: RedeemProvenance['state']): RedeemProvenance => {
+      const snapshot = Object.freeze({ state, ...(transactionHash ? { transactionHash } : {}) });
+      try { onProvenance?.(snapshot); } catch { /* diagnostic only */ }
+      return snapshot;
     };
+    try {
+      // ERC1155 operator approval: the adapter pulls YES + NO from the EOA.
+      const conditionalTokens = new Contract(CTF_CONTRACT, ERC1155_ABI, this.provider);
+      const isOperator = await conditionalTokens.isApprovedForAll(this.wallet.address, adapter.address);
+      if (!isOperator) {
+        const approval = await sendCtfOperatorApprovalTx(this.wallet, this.provider, adapter.address);
+        if (!approval.success) throw new Error(approval.error || 'Redeem operator approval failed');
+      }
+
+      const lifecycleAdapter = new Contract(adapter.address, STANDARD_CTF_ADAPTER_ABI, this.wallet);
+      const gasOptions = await this.getGasOptions();
+      // From this boundary onwards, arbitrary exceptions cannot exclude broadcast.
+      attempted = true;
+      const tx = await lifecycleAdapter.redeemPositions(
+        USDC_CONTRACT,
+        ethers.constants.HashZero,
+        conditionId,
+        [1, 2],
+        gasOptions
+      );
+
+      submissionReturned = true;
+      if (typeof tx?.hash === 'string' && /^0x[0-9a-fA-F]{64}$/.test(tx.hash)) {
+        transactionHash = tx.hash;
+        notify('SUBMITTED');
+      }
+      const receipt = await tx.wait();
+      if (receipt?.status !== 1 || typeof receipt.transactionHash !== 'string' ||
+          !/^0x[0-9a-fA-F]{64}$/.test(receipt.transactionHash) ||
+          (transactionHash && receipt.transactionHash.toLowerCase() !== transactionHash.toLowerCase())) {
+        throw new Error('Redeem receipt does not prove confirmation');
+      }
+      transactionHash = receipt.transactionHash;
+      confirmed = true;
+      const provenance = notify('CONFIRMED');
+
+      // 1:1 payout for the winning side; pUSD is the user-facing output asset.
+      const winningBalanceWei = winningOutcome === 'YES' ? yesBalanceWei : noBalanceWei;
+      const winningBalance = ethers.utils.formatUnits(winningBalanceWei, USDC_DECIMALS);
+
+      return {
+        success: true,
+        provenance,
+        txHash: receipt.transactionHash,
+        outcome: winningOutcome,
+        tokensRedeemed: winningBalance,
+        usdcReceived: winningBalance,
+        yesTokensConsumed: ethers.utils.formatUnits(yesBalanceWei, USDC_DECIMALS),
+        noTokensConsumed: ethers.utils.formatUnits(noBalanceWei, USDC_DECIMALS),
+        gasUsed: receipt.gasUsed.toString(),
+      };
+    } catch (cause) {
+      // This internal typed barrier proves no redeem send occurred. Never infer
+      // non-submission from arbitrary RPC messages or textual error codes.
+      const state = confirmed ? 'CONFIRMED'
+        : !attempted || (!submissionReturned && cause instanceof WriteBlockedError)
+          ? 'NOT_SUBMITTED' : 'UNCERTAIN';
+      throw new RedeemProvenanceError(cause, notify(state));
+    }
   }
 
   async redeem(conditionId: string, outcome?: string, routing?: LifecycleRouting): Promise<RedeemResult> {
@@ -673,36 +730,44 @@ export class CTFClient {
     conditionId: string,
     tokenIds: TokenIds,
     outcome?: string,
-    routing?: LifecycleRouting
+    routing?: LifecycleRouting,
+    onProvenance?: RedeemProvenanceObserver
   ): Promise<RedeemResult> {
-    // V2.3C1c/C2d: both market types must redeem through a V2 collateral
-    // adapter via redeemByTokenIds. Standard uses CtfCollateralAdapter; neg-risk
-    // uses NegRiskCtfCollateralAdapter. Unknown routing fails closed.
-    // Generic redeem() for neg-risk remains blocked.
-    const adapter = resolveLifecycleAdapter(routing); // fails closed on non-boolean routing
-    const resolution = await this.getMarketResolution(conditionId);
-    if (!resolution.isResolved) {
-      throw new Error('Market is not resolved yet');
-    }
+    try {
+      // V2.3C1c/C2d: both market types must redeem through a V2 collateral
+      // adapter via redeemByTokenIds. Standard uses CtfCollateralAdapter; neg-risk
+      // uses NegRiskCtfCollateralAdapter. Unknown routing fails closed.
+      // Generic redeem() for neg-risk remains blocked.
+      const adapter = resolveLifecycleAdapter(routing); // fails closed on non-boolean routing
+      const resolution = await this.getMarketResolution(conditionId);
+      if (!resolution.isResolved) {
+        throw new Error('Market is not resolved yet');
+      }
 
-    const winningOutcome = outcome || resolution.winningOutcome;
-    if (!winningOutcome) {
-      throw new Error('Could not determine winning outcome');
-    }
-    if (outcome && resolution.winningOutcome && outcome !== resolution.winningOutcome) {
-      throw new Error(`Outcome mismatch: requested ${outcome}, but market resolved to ${resolution.winningOutcome}`);
-    }
+      const winningOutcome = outcome || resolution.winningOutcome;
+      if (!winningOutcome) {
+        throw new Error('Could not determine winning outcome');
+      }
+      if (outcome && resolution.winningOutcome && outcome !== resolution.winningOutcome) {
+        throw new Error(`Outcome mismatch: requested ${outcome}, but market resolved to ${resolution.winningOutcome}`);
+      }
 
-    const balances = await this.getPositionBalanceByTokenIds(conditionId, tokenIds);
-    const yesBalanceWei = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
-    const noBalanceWei = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
+      const balances = await this.getPositionBalanceByTokenIds(conditionId, tokenIds);
+      const yesBalanceWei = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
+      const noBalanceWei = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
 
-    const winningBalance = winningOutcome === 'YES' ? balances.yesBalance : balances.noBalance;
-    if (parseFloat(winningBalance) === 0) {
-      throw new Error(`No ${winningOutcome} tokens to redeem`);
+      const winningBalance = winningOutcome === 'YES' ? balances.yesBalance : balances.noBalance;
+      if (parseFloat(winningBalance) === 0) {
+        throw new Error(`No ${winningOutcome} tokens to redeem`);
+      }
+
+      return await this.standardRedeemPositions(conditionId, yesBalanceWei, noBalanceWei, winningOutcome, adapter, onProvenance);
+    } catch (cause) {
+      if (cause instanceof RedeemProvenanceError) throw cause;
+      const error = new RedeemProvenanceError(cause, { state: 'NOT_SUBMITTED' });
+      try { onProvenance?.(error.provenance); } catch { /* diagnostic only */ }
+      throw error;
     }
-
-    return this.standardRedeemPositions(conditionId, yesBalanceWei, noBalanceWei, winningOutcome, adapter);
   }
 
   async getPositionBalance(conditionId: string): Promise<PositionBalance> {
