@@ -108,6 +108,87 @@ const hash = '0x' + '22'.repeat(32);
 const invoke = (ctf: Awaited<ReturnType<typeof setup>>['ctf'], observer?: (p: any) => void) =>
   ctf.redeemByTokenIds(condition, ids, undefined, { negRisk: false }, observer);
 
+describe('CTF read-only redeem payout lookup', () => {
+  const historicalWallet = '0x' + 'ab'.repeat(20);
+  const mint = (amount = '12.5', index = 0) => mintLog(amount, index, historicalWallet);
+  const receipt = (logs = [mint()]) => ({ status: 1, transactionHash: hash, logs });
+  afterEach(() => {
+    expect(send).not.toHaveBeenCalled();
+    expect(reads).toEqual([]);
+    expect(providers.BaseProvider.prototype.call).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['historical wallet', [mint()], '12.5'],
+    ['zero', [mint('0')], '0.0'],
+    ['exact sum', [mint('9007199254740993.123456'), mint('0.000001', 1)], '9007199254740993.123457'],
+    ['identical duplicate', [mint(), mint()], '12.5'],
+  ] as const)('reads %s without writes or balance reads', async (_label, logs, amount) => {
+    const { ctf } = await setup('HALT');
+    const lookup = vi.spyOn(providers.BaseProvider.prototype, 'getTransactionReceipt')
+      .mockResolvedValue({ ...receipt(), logs } as any);
+    expect(await ctf.getRedeemPayout(hash, historicalWallet)).toEqual({
+      state: 'PAYOUT_KNOWN', transactionHash: hash, pusdReceived: amount });
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(lookup).toHaveBeenCalledWith(hash);
+  });
+
+  it.each([
+    ['null', null], ['bad status', { ...receipt(), status: 0 }],
+    ['missing status', { ...receipt(), status: undefined }],
+    ['wrong hash', { ...receipt(), transactionHash: '0x' + '33'.repeat(32) }],
+    ['missing hash', { ...receipt(), transactionHash: undefined }],
+    ['no mint', receipt([])], ['other wallet', receipt([mintLog()])],
+    ['other token', receipt([{ ...mint(), address: legacyCtf }])],
+    ['conflict', receipt([mint(), mint('1')])],
+    ['recipient conflict', receipt([mint(), mintLog()])],
+    ['recipient conflict reversed', receipt([mintLog(), mint()])],
+    ['invalid index', receipt([{ ...mint(), logIndex: -1 }])],
+    ['invalid data', receipt([{ ...mint(), data: '0x01' }])],
+    ['log tx mismatch', receipt([{ ...mint(), transactionHash: '0x' + '44'.repeat(32) } as any])],
+  ])('keeps %s unknown', async (_label, value) => {
+    const { ctf } = await setup('LIVE');
+    vi.spyOn(providers.BaseProvider.prototype, 'getTransactionReceipt').mockResolvedValue(value as any);
+    const result = await ctf.getRedeemPayout(hash, historicalWallet);
+    expect(result).toMatchObject({ state: 'PAYOUT_UNKNOWN', transactionHash: hash, pusdReceived: undefined });
+    expect('cause' in result && result.cause).toBeInstanceOf(Error);
+  });
+
+  it('accepts canonical-equivalent wallet and transaction casing', async () => {
+    const { ctf } = await setup('LIVE');
+    const mixedHash = '0x' + 'ab'.repeat(32);
+    vi.spyOn(providers.BaseProvider.prototype, 'getTransactionReceipt').mockResolvedValue({
+      ...receipt(), transactionHash: '0x' + 'AB'.repeat(32) } as any);
+    expect(await ctf.getRedeemPayout(mixedHash, '0x' + 'AB'.repeat(20))).toMatchObject({
+      state: 'PAYOUT_KNOWN', pusdReceived: '12.5' });
+  });
+
+  it.each(['rpc', 'null'])('can resolve after %s and repeat without side effects', async failure => {
+    const { ctf } = await setup('LIVE');
+    const cause = new Error('RPC unavailable');
+    const lookup = vi.spyOn(providers.BaseProvider.prototype, 'getTransactionReceipt').mockResolvedValue(receipt() as any);
+    if (failure === 'rpc') lookup.mockRejectedValueOnce(cause);
+    else lookup.mockResolvedValueOnce(null as any);
+    const first = await ctf.getRedeemPayout(hash, historicalWallet);
+    expect(first).toMatchObject({ state: 'PAYOUT_UNKNOWN', pusdReceived: undefined });
+    if (failure === 'rpc') expect('cause' in first && first.cause).toBe(cause);
+    for (let i = 0; i < 2; i++) {
+      expect(await ctf.getRedeemPayout(hash, historicalWallet)).toEqual({
+        state: 'PAYOUT_KNOWN', transactionHash: hash, pusdReceived: '12.5' });
+    }
+    expect(lookup).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([['', historicalWallet], ['0x12', historicalWallet], [hash, ''], [hash, '0x12']])(
+    'rejects invalid input %s / %s before RPC', async (txHash, wallet) => {
+      const { ctf } = await setup('LIVE');
+      const lookup = vi.spyOn(providers.BaseProvider.prototype, 'getTransactionReceipt');
+      expect(await ctf.getRedeemPayout(txHash, wallet)).toMatchObject({
+        state: 'PAYOUT_UNKNOWN', pusdReceived: undefined });
+      expect(lookup).not.toHaveBeenCalled();
+    });
+});
+
 describe('CTF redeem factual provenance', () => {
   const conflicts = [
     ['recipient', mintLog('12.5', 0, standardAdapter)],

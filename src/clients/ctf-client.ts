@@ -116,6 +116,10 @@ const PUSD_TRANSFER = new ethers.utils.Interface([
 ]);
 
 /** Receipt-scoped credit only; absence or ambiguity is never a zero payout. */
+export type RedeemPayoutLookup =
+  | { state: 'PAYOUT_KNOWN'; transactionHash: string; pusdReceived: string }
+  | { state: 'PAYOUT_UNKNOWN'; transactionHash: string; pusdReceived: undefined; cause: unknown };
+
 function redeemPusdReceived(receipt: ethers.providers.TransactionReceipt, wallet: string): string {
   if (!Array.isArray(receipt.logs)) throw new Error('Redeem receipt logs unavailable');
   const topic = PUSD_TRANSFER.getEventTopic('Transfer').toLowerCase();
@@ -456,6 +460,31 @@ export class CTFClient {
 
   getAddress(): string {
     return this.wallet.address;
+  }
+
+  /** Read historical payout evidence only; never changes submission provenance. */
+  async getRedeemPayout(transactionHash: string, expectedWallet: string): Promise<RedeemPayoutLookup> {
+    try {
+      if (typeof transactionHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(transactionHash)) {
+        throw new Error('Invalid redeem transaction hash');
+      }
+      if (typeof expectedWallet !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(expectedWallet)) {
+        throw new Error('Invalid expected redeem wallet');
+      }
+      const wallet = ethers.utils.getAddress(expectedWallet.toLowerCase());
+      const receipt = await this.provider.getTransactionReceipt(transactionHash);
+      if (!receipt) throw new Error('Redeem receipt unavailable');
+      if (receipt.status !== 1) throw new Error('Redeem receipt lacks successful status');
+      if (typeof receipt.transactionHash !== 'string' ||
+          !/^0x[0-9a-fA-F]{64}$/.test(receipt.transactionHash) ||
+          receipt.transactionHash.toLowerCase() !== transactionHash.toLowerCase()) {
+        throw new Error('Redeem receipt transaction mismatch');
+      }
+      return { state: 'PAYOUT_KNOWN', transactionHash,
+        pusdReceived: redeemPusdReceived(receipt, wallet) };
+    } catch (cause) {
+      return { state: 'PAYOUT_UNKNOWN', transactionHash, pusdReceived: undefined, cause };
+    }
   }
 
   /** CLOB V2 collateral only; legacy CTF lifecycle retains USDC.e. */
