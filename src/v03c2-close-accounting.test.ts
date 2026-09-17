@@ -1,3 +1,4 @@
+import { ethers } from 'ethers';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
@@ -5,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 const source = readFileSync(new URL('../bot-with-dashboard.ts', import.meta.url), 'utf8');
 const ast = ts.createSourceFile('bot-with-dashboard.ts', source, ts.ScriptTarget.ES2022, true);
-const names = new Set(['DirectEntry', 'directEntries', 'CloseSettlement', 'PendingClose', 'pendingCloses',
+const names = new Set(['pendingBuys', 'activeInventoryWriters', 'nextInventoryWriterId', 'inventoryWallet', 'dashboardInventoryConflict', 'beginInventoryWriter', 'submitInventoryOrder', 'DirectEntry', 'directEntries', 'CloseSettlement', 'PendingClose', 'pendingCloses',
   'consumeTerminalCloses', 'executeClosePosition', 'recordRealized', 'recordTradeForHistory', 'sessionTrades']);
 const selected = ast.statements.filter(s => ts.isVariableStatement(s)
   ? s.declarationList.declarations.some(d => ts.isIdentifier(d.name) && names.has(d.name.text))
@@ -25,7 +26,7 @@ function fixture() {
     const recordCalls = [];
     recordRealized = (...args) => { recordCalls.push(args); return originalRecord(...args); };
     ({ directEntries, pendingCloses, consumeTerminalCloses, executeClosePosition, sessionTrades, recordCalls });`,
-  { state, updateDashboard, log }) as {
+  { state, updateDashboard, log, ethers, arbService: { getShortInventoryProtection: () => undefined }, activeSdk: null }) as {
     directEntries: Map<string, Entry>; pendingCloses: Map<string, Pending>;
     consumeTerminalCloses: () => void; executeClosePosition: (sdk: unknown, token: string, size: number) => Promise<boolean>;
     sessionTrades: Array<{ size: number; price: number; profit: number; strategy: string }>;
@@ -103,7 +104,7 @@ describe('P0.3c-2 terminal close accounting', () => {
   });
   it('submission snapshots basis and stays pending; requested size and snapshot exit price are ignored later', async () => {
     const h = fixture(); h.pendingCloses.clear();
-    const sdk = { tradingService: { createMarketOrder: vi.fn().mockResolvedValue({ success: true, orderId: 'order' }) } };
+    const sdk = { tradingService: { getAddress: () => '0x' + '11'.repeat(20), createMarketOrder: vi.fn().mockResolvedValue({ success: true, orderId: 'order' }) } };
     expect(await h.executeClosePosition(sdk, 'token', 100)).toBe(true);
     h.consume(); unchanged(h);
     const pending = h.pendingCloses.get('order')!;

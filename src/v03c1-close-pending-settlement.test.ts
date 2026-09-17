@@ -1,3 +1,4 @@
+import { ethers } from 'ethers';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
@@ -7,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 // installing process handlers, or contacting any trading service.
 const source = readFileSync(new URL('../bot-with-dashboard.ts', import.meta.url), 'utf8');
 const ast = ts.createSourceFile('bot-with-dashboard.ts', source, ts.ScriptTarget.ES2022, true);
-const names = new Set(['DirectEntry', 'directEntries', 'CloseSettlement', 'PendingClose',
+const names = new Set(['pendingBuys', 'activeInventoryWriters', 'nextInventoryWriterId', 'inventoryWallet', 'dashboardInventoryConflict', 'beginInventoryWriter', 'submitInventoryOrder', 'DirectEntry', 'directEntries', 'CloseSettlement', 'PendingClose',
   'pendingCloses', 'closeFlushPromise', 'parseCloseShares', 'flushPendingCloses', 'executeClosePosition']);
 const selected = ast.statements.filter(statement => {
   if (ts.isVariableStatement(statement)) {
@@ -24,6 +25,7 @@ type Settlement = { state: string; successShares?: number; weightedPrice?: numbe
 type RecordState = { tokenId: string; entryPrice: number | null; settlement: Settlement };
 function fixture() {
   const tradingService = {
+    getAddress: () => '0x' + '11'.repeat(20),
     createMarketOrder: vi.fn().mockResolvedValue({ success: true, orderId: 'order' }),
     getOrderFillDetails: vi.fn().mockResolvedValue({ tradeIds: ['a'], sizeMatched: '4.25' }),
     getTradeStatuses: vi.fn().mockResolvedValue([trade()]),
@@ -31,6 +33,7 @@ function fixture() {
   const sdk = { tradingService };
   const log = vi.fn();
   const api = runInNewContext(compiled + '\n({ pendingCloses, parseCloseShares, flushPendingCloses, executeClosePosition })', {
+    ethers, arbService: { getShortInventoryProtection: () => undefined }, activeSdk: null,
     state: { positions: [{ asset: 'token', avgPrice: 0.3 }] }, log,
   }) as {
     pendingCloses: Map<string, RecordState>;
@@ -122,7 +125,7 @@ describe('P0.3c-1 close pending settlement infrastructure', () => {
     const a = h.flush(); const b = h.flush(); expect(a).toBe(b);
     await vi.waitFor(() => expect(h.tradingService.getTradeStatuses).toHaveBeenCalledTimes(1));
     h.tradingService.createMarketOrder.mockResolvedValue({ success: true, orderId: 'second' });
-    await h.submit();
+    await h.executeClosePosition(h.sdk, 'other-token', 10);
     resolve([trade('MINED', '4.25', '0.4', 'hash')]); await Promise.all([a, b]);
     expect(h.pendingCloses.get('second')!.settlement.state).toBe('PENDING');
     h.tradingService.getTradeStatuses.mockResolvedValue([trade('FAILED')]);

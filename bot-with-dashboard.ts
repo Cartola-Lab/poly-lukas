@@ -21,7 +21,7 @@ import {
   type DipArbRoundResult,
   OnchainService,
 } from './src/index.js';
-import { CTFClient } from './src/clients/ctf-client.js';
+import { CTFClient, RedeemProvenanceError, type RedeemProvenance } from './src/clients/ctf-client.js';
 import { startDashboard, dashboardEmitter } from './src/dashboard/index.js';
 import type { BotState, BotConfig, LogLevel, DipArbSignal, SmartMoneySignal } from './src/dashboard/types.js';
 import { loadHistory, saveHistory, createSessionFromState, type TradeRecord, type SessionSummary } from './src/dashboard/session-history.js';
@@ -504,7 +504,7 @@ let isSmartMoneyInitializing = false;
 let onchainService: OnchainService | null = null;
 let copySubscription: AutoCopyTradingSubscription | null = null;
 let activeSdk: PolymarketSDK | null = null;
-type DirectEntry = { price: number; size: number; time: number };
+type DirectEntry = { walletAddress?: string; price: number; size: number; time: number };
 const directEntries = new Map<string, DirectEntry>();
 
 // Session history: per-trade records feed createSessionFromState; the
@@ -681,6 +681,7 @@ type CloseSettlement =
   | { state: 'TERMINAL_FAILED'; orderId: string; successShares: number; weightedPrice: null; todosFailed: true }
   | { state: 'TERMINAL_SUCCESS'; orderId: string; successShares: number; weightedPrice: number; todosFailed: false };
 type PendingClose = {
+  walletAddress?: string;
   tokenId: string;
   entryPrice: number | null;
   directEntry?: DirectEntry;
@@ -698,6 +699,7 @@ type BuySettlement =
   | { state: 'TERMINAL_FAILED'; orderId: string; successShares: number; weightedPrice: null; todosFailed: true }
   | { state: 'TERMINAL_SUCCESS'; orderId: string; successShares: number; weightedPrice: number; todosFailed: false };
 type PendingBuy = {
+  walletAddress?: string;
   orderId: string;
   tokenId: string;
   submittedAt: number;
@@ -911,7 +913,8 @@ function consumeTerminalBuys(): void {
       }
       // Claim before non-idempotent writes.
       pending.accountingFinalized = true;
-      directEntries.set(pending.tokenId, { price, size: q, time: pending.submittedAt });
+      directEntries.set(pending.tokenId, { price, size: q, time: pending.submittedAt,
+        ...(pending.walletAddress ? { walletAddress: pending.walletAddress } : {}) });
       recordEntry('direct');
       updateDashboard();
       log('TRADE', `Buy settled: ${q} shares of ${pending.tokenId.slice(0, 10)}... @ $${price.toFixed(4)}`);
@@ -921,29 +924,165 @@ function consumeTerminalBuys(): void {
   }
 }
 
-// true means submission accepted, never proof of an economically closed position.
-async function executeClosePosition(sdk: PolymarketSDK, tokenId: string, size: number): Promise<boolean> {
+type InventoryWriter = {
+  localOperationId: number;
+  wallet: string;
+  tokenIds: readonly string[];
+  writerType: 'CLOSE' | 'DIRECT_BUY' | 'REDEEM';
+  state: 'ACTIVE' | 'SUBMITTED' | 'UNCERTAIN';
+  transactionHash?: string;
+};
+type InventoryRefusal = { status: 'BLOCKED_INVENTORY'; reason: string };
+const activeInventoryWriters = new Map<number, InventoryWriter>();
+let nextInventoryWriterId = 0;
+
+function inventoryWallet(address: string): string {
+  if (!ethers.utils.isAddress(address)) throw new Error('Invalid inventory wallet identity');
+  return ethers.utils.getAddress(address).toLowerCase();
+}
+
+function dashboardInventoryConflict(query: { walletAddress: string; tokenIds: readonly string[] }, includeEntry = true): string | undefined {
+  const wallet = inventoryWallet(query.walletAddress);
+  for (const writer of activeInventoryWriters.values()) {
+    if (writer.wallet === wallet && writer.tokenIds.some(token => query.tokenIds.includes(token))) return 'EXTERNAL_WRITER_ACTIVE';
+  }
+  // Legacy entries in this process belong to its factual SDK signer, not to
+  // the aggregated portfolio snapshot. New records capture the signer explicitly.
+  const matches = (address?: string) => inventoryWallet(address ?? activeSdk?.tradingService.getAddress() ?? '') === wallet;
+  for (const pending of [...pendingBuys.values(), ...pendingCloses.values()]) {
+    if (!pending.accountingFinalized && query.tokenIds.includes(pending.tokenId) && matches(pending.walletAddress)) return 'EXTERNAL_SETTLEMENT_PENDING';
+  }
+  if (includeEntry) for (const token of query.tokenIds) {
+    const entry = directEntries.get(token);
+    if (entry && entry.size > 0 && matches(entry.walletAddress)) return 'DIRECT_POSITION_OPEN';
+  }
+}
+
+function beginInventoryWriter(sdk: PolymarketSDK, tokenIds: string[], writerType: InventoryWriter['writerType']): InventoryWriter | InventoryRefusal {
   try {
-    const directEntry = directEntries.get(tokenId);
-    const position = state.positions.find(p => p.asset === tokenId);
-    const candidatePrice = directEntry?.price ?? Number(position?.avgPrice);
-    const entryPrice = Number.isFinite(candidatePrice) && candidatePrice > 0 ? candidatePrice : null;
-    const res = await sdk.tradingService.createMarketOrder({ tokenId, side: 'SELL', amount: size });
-    if (res.success) {
-      const orderId = typeof res.orderId === 'string' ? res.orderId.trim() : '';
-      if (!orderId) {
-        log('WARN', `Close submission accepted without usable orderId for ${tokenId}; accounting withheld`);
-      } else if (!pendingCloses.has(orderId)) {
-        pendingCloses.set(orderId, { tokenId, entryPrice, directEntry, settlement: { state: 'PENDING' } });
-      }
-      log('TRADE', `Close order submitted: ${size} shares of ${tokenId.slice(0, 10)}...; settlement not yet accounted`);
+    const wallet = inventoryWallet(sdk.tradingService.getAddress());
+    if (!arbService) throw new Error('Inventory protection service unavailable');
+    if (!tokenIds.length || tokenIds.some(token => typeof token !== 'string' || !token.trim())) throw new Error('Invalid inventory token identity');
+    const block = arbService.getShortInventoryProtection({ walletAddress: wallet, tokenIds });
+    const reason = block ? `${block.reason}: ${block.operationId}`
+      : dashboardInventoryConflict({ walletAddress: wallet, tokenIds }, writerType === 'DIRECT_BUY');
+    if (reason) return { status: 'BLOCKED_INVENTORY', reason };
+    const writer: InventoryWriter = { localOperationId: ++nextInventoryWriterId, wallet,
+      tokenIds: Object.freeze([...tokenIds]), writerType, state: 'ACTIVE' };
+    activeInventoryWriters.set(writer.localOperationId, writer);
+    return writer;
+  } catch (error) {
+    return { status: 'BLOCKED_INVENTORY', reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// The registration callback must install pending ownership synchronously before
+// active ownership is released. Unknown outcomes never release ownership.
+async function submitInventoryOrder(sdk: PolymarketSDK, tokenId: string, side: 'BUY' | 'SELL', amount: number,
+  register: (orderId: string, walletAddress: string) => void): Promise<boolean | InventoryRefusal> {
+  const writer = beginInventoryWriter(sdk, [tokenId], side === 'BUY' ? 'DIRECT_BUY' : 'CLOSE');
+  if ('status' in writer) return writer;
+  try {
+    const result = await sdk.tradingService.createMarketOrder({ tokenId, side, amount });
+    if (result.submissionState === 'REJECTED') {
+      activeInventoryWriters.delete(writer.localOperationId);
+      return false;
+    }
+    const orderId = typeof result.orderId === 'string' ? result.orderId.trim() : '';
+    if (result.success && orderId && result.submissionState !== 'UNCERTAIN') {
+      register(orderId, writer.wallet);
+      activeInventoryWriters.delete(writer.localOperationId);
       return true;
     }
-    log('WARN', `❌ Close submission failed: ${res.errorMsg}`);
+    writer.state = 'UNCERTAIN';
+    if (result.success && !orderId) log('WARN', `Submission accepted without usable orderId for ${tokenId}; accounting withheld`);
+    return result.success;
+  } catch (error) {
+    writer.state = 'UNCERTAIN';
+    log('WARN', `Inventory submission uncertain: ${String(error)}`);
     return false;
-  } catch (err: any) {
-    log('WARN', `❌ Close submission error: ${err.message}`);
-    return false;
+  }
+}
+
+// true acknowledges submission only; BLOCKED_INVENTORY is not an exchange result.
+async function executeClosePosition(sdk: PolymarketSDK, tokenId: string, size: number): Promise<boolean | InventoryRefusal> {
+  const entry = directEntries.get(tokenId);
+  const callerWallet = sdk.tradingService.getAddress();
+  const entryWallet = entry?.walletAddress ?? activeSdk?.tradingService.getAddress() ?? callerWallet;
+  const directEntry = entryWallet?.toLowerCase() === callerWallet?.toLowerCase() ? entry : undefined;
+  const position = state.positions.find(p => p.asset === tokenId);
+  const candidatePrice = directEntry?.price ?? Number(position?.avgPrice);
+  const entryPrice = Number.isFinite(candidatePrice) && candidatePrice > 0 ? candidatePrice : null;
+  return submitInventoryOrder(sdk, tokenId, 'SELL', size, (orderId, walletAddress) => {
+    if (!pendingCloses.has(orderId)) pendingCloses.set(orderId, {
+      tokenId, walletAddress, entryPrice, directEntry, settlement: { state: 'PENDING' },
+    });
+  });
+}
+
+async function executePanicSell(sdk: PolymarketSDK): Promise<void> {
+  const targets = [...state.positions].filter(p => Number(p.size) > 0).slice(0, 10);
+  for (const p of targets) {
+    const result = await executeClosePosition(sdk, String(p.asset), Number(p.size));
+    if (typeof result === 'object') log('WARN', `Panic sell blocked: ${p.asset}: ${result.reason}`);
+    else if (!result) log('WARN', `Panic sell submission unsuccessful: ${p.asset}`);
+  }
+}
+
+async function executeDirectBuy(sdk: PolymarketSDK, tokenId: string, amount: number): Promise<boolean | InventoryRefusal> {
+  return submitInventoryOrder(sdk, tokenId, 'BUY', amount, (orderId, walletAddress) => {
+    if (!pendingBuys.has(orderId)) pendingBuys.set(orderId, {
+      orderId, tokenId, walletAddress, submittedAt: Date.now(), priorDirectEntry: directEntries.get(tokenId),
+      settlement: { state: 'PENDING' },
+    });
+  });
+}
+
+async function executeDashboardRedeem(sdk: PolymarketSDK, conditionId: string, ctfClient: CTFClient) {
+  const market = await sdk.markets.getMarket(conditionId);
+  if (!market || market.tokens.length < 2) return { status: 'BLOCKED_INVENTORY', reason: 'Missing redeem token identity' };
+  try {
+    if (inventoryWallet(sdk.tradingService.getAddress()) !== inventoryWallet(ctfClient.getAddress())) {
+      return { status: 'BLOCKED_INVENTORY', reason: 'Inconsistent redeem wallet identity' };
+    }
+  } catch {
+    return { status: 'BLOCKED_INVENTORY', reason: 'Invalid redeem wallet identity' };
+  }
+  const tokenIds = { yesTokenId: market.tokens[0].tokenId, noTokenId: market.tokens[1].tokenId };
+  // Capture only this wallet's entries before redeem starts. The CTF adapter
+  // redeems the full balances of both supplied outcome tokens. Confirmation
+  // closes these lifecycles, without inferring PnL or touching newer entries.
+  const redeemWallet = inventoryWallet(ctfClient.getAddress());
+  const redeemEntries = Object.values(tokenIds).map(tokenId => {
+    const entry = directEntries.get(tokenId);
+    const address = entry?.walletAddress ?? activeSdk?.tradingService.getAddress();
+    return { tokenId, entry: entry && address && inventoryWallet(address) === redeemWallet ? entry : undefined };
+  });
+  const writer = beginInventoryWriter(sdk, Object.values(tokenIds), 'REDEEM');
+  if ('status' in writer) return writer;
+  const release = (provenance: RedeemProvenance | undefined) => {
+    if (provenance?.state === 'CONFIRMED') {
+      for (const { tokenId, entry } of redeemEntries) {
+        if (entry && directEntries.get(tokenId) === entry) directEntries.delete(tokenId);
+      }
+    }
+    if (provenance?.state === 'CONFIRMED' || provenance?.state === 'NOT_SUBMITTED') {
+      activeInventoryWriters.delete(writer.localOperationId);
+    } else writer.state = 'UNCERTAIN';
+  };
+  const observe = (provenance: RedeemProvenance) => {
+    if (provenance.transactionHash) writer.transactionHash = provenance.transactionHash;
+    if (provenance.state === 'SUBMITTED' || provenance.state === 'UNCERTAIN') writer.state = provenance.state;
+    // Retain ownership across observer callbacks; release only when the call exits.
+  };
+  try {
+    const routing = typeof market.negRisk === 'boolean' ? { negRisk: market.negRisk } : undefined;
+    const result = await ctfClient.redeemByTokenIds(conditionId, tokenIds, undefined, routing, observe);
+    release(result.provenance);
+    return result;
+  } catch (error) {
+    release(error instanceof RedeemProvenanceError ? error.provenance : undefined);
+    throw error;
   }
 }
 
@@ -1097,6 +1236,7 @@ async function setupArbitrage(_sdk: PolymarketSDK) {
     enableRebalancer: !CONFIG.dryRun && CONFIG.arbitrage.enableRebalancer,
     enableLogging: true,
     preExecutionGuard: riskGuard, // v3.2 AUDIT #4: risk limits gate arb too
+    shortInventoryAdmission: query => dashboardInventoryConflict(query),
   });
 
   arbService.on('opportunity', (opp) => {
@@ -1592,33 +1732,9 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
               } else {
                 log('SIGNAL', `Executing Trend Trade: ${trend.toUpperCase()} on ${market.question?.slice(0, 30)}...`);
 
-                sdk.tradingService.createMarketOrder({
-                  tokenId: targetToken.tokenId,
-                  side: 'BUY',
-                  amount: amountUsdc
-                }).then(res => {
-                  if (res.success) {
-                    const orderId = typeof res.orderId === 'string' ? res.orderId.trim() : '';
-                    if (!orderId) {
-                      log('WARN', `Direct BUY submission accepted without usable orderId for ${targetToken.tokenId}; accounting withheld`);
-                    } else if (!pendingBuys.has(orderId)) {
-                      const priorDirectEntry = directEntries.get(targetToken.tokenId);
-                      pendingBuys.set(orderId, {
-                        orderId,
-                        tokenId: targetToken.tokenId,
-                        submittedAt: Date.now(),
-                        priorDirectEntry,
-                        settlement: { state: 'PENDING' },
-                      });
-                      log('TRADE', `Direct BUY submitted: ${orderId} on ${targetToken.outcome}; settlement pending`);
-                    }
-                  } else {
-                    log('WARN', `❌ Direct Trade failed: ${res.errorMsg}`);
-                  }
-                }).catch(err => {
-                  // v3.2: unhandled rejections kill the process on Node >= 15
-                  log('ERROR', `Direct trade order error: ${(err as Error).message}`);
-                });
+                void executeDirectBuy(sdk, targetToken.tokenId, amountUsdc).then(result => {
+                  if (typeof result === 'object') log('WARN', `Direct BUY blocked: ${result.reason}`);
+                }).catch(err => log('ERROR', `Direct BUY error: ${String(err)}`));
               }
             }
           }
@@ -1817,12 +1933,7 @@ async function main() {
         log('TRADE', '[SIMULATION] Panic sell would close all open positions');
         return;
       }
-      const targets = [...state.positions].filter(p => Number(p.size) > 0).slice(0, 10);
-      log('WARN', `🚨 Panic sell: closing ${targets.length} positions sequentially...`);
-      for (const p of targets) {
-        const ok = await executeClosePosition(sdk, String(p.asset), Number(p.size));
-        if (!ok) log('WARN', `Panic sell: failed on ${String(p.asset).slice(0, 10)}... — continuing`);
-      }
+      await executePanicSell(sdk);
       await refreshExposure(sdk);
       updateDashboard();
       return;
@@ -1837,7 +1948,8 @@ async function main() {
         return;
       }
 
-      await executeClosePosition(sdk, tokenId, size);
+      const result = await executeClosePosition(sdk, tokenId, size);
+      if (typeof result === 'object') log('WARN', `Close blocked: ${result.reason}`);
     }
 
     if (command === 'toggleStrategy') {
@@ -1958,33 +2070,10 @@ async function main() {
           privateKey: process.env.POLYMARKET_PRIVATE_KEY!,
         });
 
-        // 1. Fetch market details to get Token IDs (required for Polymarket CLOB redemption)
-        // We use the Gamma API (via sdk.markets or sdk.gammaApi)
-        log('CHAIN', `Fetching market details for condition ${conditionId}...`);
-        const market = await sdk.markets.getMarket(conditionId);
+        const result = await executeDashboardRedeem(sdk, conditionId, ctfClient);
+        if ('status' in result) log('WARN', `Redeem blocked: ${result.reason}`);
+        else if (result.success) log('CHAIN', `Redeemed ${result.tokensRedeemed} tokens; TX: ${result.txHash}`);
 
-        if (!market || !market.tokens || market.tokens.length < 2) {
-          log('WARN', `❌ Redeem failed: Valid market not found for condition ${conditionId}`);
-          return;
-        }
-
-        const tokenIds = {
-          yesTokenId: market.tokens[0].tokenId,
-          noTokenId: market.tokens[1].tokenId,
-        };
-
-        log('CHAIN', `Found market: ${market.question} (Tokens: ${tokenIds.yesTokenId.slice(0, 10)}... / ${tokenIds.noTokenId.slice(0, 10)}...)`);
-
-        // 2. Redeem using Polymarket Token IDs (V2.3A: neg-risk routing from CLOB metadata)
-        const routing = typeof market.negRisk === 'boolean' ? { negRisk: market.negRisk } : undefined;
-        const result = await ctfClient.redeemByTokenIds(conditionId, tokenIds, undefined, routing);
-
-        if (result.success) {
-          log('CHAIN', `✅ Redeemed! ${result.tokensRedeemed} tokens → ${result.usdcReceived} pUSD`);
-          log('CHAIN', `   Tx: ${result.txHash}`);
-        } else {
-          log('WARN', `❌ Redeem failed`);
-        }
       } catch (err: any) {
         log('WARN', `❌ Redeem error: ${err.message}`);
       }

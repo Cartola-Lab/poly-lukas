@@ -20,6 +20,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { ethers } from 'ethers';
 import {
   RealtimeServiceV2,
   type MarketSubscription,
@@ -115,6 +116,7 @@ export interface ArbitrageServiceConfig {
    * are gated — closes/exits bypass it inside the callees.
    */
   preExecutionGuard?: PreExecutionGuard;
+  shortInventoryAdmission?: (query: Readonly<{ walletAddress: string; tokenIds: readonly string[] }>) => string | undefined;
 }
 
 export interface RebalanceAction {
@@ -343,11 +345,12 @@ export class ArbitrageService extends EventEmitter {
   private rateLimiter: RateLimiter;
 
   private market: ArbitrageMarketConfig | null = null;
-  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval' | 'preExecutionGuard'> & {
+  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval' | 'preExecutionGuard' | 'shortInventoryAdmission'> & {
     privateKey?: string;
     rpcUrl?: string;
     rebalanceIntervalMs: number;
     preExecutionGuard?: PreExecutionGuard;
+    shortInventoryAdmission?: ArbitrageServiceConfig['shortInventoryAdmission'];
   };
 
   private orderbook: OrderbookState = {
@@ -423,6 +426,7 @@ export class ArbitrageService extends EventEmitter {
       sequentialExecution: config.sequentialExecution ?? true,
       // Audit #4: risk gate passes straight through (no default — unset = unguarded, caller's choice)
       preExecutionGuard: config.preExecutionGuard,
+      shortInventoryAdmission: config.shortInventoryAdmission,
     };
 
     this.rateLimiter = new RateLimiter();
@@ -789,6 +793,14 @@ export class ArbitrageService extends EventEmitter {
         error: 'Another execution in progress',
         executionTimeMs: 0,
       };
+    }
+
+    if (opportunity.type === 'short' && this.config.shortInventoryAdmission) {
+      const reason = this.config.shortInventoryAdmission(Object.freeze({
+        walletAddress: this.getInventoryWalletAddress(),
+        tokenIds: Object.freeze([this.market.yesTokenId, this.market.noTokenId]),
+      }));
+      if (reason) throw new Error(`Inventory admission refused: ${reason}`);
     }
 
     this.isExecuting = true;
@@ -1496,6 +1508,35 @@ export class ArbitrageService extends EventEmitter {
           this.execute(opportunity).catch((error) => {
             this.emit('error', error);
           });
+        }
+      }
+    }
+  }
+
+  /** Signer identity, verified against the CTF inventory owner. */
+  getInventoryWalletAddress(): string {
+    const trading = this.tradingService?.getAddress();
+    const ctf = this.ctf?.getAddress();
+    if (!trading || !ctf || !ethers.utils.isAddress(trading) || !ethers.utils.isAddress(ctf) ||
+        trading.toLowerCase() !== ctf.toLowerCase()) throw new Error('Invalid inventory wallet identity');
+    return ethers.utils.getAddress(trading).toLowerCase();
+  }
+
+  /** Cross-caller read-only query; any shared outcome token conflicts. */
+  getShortInventoryProtection(query: { walletAddress: string; tokenIds: readonly string[] }):
+    Readonly<{ operationId: string; reason: string }> | undefined {
+    if (!ethers.utils.isAddress(query.walletAddress)) throw new Error('Invalid inventory wallet identity');
+    const wallet = this.getInventoryWalletAddress();
+    if (ethers.utils.getAddress(query.walletAddress).toLowerCase() !== wallet) return;
+    if (!query.tokenIds.length || query.tokenIds.some(token => typeof token !== 'string' || !token.trim())) {
+      throw new Error('Invalid inventory token identity');
+    }
+    for (const pending of this.pendingShortArbs.values()) {
+      if (query.tokenIds.includes(pending.legA.tokenId) || query.tokenIds.includes(pending.legB.tokenId)) {
+        if (pending.finalized !== true) return Object.freeze({ operationId: pending.id, reason: 'SHORT_UNRESOLVED' });
+        if (pending.inventoryReconciled !== true &&
+            (pending.terminalResult?.legA.state === 'TERMINAL_SUCCESS' || pending.terminalResult?.legB.state === 'TERMINAL_SUCCESS')) {
+          return Object.freeze({ operationId: pending.id, reason: 'SHORT_INVENTORY_PENDING' });
         }
       }
     }
