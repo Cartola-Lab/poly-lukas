@@ -15,8 +15,27 @@ async function fixture(extra: AutoCopyTradingOptions = {}) {
     getOrderFillDetails: vi.fn().mockResolvedValue({ tradeIds: ['child'], sizeMatched: '10' }),
     getTradeStatuses: vi.fn().mockResolvedValue([{ id: 'child', status: 'MATCHED', size: '10', price: '0.4' }]),
   };
+  // V2 transport fixture: retain the actual submitted order identity.
+  const submitted = new Map<string, any>();
+  let queriedOrder = '';
+  const factualTrading = { ...trading,
+    createMarketOrder: async (params: any) => {
+      const result = await (trading.createMarketOrder as any)(params);
+      if (result.orderId) submitted.set(result.orderId, params);
+      return result;
+    },
+    getOrderFillDetails: async (id: string) => {
+      queriedOrder = id;
+      return { id, status: 'CANCELED', tradeEnumerationPresent: true, asset_id: submitted.get(id)?.tokenId, side: submitted.get(id)?.side,
+        ...await (trading.getOrderFillDetails as any)(id) };
+    },
+    getTradeStatuses: async (ids: string[]) => (await (trading.getTradeStatuses as any)(ids)).map((row: any) => ({
+      asset_id: submitted.get(queriedOrder)?.tokenId, side: submitted.get(queriedOrder)?.side,
+      taker_order_id: queriedOrder, trader_side: 'TAKER', maker_orders: [], ...row,
+    })),
+  };
   type D = ConstructorParameters<typeof SmartMoneyService>;
-  const service = new SmartMoneyService({} as D[0], {} as D[1], trading as unknown as D[2]);
+  const service = new SmartMoneyService({} as D[0], {} as D[1], factualTrading as unknown as D[2]);
   const listeners = new Set<(t: SmartMoneyTrade) => void>();
   const captured: Array<(t: SmartMoneyTrade) => void> = [];
   const subscribe = vi.spyOn(service, 'subscribeSmartMoneyTrades').mockImplementation(callback => {
@@ -33,7 +52,7 @@ async function fixture(extra: AutoCopyTradingOptions = {}) {
   const emit = async (side: 'BUY' | 'SELL' = 'BUY') => { await Promise.all([...listeners].map(fn => fn(trade(side)))); };
   const protection = () => service.getInventoryProtection({ walletAddress: wallet, tokenIds: ['token'] });
   const terminal = (failed = false) => trading.getTradeStatuses.mockResolvedValue([{ id: 'child', status: failed ? 'FAILED' : 'MINED',
-    size: '10', price: '0.4', ...(failed ? {} : { transactionHash: 'hash' }) }]);
+    size: '10', price: '0.4', ...(failed ? {} : { transactionHash: '0x' + '12'.repeat(32) }) }]);
   return { service, trading, listeners, captured, subscribe, options, session, start, trade, emit, protection, terminal,
     onTrade, onCopyPnl, onError };
 }

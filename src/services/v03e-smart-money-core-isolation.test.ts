@@ -19,8 +19,27 @@ async function fixture(guard: AutoCopyTradingOptions['inventoryAdmissionGuard'] 
     getOrderFillDetails: vi.fn().mockResolvedValue({ tradeIds: ['child'], sizeMatched: '10' }),
     getTradeStatuses: vi.fn().mockResolvedValue([{ id: 'child', status: 'MATCHED', size: '10', price: '0.4' }]),
   };
+  // V2 transport fixture: retain the actual submitted order identity.
+  const submitted = new Map<string, any>();
+  let queriedOrder = '';
+  const factualTrading = { ...trading,
+    createMarketOrder: async (params: any) => {
+      const result = await (trading.createMarketOrder as any)(params);
+      if (result.orderId) submitted.set(result.orderId, params);
+      return result;
+    },
+    getOrderFillDetails: async (id: string) => {
+      queriedOrder = id;
+      return { id, status: 'CANCELED', tradeEnumerationPresent: true, asset_id: submitted.get(id)?.tokenId, side: submitted.get(id)?.side,
+        ...await (trading.getOrderFillDetails as any)(id) };
+    },
+    getTradeStatuses: async (ids: string[]) => (await (trading.getTradeStatuses as any)(ids)).map((row: any) => ({
+      asset_id: submitted.get(queriedOrder)?.tokenId, side: submitted.get(queriedOrder)?.side,
+      taker_order_id: queriedOrder, trader_side: 'TAKER', maker_orders: [], ...row,
+    })),
+  };
   type Dependencies = ConstructorParameters<typeof SmartMoneyService>;
-  const service = new SmartMoneyService({} as Dependencies[0], {} as Dependencies[1], trading as unknown as Dependencies[2]);
+  const service = new SmartMoneyService({} as Dependencies[0], {} as Dependencies[1], factualTrading as unknown as Dependencies[2]);
   let incoming!: (trade: SmartMoneyTrade) => Promise<void>;
   vi.spyOn(service, 'subscribeSmartMoneyTrades').mockImplementation(callback => {
     incoming = callback as typeof incoming;
@@ -36,7 +55,7 @@ async function fixture(guard: AutoCopyTradingOptions['inventoryAdmissionGuard'] 
   const terminal = (size = '10', failed = false) => {
     trading.getOrderFillDetails.mockResolvedValue({ tradeIds: ['child'], sizeMatched: size });
     trading.getTradeStatuses.mockResolvedValue([{ id: 'child', status: failed ? 'FAILED' : 'MINED', size,
-      price: '0.4', ...(failed ? {} : { transactionHash: 'hash' }) }]);
+      price: '0.4', ...(failed ? {} : { transactionHash: '0x' + '12'.repeat(32) }) }]);
   };
   const protection = (tokenId = 'token', address = wallet) => service.getInventoryProtection({ walletAddress: address, tokenIds: [tokenId] });
   return { service, trading, emit, flush, terminal, protection, sub, onTrade, onCopyPnl, onError };
@@ -143,11 +162,13 @@ describe('P0.3e Smart Money core inventory isolation', () => {
     expect(h.protection()).toBeUndefined(); expect(h.onCopyPnl).toHaveBeenCalledTimes(2);
     expect(h.onCopyPnl.mock.calls.map(c => c[0].closedSize)).toEqual([4, 6]);
   });
-  it('negative lot stays protected, rejects another SELL and permits BUY closure', async () => {
+  it('SELL without known inventory stays pending and cannot be cleared by a new BUY', async () => {
     const h = await fixture(); await h.emit('SELL'); h.terminal(); await h.flush();
-    expect(h.protection()).toMatchObject({ reason: 'SMART_MONEY_OPEN_LOT' });
+    expect(h.protection()).toMatchObject({ reason: 'SMART_MONEY_PENDING', unresolvedSellShares: 10 });
     await h.emit('SELL'); expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(1);
-    await h.emit('BUY'); h.terminal(); await h.flush(); expect(h.protection()).toBeUndefined();
+    await h.emit('BUY'); h.terminal(); await h.flush();
+    expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(1);
+    expect(h.protection()).toMatchObject({ reason: 'SMART_MONEY_PENDING', unresolvedSellShares: 10 });
   });
   it('all FAILED terminal tombstone alone releases', async () => {
     const h = await fixture(); await h.emit(); h.terminal('10', true); await h.flush();

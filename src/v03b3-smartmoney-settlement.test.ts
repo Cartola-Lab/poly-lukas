@@ -4,7 +4,7 @@ import { CopyPnlTracker } from './services/copy-pnl-tracker.js';
 import type { TradeStatus } from './services/trading-service.js';
 
 const child = (id = 'a', status = 'MATCHED', size = '4.25', price = '0.4', transactionHash?: string): TradeStatus =>
-  ({ id, status, size, price, transactionHash });
+  ({ id, status, size, price, transactionHash: transactionHash ? '0x' + (transactionHash.includes('sell') ? '34' : '12').repeat(32) : undefined });
 
 async function setup(onCopyPnl = vi.fn()) {
   const trading = {
@@ -12,9 +12,28 @@ async function setup(onCopyPnl = vi.fn()) {
     getOrderFillDetails: vi.fn().mockResolvedValue({ tradeIds: ['a'], sizeMatched: '4.25' }),
     getTradeStatuses: vi.fn().mockResolvedValue([child()]),
   };
+  // V2 transport fixture: retain the actual submitted order identity.
+  const submitted = new Map<string, any>();
+  let queriedOrder = '';
+  const factualTrading = { ...trading,
+    createMarketOrder: async (params: any) => {
+      const result = await (trading.createMarketOrder as any)(params);
+      if (result.orderId) submitted.set(result.orderId, params);
+      return result;
+    },
+    getOrderFillDetails: async (id: string) => {
+      queriedOrder = id;
+      return { id, status: 'CANCELED', tradeEnumerationPresent: true, asset_id: submitted.get(id)?.tokenId, side: submitted.get(id)?.side,
+        ...await (trading.getOrderFillDetails as any)(id) };
+    },
+    getTradeStatuses: async (ids: string[]) => (await (trading.getTradeStatuses as any)(ids)).map((row: any) => ({
+      asset_id: submitted.get(queriedOrder)?.tokenId, side: submitted.get(queriedOrder)?.side,
+      taker_order_id: queriedOrder, trader_side: 'TAKER', maker_orders: [], ...row,
+    })),
+  };
   type Dependencies = ConstructorParameters<typeof SmartMoneyService>;
   const service = new SmartMoneyService(
-    {} as Dependencies[0], {} as Dependencies[1], trading as unknown as Dependencies[2],
+    {} as Dependencies[0], {} as Dependencies[1], factualTrading as unknown as Dependencies[2],
   );
   let incoming!: (trade: SmartMoneyTrade) => Promise<void>;
   vi.spyOn(service, 'subscribeSmartMoneyTrades').mockImplementation(callback => {
@@ -35,7 +54,7 @@ beforeEach(() => { vi.stubEnv('DRY_RUN', 'false'); vi.spyOn(console, 'warn').moc
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 describe('P0.3b-3 Smart Money settlement accounting', () => {
-  it('MATCHED waits, then hash resolves exactly once without requiring CONFIRMED', async () => {
+  it('MATCHED waits, then attributed MINED fill resolves exactly once', async () => {
     const h = await setup();
     expect(h.record).not.toHaveBeenCalled();
     expect(h.sub.stats.tradesExecuted).toBe(1);
@@ -63,7 +82,7 @@ describe('P0.3b-3 Smart Money settlement accounting', () => {
     h.trading.getOrderFillDetails.mockResolvedValue({ tradeIds: ['a', 'b'], sizeMatched: '10' });
     h.trading.getTradeStatuses.mockResolvedValue([
       child('a', 'MINED', '4', '0.25', 'hash-a'),
-      child('b', mixed ? 'FAILED' : 'MATCHED', '6', '0.5', mixed ? undefined : 'hash-b'),
+      child('b', mixed ? 'FAILED' : 'CONFIRMED', '6', '0.5', mixed ? undefined : 'hash-b'),
     ]);
     await h.flush();
     expect(h.record).toHaveBeenCalledTimes(1); expect(h.record).toHaveBeenCalledWith('token', 'BUY', mixed ? 4 : 10, mixed ? 0.25 : 0.4, mixed ? 0.01 : 0.04);
@@ -78,13 +97,12 @@ describe('P0.3b-3 Smart Money settlement accounting', () => {
     await h.flush(); expect(h.record).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['4.24', '4.26'])('size sum %s differing from matched waits and retries', async size => {
+  it.each(['4.24', '4.26'])('size sum %s differing from matched stays pending when the same trade changes quantity', async size => {
     const h = await setup();
     h.trading.getTradeStatuses.mockResolvedValue([child('a', 'MINED', size, '0.4', 'hash')]);
     await h.flush(); expect(h.record).not.toHaveBeenCalled();
-    if (size === '4.26') expect(console.warn).toHaveBeenCalled();
     h.trading.getTradeStatuses.mockResolvedValue([child('a', 'MINED', '4.25', '0.4', 'hash')]);
-    await h.flush(); expect(h.record).toHaveBeenCalledTimes(1);
+    await h.flush(); expect(h.record).not.toHaveBeenCalled();
   });
 
   it('empty discovery at zero matched remains reconcilable', async () => {

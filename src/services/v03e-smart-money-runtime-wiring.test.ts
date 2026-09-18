@@ -38,8 +38,27 @@ async function fixture(entry: string, address = wallet, boot = true, arbEnabled 
     createMarketOrder: vi.fn().mockImplementation(async () => accepted('sm-' + (++n))),
     getOrderFillDetails: vi.fn().mockResolvedValue({ tradeIds: ['child'], sizeMatched: '10' }),
     getTradeStatuses: vi.fn().mockImplementation(async () => [{ id: 'child', size: '10', price: '0.4',
-      status: terminal ? 'MINED' : 'MATCHED', ...(terminal ? { transactionHash: 'tx' } : {}) }]) };
-  const smart = new SmartMoneyService({} as any, {} as any, trading as any);
+      status: terminal ? 'MINED' : 'MATCHED', ...(terminal ? { transactionHash: '0x' + '12'.repeat(32) } : {}) }]) };
+  // V2 transport fixture: retain the actual submitted order identity.
+  const submitted = new Map<string, any>();
+  let queriedOrder = '';
+  const factualTrading = { ...trading,
+    createMarketOrder: async (params: any) => {
+      const result = await (trading.createMarketOrder as any)(params);
+      if (result.orderId) submitted.set(result.orderId, params);
+      return result;
+    },
+    getOrderFillDetails: async (id: string) => {
+      queriedOrder = id;
+      return { id, status: 'CANCELED', tradeEnumerationPresent: true, asset_id: submitted.get(id)?.tokenId, side: submitted.get(id)?.side,
+        ...await (trading.getOrderFillDetails as any)(id) };
+    },
+    getTradeStatuses: async (ids: string[]) => (await (trading.getTradeStatuses as any)(ids)).map((row: any) => ({
+      asset_id: submitted.get(queriedOrder)?.tokenId, side: submitted.get(queriedOrder)?.side,
+      taker_order_id: queriedOrder, trader_side: 'TAKER', maker_orders: [], ...row,
+    })),
+  };
+  const smart = new SmartMoneyService({} as any, {} as any, factualTrading as any);
   const listeners = new Set<(t: any) => any>();
   const subscribe = vi.spyOn(smart, 'subscribeSmartMoneyTrades').mockImplementation(fn => {
     listeners.add(fn); return { id: 'listener', unsubscribe: () => { listeners.delete(fn); } };

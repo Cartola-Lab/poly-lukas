@@ -153,13 +153,15 @@ export type SmartMoneyInventoryProtection = Readonly<{
   blocked: true;
   reason: 'SMART_MONEY_ACTIVE' | 'SMART_MONEY_UNCERTAIN' | 'SMART_MONEY_PENDING' | 'SMART_MONEY_OPEN_LOT';
   operationId?: string;
+  /** Executed SELL quantity without a known local FIFO cost basis. */
+  unresolvedSellShares?: number;
 }>;
 type CopyInventoryWriter = { localOperationId: string; wallet: string; tokenId: string;
   side: 'BUY' | 'SELL'; state: 'ACTIVE' | 'UNCERTAIN' };
 type CopyInventoryContext = {
   wallet?: string;
   writers: Map<string, CopyInventoryWriter>;
-  pending: Map<string, { tokenId: string; side: 'BUY' | 'SELL' }>;
+  pending: Map<string, { tokenId: string; side: 'BUY' | 'SELL'; unresolvedSellShares?: number }>;
   tracker: CopyPnlTracker;
 };
 
@@ -873,7 +875,8 @@ export class SmartMoneyService {
       }
       for (const [orderId, pending] of context.pending) {
         if (query.tokenIds.includes(pending.tokenId)) return Object.freeze({
-          blocked: true, reason: 'SMART_MONEY_PENDING', operationId: orderId });
+          blocked: true, reason: 'SMART_MONEY_PENDING', operationId: orderId,
+          ...(pending.unresolvedSellShares ? { unresolvedSellShares: pending.unresolvedSellShares } : {}) });
       }
       if (query.tokenIds.some(token => context.tracker.openLots(token).some(lot => lot.qty !== 0))) {
         return Object.freeze({ blocked: true, reason: 'SMART_MONEY_OPEN_LOT' });
@@ -1321,7 +1324,8 @@ export class SmartMoneyService {
 
     // Subscription-local state: no timers or persistence. Retain finalized IDs to
     // reject a repeated order result even after its pending entry is removed.
-    const pendingFills = new Map<string, { tokenId: string; side: 'BUY' | 'SELL' }>();
+    const pendingFills = new Map<string, { tokenId: string; side: 'BUY' | 'SELL'; ids?: Set<string>; facts?: Map<string, string>;
+      accounted?: Set<string>; accountingUncertain?: boolean; unresolvedSellShares?: number }>();
     const inventory = options.inventoryAdmissionGuard && !dryRun
       ? { writers: new Map<string, CopyInventoryWriter>(), pending: pendingFills, tracker: pnlTracker } as CopyInventoryContext
       : undefined;
@@ -1341,53 +1345,115 @@ export class SmartMoneyService {
       flushPromise = Promise.resolve().then(async () => {
         for (const [orderId, fill] of [...pendingFills]) {
           // A claimed but failed accounting transition stays protected, never replayed.
-          if (inventory && finalizedOrderIds.has(orderId)) continue;
+          if (fill.accountingUncertain || finalizedOrderIds.has(orderId)) continue;
           try {
             const details = await this.tradingService.getOrderFillDetails(orderId);
+            if (details.id !== orderId || details.asset_id !== fill.tokenId || details.side !== fill.side) {
+              throw new Error('Copy order identity unavailable or contradictory');
+            }
             const matched = parseShares(details.sizeMatched);
-            const ids = [...new Set(details.tradeIds)];
+            if (!Array.isArray(details.tradeIds)) throw new Error('Copy trade enumeration unavailable');
+            const knownIds = fill.ids ??= new Set<string>();
+            for (const id of details.tradeIds) knownIds.add(id);
+            const ids = [...knownIds];
             // Empty discovery is not evidence of terminality, even at zero matched.
-            if (ids.length === 0) continue;
+            if (!ids.length || ids.some(id => typeof id !== 'string' || !id.trim() || !details.tradeIds.includes(id))) continue;
             const trades = await this.tradingService.getTradeStatuses(ids);
             // Missing, duplicate, or unrelated records cannot prove completeness.
             if (trades.length !== ids.length || new Set(trades.map(t => t.id)).size !== ids.length ||
                 trades.some(t => !ids.includes(t.id))) {
               throw new Error('Incomplete or ambiguous child trade records');
             }
-            const sizes = trades.map(t => parseShares(t.size));
-            const total = sizes.reduce((sum, size) => sum + size, 0n);
-            if (total < matched) continue;
-            if (total > matched) throw new Error('Child trade sizes exceed sizeMatched');
-            const success = trades.map(t => typeof t.transactionHash === 'string' && t.transactionHash.trim().length > 0);
-            if (trades.some((t, i) => !success[i] && t.status !== 'FAILED')) continue;
-
-            let settledUnits = 0n;
-            let notional = 0;
-            for (let i = 0; i < trades.length; i++) {
-              if (!success[i]) continue;
-              const rawPrice = trades[i].price;
+            const facts = fill.facts ??= new Map<string, string>();
+            const accounted = fill.accounted ??= new Set<string>();
+            const newIds: string[] = [];
+            let total = 0n, settledUnits = 0n, notional = 0, terminal = true;
+            for (const trade of trades) {
+              if (!Array.isArray(trade.maker_orders) || typeof trade.taker_order_id !== 'string' || !trade.taker_order_id.trim()) {
+                throw new Error('Copy trade association unavailable');
+              }
+              const makers = trade.maker_orders.filter(m => m.order_id === orderId);
+              let size: string | undefined, rawPrice: string | undefined;
+              if (trade.taker_order_id === orderId) {
+                if (trade.trader_side !== 'TAKER' || makers.length || trade.asset_id !== fill.tokenId || trade.side !== fill.side) {
+                  throw new Error('Contradictory copy taker');
+                }
+                size = trade.size; rawPrice = trade.price;
+              } else {
+                if (trade.trader_side !== 'MAKER' || makers.length !== 1) throw new Error('Ambiguous copy maker');
+                const maker = makers[0];
+                if (maker.asset_id !== fill.tokenId || (maker.side !== undefined && maker.side !== fill.side) ||
+                    !trade.asset_id || !['BUY', 'SELL'].includes(trade.side ?? '') ||
+                    (trade.asset_id === fill.tokenId && trade.side === fill.side)) throw new Error('Contradictory copy maker');
+                size = maker.matched_amount; rawPrice = maker.price;
+                if (parseShares(size) > parseShares(trade.size)) throw new Error('Copy allocation exceeds trade');
+              }
+              const units = parseShares(size);
+              total += units;
+              const confirmed = (trade.status === 'MINED' || trade.status === 'CONFIRMED') &&
+                typeof trade.transactionHash === 'string' && /^0x[0-9a-f]{64}$/i.test(trade.transactionHash);
+              if (!confirmed) {
+                if (facts.has(trade.id)) throw new Error('Previously confirmed copy fact contradicted');
+                if (trade.status !== 'FAILED' || trade.transactionHash?.trim()) terminal = false;
+                continue;
+              }
               const price = typeof rawPrice === 'string' && /^\d+(?:\.\d+)?$/.test(rawPrice) ? Number(rawPrice) : NaN;
-              if (!Number.isFinite(price) || price <= 0 || sizes[i] <= 0n) {
+              if (!Number.isFinite(price) || price <= 0 || price > 1 || units <= 0n) {
                 throw new Error('Invalid success child price or size');
               }
-              settledUnits += sizes[i];
-              notional += Number(sizes[i]) / 100 * price;
+              const fingerprint = JSON.stringify([fill.tokenId, fill.side, trade.trader_side, trade.taker_order_id,
+                units.toString(), rawPrice, trade.transactionHash!.toLowerCase()]);
+              const prior = facts.get(trade.id);
+              if (prior !== undefined && prior !== fingerprint) throw new Error('Conflicting copy fill metadata');
+              facts.set(trade.id, fingerprint);
+              if (!accounted.has(trade.id)) {
+                newIds.push(trade.id);
+                settledUnits += units;
+                notional += Number(units) / 100 * price;
+              }
             }
+            // Current matched volume proves observation consistency, not order
+            // terminality. Keep the order and consumed trade identities for later fills.
+            if (!terminal || total !== matched) continue;
             const settledShares = Number(settledUnits) / 100;
             const settledFee = estimateTakerFee(notional, feeRateBps);
             if (settledUnits > BigInt(Number.MAX_SAFE_INTEGER) || !Number.isFinite(notional) ||
                 !Number.isFinite(settledFee)) throw new Error('Invalid settlement accounting totals');
 
-            // Claim before non-idempotent accounting and external callbacks.
-            if (!inventory) pendingFills.delete(orderId);
-            finalizedOrderIds.add(orderId);
+            // Cancellation closes the unmatched remainder; all known children
+            // must still be resolved. MATCHED/requested quantity alone is insufficient.
+            const orderTerminal = details.status === 'CANCELED' && details.tradeEnumerationPresent === true;
             if (settledUnits === 0n) {
-              pendingFills.delete(orderId);
-              continue; // All children FAILED.
+              if (orderTerminal && !fill.unresolvedSellShares) { finalizedOrderIds.add(orderId); pendingFills.delete(orderId); }
+              continue;
             }
-            const close = pnlTracker.recordFill(fill.tokenId, fill.side, settledShares, notional / settledShares, settledFee);
-            // Keep pending ownership through recordFill, including reentrant observers.
-            pendingFills.delete(orderId);
+            // A throwing accounting transition stays protected and cannot replay.
+            fill.accountingUncertain = true;
+            for (const id of newIds) accounted.add(id);
+            const price = notional / settledShares;
+            let close = { closedSize: 0, realizedUsd: 0 };
+            if (fill.side === 'BUY') {
+              close = pnlTracker.recordFill(fill.tokenId, fill.side, settledShares, price, settledFee);
+            } else {
+              // Execute only against known positive FIFO lots. Apply one lot at a
+              // time so floating-point summation cannot manufacture a short tail.
+              let remaining = settledShares;
+              for (const lot of pnlTracker.openLots(fill.tokenId)) {
+                if (!(remaining > 0) || !(lot.qty > 0)) break;
+                const quantity = Math.min(remaining, lot.qty);
+                const part = pnlTracker.recordFill(fill.tokenId, 'SELL', quantity, price,
+                  settledFee * (quantity / settledShares));
+                close.closedSize += part.closedSize;
+                close.realizedUsd += part.realizedUsd;
+                remaining -= quantity;
+              }
+              // These IDs remain consumed, but the execution excess is NOT a
+              // reconciled position. Later BUYs cannot safely supply historical
+              // cost basis automatically; retain this divergence and protection.
+              fill.unresolvedSellShares = (fill.unresolvedSellShares ?? 0) + remaining;
+            }
+            fill.accountingUncertain = false;
+            if (orderTerminal && !fill.unresolvedSellShares) { finalizedOrderIds.add(orderId); pendingFills.delete(orderId); }
             stats.realizedPnlUsd = pnlTracker.totalRealizedUsd;
             if (close.closedSize > 0) {
               options.onCopyPnl?.({
@@ -1613,7 +1679,7 @@ export class SmartMoneyService {
               } else if (result.submissionState === 'ACCEPTED' && orderId) {
                 // A reused order identity cannot prove ownership of this new attempt.
                 if (!finalizedOrderIds.has(orderId) && !pendingFills.has(orderId)) {
-                  pendingFills.set(orderId, { tokenId, side: trade.side });
+                  pendingFills.set(orderId, { tokenId, side: trade.side, ids: new Set(result.tradeIds ?? []) });
                   inventory.writers.delete(writer.localOperationId);
                 } else writer.state = 'UNCERTAIN';
               } else writer.state = 'UNCERTAIN';
@@ -1632,7 +1698,7 @@ export class SmartMoneyService {
               if (!orderId) {
                 console.warn('[SmartMoneyService] Successful copy without usable orderId; accounting withheld');
               } else if (!finalizedOrderIds.has(orderId) && !pendingFills.has(orderId)) {
-                pendingFills.set(orderId, { tokenId, side: trade.side });
+                pendingFills.set(orderId, { tokenId, side: trade.side, ids: new Set(result.tradeIds ?? []) });
               }
             }
           } else {
