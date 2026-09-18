@@ -97,6 +97,15 @@ type SellSettlement = {
   composition: SellComposition; finalizedComposition?: SellComposition;
   flight?: Promise<DipArbSettleResult>; finalized?: DipArbSettleResult;
 };
+type BuyExecution = {
+  signal: DipArbLeg1Signal | DipArbLeg2Signal; scope?: ClobScope; submitted: boolean;
+  orders: Array<{ orderId?: string; ids: Set<string>; rejected: boolean; facts: Map<string, { units: bigint; hash: string }> }>;
+  flight?: Promise<DipArbExecutionResult & DipArbInventoryDiagnostic>;
+  result?: DipArbExecutionResult & DipArbInventoryDiagnostic;
+  executionEmitted?: boolean;
+  publishExecution?: boolean;
+  interruption?: DipArbInventoryDiagnostic['inventoryInterruption'];
+};
 type ClobLifecycle = { operationId: string; wallet: string; tokenIds: readonly string[];
   writerType: DipArbClobWriter | 'POSITION'; invocation?: symbol; round: DipArbRoundState; scope?: ClobScope;
   submission: 'ACTIVE' | 'ACCEPTED' | 'UNCERTAIN' | 'EXISTING';
@@ -395,7 +404,8 @@ export class DipArbService extends EventEmitter {
   private market: DipArbMarketConfig | null = null;
   private currentRound: DipArbRoundState | null = null;
   private isRunning = false;
-  private isExecuting = false;
+  private readonly executionOwners = new Set<symbol>();
+  private get isExecuting(): boolean { return this.executionOwners.size > 0; }
   private lastExecutionTime = 0;
   private stats: DipArbStats;
 
@@ -413,6 +423,8 @@ export class DipArbService extends EventEmitter {
   private accountedRedeemTransactions = new Map<string, Readonly<DipArbSettleResult>>();
   private confirmedRedeemLifecycles = new WeakMap<DipArbRoundState, Map<string, DipArbPendingRedemption>>();
   private publicRedeemFlight?: Promise<DipArbSettleResult & DipArbInventoryDiagnostic>;
+  private buyExecutions = new WeakMap<DipArbRoundState, Partial<Record<'leg1' | 'leg2', BuyExecution>>>();
+  private buyEvidenceOwners = new Map<string, object>();
   private sellSettlements = new WeakMap<DipArbRoundState, SellSettlement>();
   private sellEvidenceOwners = new Map<string, SellSettlementLeg>();
   private redeemCheckInterval: ReturnType<typeof setInterval> | null = null;
@@ -471,40 +483,147 @@ export class DipArbService extends EventEmitter {
     }
   }
 
-  /**
-   * Reconcile estimated leg fills against on-chain balances (PROBLEMS.md #10).
-   *
-   * Split-order fills are estimated client-side; the venue may partially
-   * fill. When a CTF client is available, read actual UP/DOWN balances and
-   * clamp the recorded leg shares to what is really held.
-   *
-   * @returns Reconciled share count (<= estimatedShares)
-   */
-  private async reconcileLegShares(
-    estimatedShares: number,
-    legSide: DipArbSide,
-    market = this.market, ctf = this.ctf
-  ): Promise<number> {
-    if (!ctf || !market) return estimatedShares;
-    try {
-      const positions = await ctf.getPositionBalanceByTokenIds(
-        market.conditionId,
-        { yesTokenId: market.upTokenId, noTokenId: market.downTokenId }
-      );
-      // NOTE: CTF position IDs map UP→yes / DOWN→no for UpDown markets.
-      const held = legSide === 'UP'
-        ? parseFloat(positions.yesBalance)
-        : parseFloat(positions.noBalance);
-      if (!Number.isFinite(held) || held <= 0) return estimatedShares;
-      if (held + 1e-9 < estimatedShares) {
-        this.log(`⚠️ Fill mismatch: estimated ${estimatedShares.toFixed(2)} ${legSide} but on-chain holds ${held.toFixed(2)} — clamping to actual`);
-        return Math.floor(held * 1e6) / 1e6;
-      }
-      return estimatedShares;
-    } catch (error) {
-      this.log(`⚠️ Reconciliation skipped: ${error instanceof Error ? error.message : String(error)}`);
-      return estimatedShares;
+  /** Read only order-attributed BUY quantities; balances are never a fill fallback. */
+  private async reconcileLegShares(operation: BuyExecution): Promise<{ shares: number; terminal: boolean }> {
+    const scope = operation.scope!;
+    let terminal = operation.orders.length > 0;
+    for (const order of operation.orders) {
+      if (order.rejected) continue;
+      if (!order.orderId) { terminal = false; continue; }
+      try {
+        const wallet = this.inventoryWallet(scope.wallet ?? '');
+        if (this.inventoryWallet(scope.trading.getAddress()) !== wallet) throw new Error('BUY wallet changed');
+        const key = `${wallet}:order:${order.orderId}`;
+        const owner = this.buyEvidenceOwners.get(key);
+        if (owner && owner !== order) throw new Error('BUY order reused');
+        this.buyEvidenceOwners.set(key, order);
+        const details = await scope.trading.getOrderFillDetails(order.orderId);
+        if (details.id !== order.orderId || details.asset_id !== operation.signal.tokenId || details.side !== 'BUY') throw new Error('BUY order identity unavailable');
+        for (const id of details.tradeIds) order.ids.add(id);
+        const ids = [...order.ids];
+        if (!ids.length || ids.some(id => typeof id !== 'string' || !id.trim() || !details.tradeIds.includes(id))) throw new Error('BUY children incomplete');
+        const unique = new Map<string, TradeStatus>();
+        const conflictingIds = new Set<string>();
+        for (const row of await scope.trading.getTradeStatuses(ids)) {
+          const prior = unique.get(row.id);
+          if (prior && JSON.stringify({ ...prior, transactionHash: prior.transactionHash?.toLowerCase() }) !==
+              JSON.stringify({ ...row, transactionHash: row.transactionHash?.toLowerCase() })) conflictingIds.add(row.id);
+          unique.set(row.id, row);
+        }
+        let attributed = 0n;
+        let allTerminal = unique.size === ids.length && conflictingIds.size === 0 && [...unique.keys()].every(id => ids.includes(id));
+        const staged = new Map(order.facts);
+        for (const trade of unique.values()) {
+          try {
+            if (!ids.includes(trade.id) || conflictingIds.has(trade.id)) throw new Error('Unproven BUY child');
+            if (!Array.isArray(trade.maker_orders) || !trade.taker_order_id) throw new Error('BUY association unavailable');
+            const makers = trade.maker_orders.filter(m => m.order_id === order.orderId);
+            let size: string | undefined;
+            if (trade.taker_order_id === order.orderId) {
+              if (trade.trader_side !== 'TAKER' || makers.length || trade.asset_id !== operation.signal.tokenId || trade.side !== 'BUY') throw new Error('Contradictory BUY taker');
+              size = trade.size;
+            } else {
+              if (trade.trader_side !== 'MAKER' || makers.length !== 1) throw new Error('Ambiguous BUY maker');
+              const maker = makers[0];
+              if (maker.asset_id !== operation.signal.tokenId || (maker.side !== undefined && maker.side !== 'BUY') ||
+                  !trade.asset_id || !['BUY', 'SELL'].includes(trade.side ?? '') ||
+                  (trade.asset_id === operation.signal.tokenId && trade.side !== 'SELL')) throw new Error('Contradictory BUY maker');
+              size = maker.matched_amount;
+              if (this.sellUnits(size) > this.sellUnits(trade.size)) throw new Error('BUY maker exceeds trade');
+            }
+            const units = this.sellUnits(size); attributed += units;
+            const confirmed = ['MINED', 'CONFIRMED'].includes(trade.status) &&
+              typeof trade.transactionHash === 'string' && /^0x[0-9a-f]{64}$/i.test(trade.transactionHash);
+            if (!confirmed) {
+              if (staged.has(trade.id)) throw new Error('BUY fact contradicted');
+              if (trade.status !== 'FAILED' || trade.transactionHash?.trim()) allTerminal = false;
+              continue;
+            }
+            if (units <= 0n) throw new Error('Invalid BUY quantity');
+            const fact = { units, hash: trade.transactionHash!.toLowerCase() }, prior = staged.get(trade.id);
+            const tradeKey = `${wallet}:trade:${trade.id}`;
+            if ((prior && (prior.units !== units || prior.hash !== fact.hash)) ||
+                (this.buyEvidenceOwners.has(tradeKey) && this.buyEvidenceOwners.get(tradeKey) !== order)) throw new Error('Conflicting BUY fact');
+            staged.set(trade.id, fact);
+          } catch { allTerminal = false; } // One invalid child does not erase valid siblings.
+        }
+        // Matched volume is a completeness check, never a source of shares.
+        try { if (attributed !== this.sellUnits(details.sizeMatched)) allTerminal = false; }
+        catch { allTerminal = false; }
+        if (this.inventoryWallet(scope.trading.getAddress()) !== wallet) throw new Error('BUY wallet changed');
+        for (const id of staged.keys()) this.buyEvidenceOwners.set(`${wallet}:trade:${id}`, order);
+        order.facts = staged; terminal = terminal && allTerminal;
+      } catch { terminal = false; }
     }
+    const units = operation.orders.reduce((sum, order) => sum + [...order.facts.values()].reduce((n, f) => n + f.units, 0n), 0n);
+    if (units > BigInt(Number.MAX_SAFE_INTEGER)) return { shares: 0, terminal: false };
+    return { shares: Number(ethers.utils.formatUnits(units.toString(), 6)), terminal };
+  }
+
+  private async submitBuyLeg(operation: BuyExecution, scope: ClobScope, writer: 'LEG1' | 'LEG2',
+    splitCount: number, amount: number, price: number): Promise<void> {
+    if (operation.submitted) return;
+    operation.scope = { ...scope, market: { ...scope.market }, wallet: this.clobWalletSnapshot(scope.trading) };
+    operation.submitted = true; // Claim before transport, including ambiguous exceptions.
+    for (let i = 0; i < splitCount; i++) {
+      const order: BuyExecution['orders'][number] = { ids: new Set(), rejected: false, facts: new Map() };
+      operation.orders.push(order);
+      try {
+        const result = await this.submitClob(scope, writer, { tokenId: operation.signal.tokenId, side: 'BUY', amount, price, orderType: 'FOK' });
+        order.rejected = result.submissionState === 'REJECTED';
+        if (!order.rejected && typeof result.orderId === 'string' && result.orderId.trim()) order.orderId = result.orderId.trim();
+        for (const id of result.tradeIds ?? []) order.ids.add(id);
+        if (order.rejected || result.submissionState === 'UNCERTAIN' || !order.orderId) break;
+      } catch (error) {
+        if (error instanceof InventoryAdmissionRefusal) {
+          operation.orders.pop(); // No submission took place.
+          if (!operation.orders.length) { operation.submitted = false; throw error; }
+          operation.interruption = Object.freeze({ status: 'BLOCKED_INVENTORY', reason: error.message });
+          this.inventoryBlocked({}, error);
+        }
+        break;
+      }
+      if (i < splitCount - 1 && this.config.orderIntervalMs > 0) await new Promise(resolve => setTimeout(resolve, this.config.orderIntervalMs));
+    }
+  }
+
+  private async executeBuyLeg(kind: 'leg1' | 'leg2', signal: DipArbLeg1Signal | DipArbLeg2Signal, publishExecution = false): Promise<DipArbExecutionResult & DipArbInventoryDiagnostic> {
+    const round = this.currentRound;
+    if (!round || signal.roundId !== round.roundId) {
+
+      const result = { success: false, leg: kind, roundId: signal.roundId, error: 'Stale BUY round', executionTimeMs: 0 };
+      return this.inventoryAdmissionGuard ? this.inventoryBlocked(result, new InventoryAdmissionRefusal(result.error)) : result;
+    }
+    let operations = this.buyExecutions.get(round);
+    if (!operations) { operations = {}; this.buyExecutions.set(round, operations); }
+    if (kind === 'leg2' && operations.leg1 && !operations.leg1.result) {
+
+      return { success: false, leg: kind, roundId: signal.roundId, error: 'BUY_PENDING: Leg1 unresolved', executionTimeMs: 0 };
+    }
+    let operation = operations[kind];
+    if (!operation) { operation = { signal: { ...signal }, submitted: false, orders: [] }; operations[kind] = operation; }
+    operation.publishExecution ||= publishExecution;
+    if (operation.result) return { ...operation.result };
+    if (!operation.flight) {
+      const captured = operation;
+      let resolve!: (result: DipArbExecutionResult & DipArbInventoryDiagnostic) => void;
+      let reject!: (error: unknown) => void;
+      operation.flight = new Promise((yes, no) => { resolve = yes; reject = no; });
+      const owner = Symbol();
+      this.executionOwners.add(owner);
+      const run = kind === 'leg1' ? this.executeLeg1Attempt(captured.signal as DipArbLeg1Signal, captured)
+        : this.executeLeg2Attempt(captured.signal as DipArbLeg2Signal, captured);
+      void run.then(result => {
+        if (result.success && captured.publishExecution && !captured.executionEmitted) {
+          captured.executionEmitted = true; // Claim before listeners, including reentrant/throwing listeners.
+          this.emit('execution', result);
+        }
+        return result;
+      }).then(resolve, reject).finally(() => this.executionOwners.delete(owner));
+    }
+    const flight = operation.flight;
+    try { return { ...await flight }; }
+    finally { if (operation.flight === flight) operation.flight = undefined; }
   }
 
   // ===== Public API: Configuration =====
@@ -891,6 +1010,10 @@ export class DipArbService extends EventEmitter {
    * Execute Leg1 trade
    */
   async executeLeg1(signal: DipArbLeg1Signal): Promise<DipArbExecutionResult & DipArbInventoryDiagnostic> {
+    return this.executeBuyLeg('leg1', signal);
+  }
+
+  private async executeLeg1Attempt(signal: DipArbLeg1Signal, operation: BuyExecution): Promise<DipArbExecutionResult & DipArbInventoryDiagnostic> {
     const originMarket = this.market, round = this.currentRound, trading = this.tradingService, ctf = this.ctf;
     const guard = this.inventoryAdmissionGuard, running = this.isRunning, invocation = Symbol();
     const market = guard && originMarket ? { ...originMarket } : originMarket;
@@ -899,7 +1022,7 @@ export class DipArbService extends EventEmitter {
     const startTime = Date.now();
 
     if (!trading || !market || !round) {
-      this.isExecuting = false;  // Reset in case handleSignal() set it
+
       return {
         success: false,
         leg: 'leg1',
@@ -911,14 +1034,14 @@ export class DipArbService extends EventEmitter {
 
     // Audit #4: risk gate on the exposure-opening leg only. Leg2 hedges and
     // emergency exits bypass it — blocking an exit can only increase risk.
-    const blockReason = this.config.preExecutionGuard?.({
+    const blockReason = !operation.submitted && this.config.preExecutionGuard?.({
       strategy: 'dipArb',
       side: 'BUY',
       usdcAmount: signal.shares * signal.targetPrice,
       marketKey: market.conditionId,
     });
     if (blockReason) {
-      this.isExecuting = false;
+
       return {
         success: false,
         leg: 'leg1',
@@ -930,7 +1053,7 @@ export class DipArbService extends EventEmitter {
 
     try {
       if (guard && signal.roundId !== round.roundId) throw new InventoryAdmissionRefusal('Stale round signal');
-      this.isExecuting = true;  // Also set here for manual mode (when not called from handleSignal)
+
 
       // 计算拆分订单参数
       const splitCount = Math.max(1, this.config.splitOrders);
@@ -963,69 +1086,33 @@ export class DipArbService extends EventEmitter {
       const sharesPerOrder = adjustedShares / splitCount;
       const amountPerOrder = sharesPerOrder * signal.targetPrice;
 
-      let totalSharesFilled = 0;
-      let totalAmountSpent = 0;
-      let lastOrderId: string | undefined;
-      let failedOrders = 0;
-      let inventoryInterruption: DipArbInventoryDiagnostic['inventoryInterruption'];
-
-      // 执行多笔订单
-      for (let i = 0; i < splitCount; i++) {
-        // Price protection (PROBLEMS.md #2): send the worst acceptable price
-        // so the venue rejects fills beyond max slippage instead of sweeping.
-        const orderParams: MarketOrderParams = {
-          tokenId: signal.tokenId,
-          side: 'BUY' as Side,
-          amount: amountPerOrder,
-          price: signal.targetPrice,
-          orderType: 'FOK',
-        };
-
-        if (this.config.debug && splitCount > 1) {
-          this.log(`Leg1 order ${i + 1}/${splitCount}: ${sharesPerOrder.toFixed(2)} shares @ ${signal.targetPrice.toFixed(4)}`);
+      await this.submitBuyLeg(operation, { originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'LEG1', splitCount, amountPerOrder, signal.targetPrice);
+      const factual = await this.reconcileLegShares(operation);
+      const totalSharesFilled = factual.shares;
+      // Preserve the existing cost estimate; only quantity authority changes here.
+      const totalAmountSpent = totalSharesFilled * signal.targetPrice;
+      const lastOrderId = operation.orders[operation.orders.length - 1]?.orderId;
+      const failedOrders = operation.orders.filter(order => order.rejected).length;
+      const inventoryInterruption = operation.interruption;
+      const current = round === this.currentRound && originMarket === this.market &&
+        operation.scope?.round === round && operation.scope.originMarket === originMarket &&
+        operation.scope.trading === this.tradingService && operation.scope.market.upTokenId === market.upTokenId &&
+        operation.scope.market.downTokenId === market.downTokenId && operation.scope.market.conditionId === market.conditionId;
+      const ready = current && factual.terminal && totalSharesFilled >= adjustedShares;
+      if (!ready) {
+        if (totalSharesFilled > 0) {
+          const partial = round.leg1;
+          if (partial && partial.tokenId === signal.tokenId) partial.shares = totalSharesFilled;
+          else round.leg1 = { side: signal.dipSide, price: signal.targetPrice,
+            shares: totalSharesFilled, timestamp: Date.now(), tokenId: signal.tokenId };
         }
-
-        let result: OrderResult;
-        try {
-          result = await this.submitClob({ originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'LEG1', orderParams);
-        } catch (error) {
-          if (!(error instanceof InventoryAdmissionRefusal) || totalSharesFilled <= 0) throw error;
-          // Stop acquisition, then consume the preceding fills through the normal path once.
-          inventoryInterruption = Object.freeze({ status: 'BLOCKED_INVENTORY', reason: error.message });
-          this.inventoryBlocked({}, error);
-          break;
-        }
-
-        if (result.success) {
-          totalSharesFilled += sharesPerOrder;
-          totalAmountSpent += amountPerOrder;
-          lastOrderId = result.orderId;
-        } else {
-          failedOrders++;
-          this.log(`Leg1 order ${i + 1}/${splitCount} failed: ${result.errorMsg}`);
-          // Abort remaining splits on first failure: continuing to slice a
-          // moved market guarantees an unbalanced partial fill (PROBLEMS.md #10).
-          break;
-        }
-
-        // 订单间隔
-        if (i < splitCount - 1 && this.config.orderIntervalMs > 0) {
-          await new Promise(resolve => setTimeout(resolve, this.config.orderIntervalMs));
-        }
+        return { success: false, leg: 'leg1', roundId: signal.roundId, shares: totalSharesFilled,
+          orderId: lastOrderId, ...(inventoryInterruption ? { inventoryInterruption } : {}), error: 'BUY_PENDING: factual quantity incomplete', executionTimeMs: Date.now() - startTime };
       }
 
       // 至少有一笔成功
       if (totalSharesFilled > 0) {
         const avgPrice = totalAmountSpent / totalSharesFilled;
-
-        // Reconcile estimated fills against on-chain reality (PROBLEMS.md #10).
-        const reconciledShares = await this.reconcileLegShares(totalSharesFilled, signal.dipSide, market, ctf);
-        const fillRatio = totalSharesFilled > 0 ? reconciledShares / totalSharesFilled : 1;
-        const reconciledSpent = totalAmountSpent * fillRatio;
-        if (reconciledShares < totalSharesFilled) {
-          totalSharesFilled = reconciledShares;
-          totalAmountSpent = reconciledSpent;
-        }
 
         // Record leg1 fill
         round.leg1 = {
@@ -1036,6 +1123,9 @@ export class DipArbService extends EventEmitter {
           tokenId: signal.tokenId,
         };
         round.phase = 'leg1_filled';
+        operation.result = { success: true, leg: 'leg1', roundId: signal.roundId,
+          side: signal.dipSide, price: signal.targetPrice, shares: totalSharesFilled, orderId: lastOrderId,
+          ...(inventoryInterruption ? { inventoryInterruption } : {}), executionTimeMs: Date.now() - startTime };
         this.stats.leg1Filled++;
 
         this.lastExecutionTime = Date.now();
@@ -1083,8 +1173,6 @@ export class DipArbService extends EventEmitter {
         error: error instanceof Error ? error.message : String(error),
         executionTimeMs: Date.now() - startTime,
       };
-    } finally {
-      this.isExecuting = false;
     }
   }
 
@@ -1092,6 +1180,10 @@ export class DipArbService extends EventEmitter {
    * Execute Leg2 trade
    */
   async executeLeg2(signal: DipArbLeg2Signal): Promise<DipArbExecutionResult & DipArbInventoryDiagnostic> {
+    return this.executeBuyLeg('leg2', signal);
+  }
+
+  private async executeLeg2Attempt(signal: DipArbLeg2Signal, operation: BuyExecution): Promise<DipArbExecutionResult & DipArbInventoryDiagnostic> {
     const originMarket = this.market, round = this.currentRound, trading = this.tradingService, ctf = this.ctf;
     const guard = this.inventoryAdmissionGuard, running = this.isRunning, invocation = Symbol();
     const market = guard && originMarket ? { ...originMarket } : originMarket;
@@ -1100,7 +1192,7 @@ export class DipArbService extends EventEmitter {
     const startTime = Date.now();
 
     if (!trading || !market || !round) {
-      this.isExecuting = false;  // Reset in case handleSignal() set it
+
       return {
         success: false,
         leg: 'leg2',
@@ -1112,7 +1204,7 @@ export class DipArbService extends EventEmitter {
 
     try {
       if (guard && signal.roundId !== round.roundId) throw new InventoryAdmissionRefusal('Stale round signal');
-      this.isExecuting = true;  // Also set here for manual mode (when not called from handleSignal)
+
 
       // 计算拆分订单参数
       const splitCount = Math.max(1, this.config.splitOrders);
@@ -1128,79 +1220,32 @@ export class DipArbService extends EventEmitter {
       const sharesPerOrder = adjustedShares / splitCount;
       const amountPerOrder = sharesPerOrder * signal.targetPrice;
 
-      let totalSharesFilled = 0;
-      let totalAmountSpent = 0;
-      let lastOrderId: string | undefined;
-      let failedOrders = 0;
-      let inventoryInterruption: DipArbInventoryDiagnostic['inventoryInterruption'];
-
-      // 执行多笔订单
-      for (let i = 0; i < splitCount; i++) {
-        // Price protection (PROBLEMS.md #2).
-        const orderParams: MarketOrderParams = {
-          tokenId: signal.tokenId,
-          side: 'BUY' as Side,
-          amount: amountPerOrder,
-          price: signal.targetPrice,
-          orderType: 'FOK',
-        };
-
-        if (this.config.debug && splitCount > 1) {
-          this.log(`Leg2 order ${i + 1}/${splitCount}: ${sharesPerOrder.toFixed(2)} shares @ ${signal.targetPrice.toFixed(4)}`);
+      await this.submitBuyLeg(operation, { originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'LEG2', splitCount, amountPerOrder, signal.targetPrice);
+      const factual = await this.reconcileLegShares(operation);
+      const totalSharesFilled = factual.shares;
+      // Preserve the existing cost estimate; only quantity authority changes here.
+      const totalAmountSpent = totalSharesFilled * signal.targetPrice;
+      const lastOrderId = operation.orders[operation.orders.length - 1]?.orderId;
+      const failedOrders = operation.orders.filter(order => order.rejected).length;
+      const inventoryInterruption = operation.interruption;
+      const current = round === this.currentRound && originMarket === this.market &&
+        operation.scope?.round === round && operation.scope.originMarket === originMarket &&
+        operation.scope.trading === this.tradingService && operation.scope.market.upTokenId === market.upTokenId &&
+        operation.scope.market.downTokenId === market.downTokenId && operation.scope.market.conditionId === market.conditionId;
+      const ready = current && factual.terminal && totalSharesFilled >= adjustedShares && totalSharesFilled === round.leg1?.shares;
+      if (!ready) {
+        if (totalSharesFilled > 0) {
+          const partial = round.leg2;
+          if (partial && partial.tokenId === signal.tokenId) partial.shares = totalSharesFilled;
+          else round.leg2 = { side: signal.hedgeSide, price: signal.targetPrice,
+            shares: totalSharesFilled, timestamp: Date.now(), tokenId: signal.tokenId };
         }
-
-        let result: OrderResult;
-        try {
-          result = await this.submitClob({ originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'LEG2', orderParams);
-        } catch (error) {
-          if (!(error instanceof InventoryAdmissionRefusal) || totalSharesFilled <= 0) throw error;
-          // Stop acquisition, then consume the preceding fills through the normal path once.
-          inventoryInterruption = Object.freeze({ status: 'BLOCKED_INVENTORY', reason: error.message });
-          this.inventoryBlocked({}, error);
-          break;
-        }
-
-        if (result.success) {
-          totalSharesFilled += sharesPerOrder;
-          totalAmountSpent += amountPerOrder;
-          lastOrderId = result.orderId;
-        } else {
-          failedOrders++;
-          this.log(`Leg2 order ${i + 1}/${splitCount} failed: ${result.errorMsg}`);
-          // Abort remaining splits on first failure to bound the UP/DOWN
-          // mismatch instead of slicing a moved market (PROBLEMS.md #10).
-          break;
-        }
-
-        // 订单间隔
-        if (i < splitCount - 1 && this.config.orderIntervalMs > 0) {
-          await new Promise(resolve => setTimeout(resolve, this.config.orderIntervalMs));
-        }
+        return { success: false, leg: 'leg2', roundId: signal.roundId, shares: totalSharesFilled,
+          orderId: lastOrderId, ...(inventoryInterruption ? { inventoryInterruption } : {}), error: 'BUY_PENDING: factual quantity incomplete', executionTimeMs: Date.now() - startTime };
       }
 
       // 至少有一笔成功
       if (totalSharesFilled > 0) {
-        // Reconcile estimated fills against on-chain reality, then clamp the
-        // hedge to the ACTUAL Leg1 size so the pair stays 1:1 (PROBLEMS.md #10).
-        // Leg2 must never exceed what Leg1 really holds.
-        const leg1Actual = round.leg1?.shares ?? totalSharesFilled;
-        const reconciledLeg2 = await this.reconcileLegShares(totalSharesFilled, signal.hedgeSide, market, ctf);
-        const effectiveLeg2 = Math.min(reconciledLeg2, leg1Actual);
-        if (effectiveLeg2 < totalSharesFilled) {
-          const ratio = effectiveLeg2 / totalSharesFilled;
-          this.log(`⚠️ Hedge clamped: leg2 ${totalSharesFilled.toFixed(2)} → ${effectiveLeg2.toFixed(2)} to match leg1 ${leg1Actual.toFixed(2)} (1:1)`);
-          totalAmountSpent *= ratio;
-          totalSharesFilled = effectiveLeg2;
-        }
-        if (totalSharesFilled <= 0) {
-          return {
-            success: false,
-            leg: 'leg2',
-            roundId: signal.roundId,
-            error: 'Reconciled leg2 shares are zero - hedge aborted to preserve 1:1',
-            executionTimeMs: Date.now() - startTime,
-          };
-        }
         const avgPrice = totalAmountSpent / totalSharesFilled;
         const leg1Price = round.leg1?.price || 0;
         const actualTotalCost = leg1Price + avgPrice;
@@ -1214,6 +1259,9 @@ export class DipArbService extends EventEmitter {
           tokenId: signal.tokenId,
         };
         round.phase = 'completed';
+        operation.result = { success: true, leg: 'leg2', roundId: signal.roundId,
+          side: signal.hedgeSide, price: signal.targetPrice, shares: totalSharesFilled, orderId: lastOrderId,
+          ...(inventoryInterruption ? { inventoryInterruption } : {}), executionTimeMs: Date.now() - startTime };
         round.totalCost = actualTotalCost;
         // AUDIT #3: book NET profit (taker fee on both legs' notional comes
         // out of the $1 payout — same as the fee-aware entry gates above and
@@ -1299,8 +1347,6 @@ export class DipArbService extends EventEmitter {
         error: error instanceof Error ? error.message : String(error),
         executionTimeMs: Date.now() - startTime,
       };
-    } finally {
-      this.isExecuting = false;
     }
   }
 
@@ -1420,6 +1466,17 @@ export class DipArbService extends EventEmitter {
 
     // Log orderbook summary at intervals
     this.maybeLogOrderbookSummary();
+
+    // Service accepted BUYs even when the original signal no longer exists.
+    // A pending operation blocks normal phase processing, never resubmits.
+    const buys = this.currentRound && this.buyExecutions.get(this.currentRound);
+    const kind = buys?.leg1?.submitted && !buys.leg1.result ? 'leg1'
+      : buys?.leg2?.submitted && !buys.leg2.result ? 'leg2' : undefined;
+    if (kind && buys) {
+      const pending = buys[kind]!;
+      if (!pending.flight) void this.executeBuyLeg(kind, pending.signal, true).catch(error => this.emit('error', error));
+      return;
+    }
 
     // Check if we need to start a new round (async but fire-and-forget to not block orderbook updates)
     this.checkAndStartNewRound().catch(err => {
@@ -2118,38 +2175,41 @@ export class DipArbService extends EventEmitter {
 
     // CRITICAL: Set isExecuting immediately to prevent duplicate signals from being processed
     // This must happen before any async operations or emit() calls
-    this.isExecuting = true;
-
-    // Will execute - now emit signal and log
-    this.stats.signalsDetected++;
-    this.emit('signal', signal);
 
 
-    if (this.config.debug) {
-      const signalType = isDipArbLeg1Signal(signal) ? 'Leg1' : 'Leg2';
+    const owner = Symbol();
+    this.executionOwners.add(owner);
+    try {
+      // Will execute - now emit signal and log
+      this.stats.signalsDetected++;
+      this.emit('signal', signal);
 
-      // Log orderbook context before execution (last 5 seconds of data)
-      this.logOrderbookContext(`${signalType} Signal`);
+
+      if (this.config.debug) {
+        const signalType = isDipArbLeg1Signal(signal) ? 'Leg1' : 'Leg2';
+
+        // Log orderbook context before execution (last 5 seconds of data)
+        this.logOrderbookContext(`${signalType} Signal`);
+
+        if (isDipArbLeg1Signal(signal)) {
+          this.log(`🎯 Signal: Leg1 ${signal.dipSide} @ ${signal.currentPrice.toFixed(4)} (${signal.source})`);
+          this.log(`   Target: ${signal.targetPrice.toFixed(4)} | Opposite: ${signal.oppositeAsk.toFixed(4)} | Est.Cost: ${signal.estimatedTotalCost.toFixed(4)}`);
+        } else {
+          this.log(`🎯 Signal: Leg2 ${signal.hedgeSide} @ ${signal.currentPrice.toFixed(4)}`);
+          this.log(`   Target: ${signal.targetPrice.toFixed(4)} | TotalCost: ${signal.totalCost.toFixed(4)} | Profit: ${(signal.expectedProfitRate * 100).toFixed(2)}%`);
+        }
+      }
+
+      // Execute
+      let result: DipArbExecutionResult;
 
       if (isDipArbLeg1Signal(signal)) {
-        this.log(`🎯 Signal: Leg1 ${signal.dipSide} @ ${signal.currentPrice.toFixed(4)} (${signal.source})`);
-        this.log(`   Target: ${signal.targetPrice.toFixed(4)} | Opposite: ${signal.oppositeAsk.toFixed(4)} | Est.Cost: ${signal.estimatedTotalCost.toFixed(4)}`);
+        result = await this.executeBuyLeg('leg1', signal, true);
       } else {
-        this.log(`🎯 Signal: Leg2 ${signal.hedgeSide} @ ${signal.currentPrice.toFixed(4)}`);
-        this.log(`   Target: ${signal.targetPrice.toFixed(4)} | TotalCost: ${signal.totalCost.toFixed(4)} | Profit: ${(signal.expectedProfitRate * 100).toFixed(2)}%`);
+        result = await this.executeBuyLeg('leg2', signal, true);
       }
-    }
 
-    // Execute
-    let result: DipArbExecutionResult;
-
-    if (isDipArbLeg1Signal(signal)) {
-      result = await this.executeLeg1(signal);
-    } else {
-      result = await this.executeLeg2(signal);
-    }
-
-    if (!isInventoryRefusal(result)) this.emit('execution', result);
+    } finally { this.executionOwners.delete(owner); }
   }
 
   // ===== Public API: Auto-Rotate =====

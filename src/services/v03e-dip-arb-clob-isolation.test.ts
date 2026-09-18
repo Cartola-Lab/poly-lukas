@@ -5,9 +5,16 @@ const accepted = (orderId = 'order') => ({ success: true, submissionState: 'ACCE
 function deferred() { let resolve!: (v: any) => void; const promise = new Promise<any>(r => { resolve = r; }); return { promise, resolve }; }
 function fixture(existing = false, isolation = true) {
   let n=0;
+  const factualBuy = (id: string) => {
+    const submissions = trading.createMarketOrder.mock.calls;
+    const index = trading.createMarketOrder.mock.results.findIndex((_: unknown, i: number) => id === `order-${i + 1}`);
+    const params = submissions[index >= 0 ? index : 0]?.[0] as any;
+    return { token: params?.tokenId ?? 'up', size: String(params?.side === 'SELL' ? params.amount : (params?.amount ?? 4) / (params?.price ?? .4)) };
+  };
   const trading = { getAddress: vi.fn(() => wallet), createMarketOrder: vi.fn().mockImplementation(async () => accepted(`order-${++n}`)),
-    getOrderFillDetails: vi.fn(async (id: string) => ({ tradeIds: [id], sizeMatched: '10' })),
-    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => ({ id, status:'MINED', transactionHash:'tx', size:'10' }))) };
+    getOrderFillDetails: vi.fn(async (id: string): Promise<any> => ({ id, asset_id: factualBuy(id).token, side: 'BUY', tradeIds: [id], sizeMatched: factualBuy(id).size })),
+    getTradeStatuses: vi.fn(async (ids: string[]): Promise<any[]> => ids.map(id => ({ id, status:'MINED', transactionHash:'0x'+'12'.repeat(32), size:factualBuy(id).size,
+      asset_id:factualBuy(id).token, side:'BUY', taker_order_id:id, trader_side:'TAKER', maker_orders:[] }))) };
   const ctf = { getAddress: () => wallet, getPositionBalanceByTokenIds: vi.fn().mockResolvedValue({yesBalance:'10',noBalance:'10'}) };
   const service = new DipArbService({} as any,trading as any,{} as any);
   const round: any = {roundId:'r1',phase:existing?'leg1_filled':'waiting',startTime:Date.now(),
@@ -122,7 +129,8 @@ describe('DipArb CLOB inventory isolation',()=>{
     const h=fixture(),response=deferred();h.trading.createMarketOrder.mockReturnValueOnce(response.promise);const pending=h.leg1();
     const replacement={roundId:'new',phase:'waiting'};Object.assign(h.service,{currentRound:replacement,market:{...h.market,upTokenId:'other'}});
     response.resolve(accepted());await pending;expect(h.round.leg1.tokenId).toBe('up');expect(replacement).not.toHaveProperty('leg1');expect(h.protection()).toBeDefined();
-    expect(h.ctf.getPositionBalanceByTokenIds.mock.calls[0][1]).toEqual({yesTokenId:'up',noTokenId:'down'});
+    expect(h.trading.getOrderFillDetails).toHaveBeenCalledWith('order');
+    expect(h.ctf.getPositionBalanceByTokenIds).not.toHaveBeenCalled();
   });
   it('handleSignal suppresses economic execution event on inventory refusal',async()=>{
     const h=fixture();h.guard.mockReturnValue('blocked');await h.service['handleSignal'](h.signal);
@@ -207,7 +215,7 @@ describe('DipArb CLOB inventory isolation',()=>{
     const result = await h[method]();
     const key = method === 'leg1' ? 'leg1' : 'leg2';
     const token = method === 'leg1' ? 'up' : 'down';
-    expect(result).toMatchObject({ success: true, roundId: 'r1', shares: 5,
+    expect(result).toMatchObject({ success: false, roundId: 'r1', shares: 5,
       inventoryInterruption: { status: 'BLOCKED_INVENTORY', reason: 'SHORT_PROTECTED' } });
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(1);
     expect(h.trading.createMarketOrder).toHaveBeenCalledWith(expect.objectContaining({
@@ -220,14 +228,14 @@ describe('DipArb CLOB inventory isolation',()=>{
     expect(economicStats(h.service)).toEqual(economicStats(control.service));
     expect(h.round.profit).toBe(control.round.profit);
     expect(h.round.totalCost).toBe(control.round.totalCost);
-    expect(h.events.roundComplete).toHaveBeenCalledTimes(method === 'leg2' ? 1 : 0);
+    expect(h.events.roundComplete).toHaveBeenCalledTimes(0);
     expect(h.events.inventoryBlocked).toHaveBeenCalledTimes(1);
     const stats = economicStats(h.service), position = h.round[key];
     await h[method](); // A new invocation must not acquire or book the same position again.
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(1);
     expect(h.round[key]).toBe(position);
     expect(economicStats(h.service)).toEqual(stats);
-    expect(h.events.roundComplete).toHaveBeenCalledTimes(method === 'leg2' ? 1 : 0);
+    expect(h.events.roundComplete).toHaveBeenCalledTimes(0);
   });
 
   it('accepted split followed by admission block remains accessible to emergency exit', async () => {
@@ -236,9 +244,8 @@ describe('DipArb CLOB inventory isolation',()=>{
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '5', noBalance: '0' });
     h.guard.mockReturnValueOnce(undefined).mockReturnValueOnce('SHORT_PROTECTED');
     await h.service['handleSignal'](h.signal);
-    expect(h.events.execution).toHaveBeenCalledTimes(1);
-    expect(h.events.execution).toHaveBeenCalledWith(expect.objectContaining({ success: true, shares: 5 }));
-    expect(h.round.phase).toBe('leg1_filled');
+    expect(h.events.execution).not.toHaveBeenCalled(); // Partial BUY is not a terminal execution.
+    expect(h.round.phase).toBe('waiting');
     const result = await h.exit();
     expect(result).not.toBeNull();
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(2);
@@ -270,9 +277,9 @@ describe('DipArb CLOB inventory isolation',()=>{
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '5', noBalance: '0' });
     h.trading.createMarketOrder.mockResolvedValueOnce(accepted('first'))
       .mockResolvedValueOnce({ success: false, submissionState });
-    expect(await h.leg1()).toMatchObject({ success: true, shares: 5 });
+    expect(await h.leg1()).toMatchObject({ success: false, shares: 5 });
     expect(h.round.leg1).toMatchObject({ tokenId: 'up', shares: 5, price: .4 });
-    expect(h.service.getStats().leg1Filled).toBe(1);
+    expect(h.service.getStats().leg1Filled).toBe(0);
     expect(h.protection()).toBeDefined();
   });
 
@@ -285,7 +292,7 @@ describe('DipArb CLOB inventory isolation',()=>{
       Object.assign(h.service, { currentRound: replacement });
       return undefined;
     });
-    expect(await h.leg1()).toMatchObject({ success: true, roundId: 'r1', shares: 5 });
+    expect(await h.leg1()).toMatchObject({ success: false, roundId: 'r1', shares: 5 });
     expect(h.round.leg1).toMatchObject({ shares: 5, tokenId: 'up' });
     expect(replacement).not.toHaveProperty('leg1');
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(1);
@@ -364,6 +371,7 @@ describe('DipArb CLOB inventory isolation',()=>{
 
   it('UNCERTAIN without identity remains protected independently of resolved A', async () => {
     const h = fixture(); await h.leg1();
+    h.trading.getOrderFillDetails.mockClear();
     Object.assign(h.service, { currentRound: { roundId: 'B', phase: 'waiting' } });
     h.trading.createMarketOrder.mockResolvedValueOnce({ success: false, submissionState: 'UNCERTAIN' });
     await h.service.executeLeg1({ ...h.signal, roundId: 'B', tokenId: 'down', dipSide: 'DOWN' });
@@ -377,7 +385,8 @@ describe('DipArb CLOB inventory isolation',()=>{
   });
 
   it.each(['completed', 'expired'])('%s is not release authority', async phase => {
-    const h = fixture(); await h.leg1(); h.round.phase = phase;
+    const h = fixture(); await h.leg1();
+    h.trading.getOrderFillDetails.mockClear(); h.round.phase = phase;
     h.trading.getOrderFillDetails.mockResolvedValue({ tradeIds: [], sizeMatched: '10' });
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '0', noBalance: '0' });
     await h.service['checkAndStartNewRound']();
@@ -389,6 +398,7 @@ describe('DipArb CLOB inventory isolation',()=>{
 
   it('concurrent passes and emergency proof share cleanup without accounting replay', async () => {
     const h = fixture(); await h.leg1();
+    h.trading.getOrderFillDetails.mockClear();
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '0', noBalance: '0' });
     const facts = deferred(); h.trading.getOrderFillDetails.mockReturnValueOnce(facts.promise);
     const first = h.service['reconcileProtectedClobLifecycles']();

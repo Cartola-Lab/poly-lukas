@@ -196,6 +196,9 @@ describe.each([false, true])('P0.3f factual SELL settlement (guard=%s)', guard =
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '0', noBalance: '10' });
     const pending = h.sell();
     await started;
+    h.trading.createMarketOrder.mockResolvedValueOnce({ success: true, submissionState: 'ACCEPTED', orderId: 'buy-down', tradeIds: ['buy-fill'] });
+    h.trading.getOrderFillDetails.mockResolvedValueOnce({ id: 'buy-down', asset_id: 'down', side: 'BUY', tradeIds: ['buy-fill'], sizeMatched: '10' });
+    h.trading.getTradeStatuses.mockResolvedValueOnce([{ ...fill('buy-fill'), asset_id: 'down', side: 'BUY', taker_order_id: 'buy-down' }]);
     const bought = await h.service.executeLeg2({ type: 'leg2', roundId: 'r', hedgeSide: 'DOWN',
       tokenId: 'down', shares: 10, targetPrice: .5, currentPrice: .5, source: 'test' } as any);
     expect(bought.success).toBe(true); expect(h.round.leg2.shares).toBe(10);
