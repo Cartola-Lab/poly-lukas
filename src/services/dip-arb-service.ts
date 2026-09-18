@@ -1669,15 +1669,19 @@ export class DipArbService extends EventEmitter {
 
         // Try to sell Leg1 position
         const expiringRound = this.currentRound;
+        const expiringMarket = this.market;
         const exitResult = await this.emergencyExitLeg1();
         if (isInventoryRefusal(exitResult)) return;
 
-        if (exitResult?.success) {
-          expiringRound.phase = 'expired';
-          this.stats.roundsExpired++;
-          this.stats.roundsCompleted++;
-        }
-        // On !success: phase stays 'leg1_filled', retry on next signal.
+        // Only the captured round's factual terminal exit can complete it.
+        // Keep pending/failure reconciliable, and claim terminality before emitting
+        // so concurrent checks and throwing/reentrant listeners cannot replay it.
+        if (!exitResult?.success || exitResult.sellState !== 'COMPLETE' || exitResult.residual !== 0 ||
+            this.currentRound !== expiringRound || this.market !== expiringMarket ||
+            expiringRound.leg1 !== leg1 || expiringRound.phase !== 'leg1_filled') return;
+        expiringRound.phase = 'expired';
+        this.stats.roundsExpired++;
+        this.stats.roundsCompleted++;
 
         const result: DipArbRoundResult = {
           roundId: expiringRound.roundId,
