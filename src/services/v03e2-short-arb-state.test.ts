@@ -10,17 +10,20 @@ function fixture(a = 'SUCCESS', b = 'SUCCESS', sizeA = '4.25', sizeB = '4.25') {
   const child = (id: string, status: string, size: string): TradeStatus => ({
     id, status: status === 'SUCCESS' ? 'MINED' : status,
     size, price: id === 'a' ? '0.4' : '0.7',
-    transactionHash: status === 'SUCCESS' ? `tx-${id}` : undefined,
+    transactionHash: status === 'SUCCESS' ? '0x' + (id === 'a' ? '11' : '22').repeat(32) : undefined,
   });
   const trades: Record<string, TradeStatus> = { a: child('a', a, sizeA), b: child('b', b, sizeB) };
   const trading = {
-    getOrderFillDetails: vi.fn(async (id: string) => ({ tradeIds: [id], sizeMatched: trades[id].size! })),
-    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => trades[id])),
+    getOrderFillDetails: vi.fn(async (id: string) => ({ id, asset_id: ({a:'yes',b:'no',c:'x',d:'y'} as Record<string,string>)[id], side: 'SELL', status: 'MATCHED', tradeEnumerationPresent: true, tradeIds: [id], sizeMatched: trades[id].size! })),
+    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => ({ asset_id: ({a:'yes',b:'no',c:'x',d:'y'} as Record<string,string>)[id], side: 'SELL' as const, taker_order_id:id, trader_side:'TAKER' as const, maker_orders:[], ...trades[id] }))),
   };
   Object.assign(service, { tradingService: trading });
   const pending: Pending = { consumed: false, id: 'op', conditionId: 'market',
-    legA: { tokenId: 'yes', orderId: 'a', submission: 'SUBMITTED' },
-    legB: { tokenId: 'no', orderId: 'b', submission: 'SUBMITTED' } };
+    legA: { tokenId: 'yes', requestedShares: sizeA, orderId: 'a', submission: 'SUBMITTED' },
+    legB: { tokenId: 'no', requestedShares: sizeB, orderId: 'b', submission: 'SUBMITTED' } };
+  // State-machine tests inject already-established terminal failures; raw FAILED trades are covered by P0.3k.1.
+  if (a === 'FAILED') pending.legA.settlement = {state:'TERMINAL_FAILED'};
+  if (b === 'FAILED') pending.legB.settlement = {state:'TERMINAL_FAILED'};
   service['pendingShortArbs'].set(pending.id, pending);
   return { service, pending, trades, trading, flush: () => service['flushPendingShortArbs']() };
 }
@@ -59,8 +62,8 @@ describe('P0.3e-2 short-arb session state machine', () => {
     const h = fixture(); await h.flush(); const result = h.pending.terminalResult!;
     expect(result.legA).toBe(h.pending.legA.settlement);
     expect(result.legB).toBe(h.pending.legB.settlement);
-    expect(result.legA).toMatchObject({ successShares: 4.25, weightedPrice: 0.4, txHashes: ['tx-a'] });
-    expect(result.legB).toMatchObject({ successShares: 4.25, weightedPrice: 0.7, txHashes: ['tx-b'] });
+    expect(result.legA).toMatchObject({ successShares: 4.25, weightedPrice: 0.4, txHashes: ['0x' + '11'.repeat(32)] });
+    expect(result.legB).toMatchObject({ successShares: 4.25, weightedPrice: 0.7, txHashes: ['0x' + '22'.repeat(32)] });
     expect(Object.keys(result).sort()).toEqual(['legA', 'legB', 'state']);
     for (const leg of [result.legA, result.legB]) {
       expect(leg).not.toHaveProperty('profit'); expect(leg).not.toHaveProperty('edgeVsMerge');
@@ -71,7 +74,7 @@ describe('P0.3e-2 short-arb session state machine', () => {
     const h = fixture('SUCCESS', 'MATCHED'); await h.flush(); const a = h.pending.legA.settlement;
     await h.flush(); expect(h.pending.legA.settlement).toBe(a);
     expect(h.trading.getOrderFillDetails.mock.calls.map(c => c[0])).toEqual(['a', 'b', 'b']);
-    Object.assign(h.trades.b, { status: 'MINED', transactionHash: 'tx-b' });
+    Object.assign(h.trades.b, { status: 'MINED', transactionHash: '0x' + '22'.repeat(32) });
     await h.flush(); expect(h.pending.terminalResult?.state).toBe('BALANCED_SUCCESS');
   });
   it('never recreates terminal result or queries finalized operation', async () => {
@@ -93,15 +96,15 @@ describe('P0.3e-2 short-arb session state machine', () => {
   });
   it.each(['MATCHED', 'ERROR'])('independent operation progresses despite %s operation', async mode => {
     const h = fixture('MATCHED', 'MATCHED');
-    const other: Pending = { consumed: false, id: 'other', conditionId: 'other-market', legA: { tokenId: 'x', orderId: 'c', submission: 'SUBMITTED' },
-      legB: { tokenId: 'y', orderId: 'd', submission: 'SUBMITTED' } };
-    h.trades.c = { id: 'c', status: 'MINED', size: '3', price: '0.4', transactionHash: 'tx-c' };
-    h.trades.d = { id: 'd', status: 'MINED', size: '3', price: '0.7', transactionHash: 'tx-d' };
+    const other: Pending = { consumed: false, id: 'other', conditionId: 'other-market', legA: { tokenId: 'x', requestedShares: 3, orderId: 'c', submission: 'SUBMITTED' },
+      legB: { tokenId: 'y', requestedShares: 3, orderId: 'd', submission: 'SUBMITTED' } };
+    h.trades.c = { id: 'c', status: 'MINED', size: '3', price: '0.4', transactionHash: '0x' + '33'.repeat(32) };
+    h.trades.d = { id: 'd', status: 'MINED', size: '3', price: '0.7', transactionHash: '0x' + '44'.repeat(32) };
     h.service['pendingShortArbs'].set(other.id, other);
     if (mode === 'ERROR') h.trading.getOrderFillDetails.mockRejectedValueOnce(new Error('query'));
     await h.flush(); expect(h.pending.finalized).not.toBe(true);
     expect(other.terminalResult?.state).toBe('BALANCED_SUCCESS');
-    expect(other.terminalResult?.legA).toMatchObject({ state: 'TERMINAL_SUCCESS', successUnits: 300n, txHashes: ['tx-c'] });
+    expect(other.terminalResult?.legA).toMatchObject({ state: 'TERMINAL_SUCCESS', successUnits: 300n, txHashes: ['0x' + '33'.repeat(32)] });
     expect(h.trading.getOrderFillDetails).toHaveBeenCalledWith('c');
     expect(h.trading.getOrderFillDetails).toHaveBeenCalledWith('d');
   });

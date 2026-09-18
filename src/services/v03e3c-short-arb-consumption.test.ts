@@ -22,15 +22,15 @@ function fixture() {
   services.push(service);
   const market = { name: 'original', conditionId: 'condition', yesTokenId: 'yes', noTokenId: 'no', negRisk: false };
   const trades: Record<string, TradeStatus> = {
-    a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: 'tx-a' },
-    b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: 'tx-b' },
+    a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: '0x' + '11'.repeat(32) },
+    b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: '0x' + '22'.repeat(32) },
   };
   const trading = {
     initialize: vi.fn().mockResolvedValue(undefined),
     createMarketOrder: vi.fn<TradingService['createMarketOrder']>()
       .mockResolvedValueOnce(accepted('a')).mockResolvedValueOnce(accepted('b')),
-    getOrderFillDetails: vi.fn(async (id: string) => ({ tradeIds: [id], sizeMatched: trades[id].size! })),
-    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => trades[id])),
+    getOrderFillDetails: vi.fn(async (id: string) => ({ id, asset_id: ({a:'yes',b:'no',c:'x',d:'y'} as Record<string,string>)[id], side: 'SELL', status: 'MATCHED', tradeEnumerationPresent: true, tradeIds: [id], sizeMatched: trades[id].size! })),
+    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => ({ asset_id: ({a:'yes',b:'no',c:'x',d:'y'} as Record<string,string>)[id], side: 'SELL' as const, taker_order_id:id, trader_side:'TAKER' as const, maker_orders:[], ...trades[id] }))),
   };
   const ctf = {
     getAddress: vi.fn().mockReturnValue('wallet'),
@@ -84,6 +84,10 @@ async function terminal(a = 'SUCCESS', b = 'SUCCESS', sizeB = '10') {
   h.trades.b.size = sizeB;
   const ack = await submit(h);
   const record = h.pending.get(ack.operationId)!;
+  // Consumer tests start from terminal facts; producer rejection of FAILED/partial evidence is covered by P0.3k.1.
+  record.legB.requestedShares = Number(sizeB);
+  if (a === 'FAILED') record.legA.settlement = {state:'TERMINAL_FAILED'};
+  if (b === 'FAILED') record.legB.settlement = {state:'TERMINAL_FAILED'};
   await h.flush();
   return { ...h, record };
 }
@@ -176,7 +180,7 @@ describe('P0.3e-3c factual terminal consumption', () => {
     expect(Object.isFrozen(payload.legA.txHashes)).toBe(true);
     expect(()=>{payload.legA.txHashes.push('bad');}).toThrow();
     expect(()=>{payload.legA.weightedPrice=9;}).toThrow();
-    consume(h); expect(fact).toMatchObject({weightedPrice:0.6,txHashes:['tx-a']});
+    consume(h); expect(fact).toMatchObject({weightedPrice:0.6,txHashes:['0x' + '11'.repeat(32)]});
   });
 
   it.each(['classification','units','price','hashes','missing','submission','id'])('retains inconsistent %s and continues valid records', async kind => {
@@ -204,10 +208,10 @@ describe('P0.3e-3c factual terminal consumption', () => {
     h.ctf.getPusdBalance.mockRejectedValueOnce(Error('refresh'));
     const event=vi.fn(); h.service.on('shortArbSettled',event);
     await vi.advanceTimersByTimeAsync(30000);
-    expect(record.consumed).toBe(state==='FAILED');
-    expect(h.pending.size).toBe(state==='FAILED'?0:1);
+    expect(record.consumed).toBe(false);
+    expect(h.pending.size).toBe(1);
     await vi.advanceTimersByTimeAsync(30000);
-    expect(record.consumed).toBe(true); expect(event).toHaveBeenCalledTimes(1);
+    expect(record.consumed).toBe(state==='SUCCESS'); expect(event).toHaveBeenCalledTimes(state==='SUCCESS'?1:0);
     expect(vi.getTimerCount()).toBe(1); expect(h.recovery).not.toHaveBeenCalled();
   });
 
@@ -227,7 +231,7 @@ describe('P0.3e-3c factual terminal consumption', () => {
     const fact=h.record.terminalResult!.legA;
     const event=vi.fn(payload=>{payload.legA.txHashes.push('injected');});
     h.service.on('shortArbSettled',event); consume(h);
-    expect(event).toHaveBeenCalledTimes(1);expect(fact).toMatchObject({txHashes:['tx-a']});
+    expect(event).toHaveBeenCalledTimes(1);expect(fact).toMatchObject({txHashes:['0x' + '11'.repeat(32)]});
     expect(h.pending.size).toBe(0);expect(h.record.consumed).toBe(true);
   });
 

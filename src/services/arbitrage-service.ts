@@ -284,6 +284,9 @@ type SellLegSettlement =
 
 type PendingShortLeg = {
   tokenId: string;
+  requestedShares?: number | string;
+  tradeIds?: Set<string>;
+  facts?: Map<string, string>;
   orderId?: string;
   submission: 'NOT_SUBMITTED' | 'REJECTED' | 'SUBMITTED' | 'UNCERTAIN';
   settlement?: SellLegSettlement;
@@ -1847,51 +1850,75 @@ export class ArbitrageService extends EventEmitter {
     }
   }
 
-  private async reconcileSellLeg(orderId: string, includeExactUnits = false): Promise<SellLegSettlement> {
+  private async reconcileSellLeg(orderId: string, includeExactUnits = false, leg?: PendingShortLeg): Promise<SellLegSettlement> {
     if (!this.tradingService) throw new Error('Trading not configured');
+    const pending: SellLegSettlement = { state: 'PENDING' };
     const parseShares = (value: unknown): bigint => {
-      if (typeof value !== 'string' || !/^\d+(?:\.\d{1,2})?$/.test(value)) {
-        throw new Error('Invalid factual SELL shares');
-      }
+      if (typeof value !== 'string' || !/^\d+(?:\.\d{1,2})?$/.test(value)) throw new Error('Invalid factual SELL shares');
       const [whole, fraction = ''] = value.split('.');
       return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
     };
     const details = await this.tradingService.getOrderFillDetails(orderId);
-    const ids = [...new Set(details.tradeIds)];
-    if (ids.length === 0) return { state: 'PENDING' };
-    if (ids.some(id => typeof id !== 'string' || !id.trim())) throw new Error('Invalid SELL trade ID');
+    if (!leg || details.id !== orderId || details.asset_id !== leg.tokenId || details.side !== 'SELL' ||
+        !Array.isArray(details.tradeIds)) return pending;
+    const known = leg.tradeIds ??= new Set<string>();
+    for (const id of details.tradeIds) known.add(id);
+    const ids = [...known];
+    if (!ids.length || ids.some(id => typeof id !== 'string' || !id.trim() || !details.tradeIds.includes(id))) return pending;
     const matched = parseShares(details.sizeMatched);
     const trades = await this.tradingService.getTradeStatuses(ids);
     if (trades.length !== ids.length || new Set(trades.map(t => t.id)).size !== ids.length ||
-        trades.some(t => !ids.includes(t.id))) return { state: 'PENDING' };
-    if (trades.some(t => t.status === 'UNKNOWN' || t.size === undefined)) return { state: 'PENDING' };
-    const sizes = trades.map(t => parseShares(t.size));
-    const total = sizes.reduce((sum, size) => sum + size, 0n);
-    if (total < matched) return { state: 'PENDING' };
-    if (total > matched) throw new Error('SELL child sizes exceed sizeMatched');
-    const success = trades.map(t => typeof t.transactionHash === 'string' && t.transactionHash.trim().length > 0);
-    if (trades.some((t, i) => !success[i] && t.status !== 'FAILED')) return { state: 'PENDING' };
-    if (!success.some(Boolean)) return { state: 'TERMINAL_FAILED' };
-
-    // Completeness is proven in integer units before converting economic totals.
-    let units = 0n;
-    let notional = 0;
+        trades.some(t => !known.has(t.id))) return pending;
+    const facts = leg.facts ??= new Map<string, string>();
+    let units = 0n, notional = 0, complete = true;
     const txHashes = new Set<string>();
-    for (let i = 0; i < trades.length; i++) {
-      if (!success[i]) continue;
-      const rawPrice = trades[i].price;
+    for (const trade of trades) {
+      // Same factual authority as the frozen BUY/SELL paths: local allocation,
+      // confirmed status AND transaction identity. Invalid siblings never complete a leg.
+      if (!Array.isArray(trade.maker_orders) || !trade.taker_order_id) { complete = false; continue; }
+      const makers = trade.maker_orders.filter(m => m.order_id === orderId);
+      let size: string | undefined, rawPrice: string | undefined;
+      if (trade.taker_order_id === orderId) {
+        if (trade.trader_side !== 'TAKER' || makers.length || trade.asset_id !== leg.tokenId || trade.side !== 'SELL') {
+          complete = false; continue;
+        }
+        size = trade.size; rawPrice = trade.price;
+      } else {
+        const maker = makers[0];
+        if (trade.trader_side !== 'MAKER' || makers.length !== 1 || maker.asset_id !== leg.tokenId ||
+            (maker.side !== undefined && maker.side !== 'SELL') || !trade.asset_id ||
+            !['BUY', 'SELL'].includes(trade.side ?? '') || (trade.asset_id === leg.tokenId && trade.side !== 'BUY')) {
+          complete = false; continue;
+        }
+        size = maker.matched_amount; rawPrice = maker.price;
+        if (parseShares(size) > parseShares(trade.size)) { complete = false; continue; }
+      }
+      if (!['MINED', 'CONFIRMED'].includes(trade.status) ||
+          typeof trade.transactionHash !== 'string' || !/^0x[0-9a-f]{64}$/i.test(trade.transactionHash)) {
+        complete = false; continue;
+      }
+      if (size === undefined) { complete = false; continue; }
+      const quantity = parseShares(size);
       const price = typeof rawPrice === 'string' && /^\d+(?:\.\d+)?$/.test(rawPrice) ? Number(rawPrice) : NaN;
-      if (!Number.isFinite(price) || price <= 0 || sizes[i] <= 0n) throw new Error('Invalid successful SELL facts');
-      units += sizes[i];
-      if (units > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('SELL shares exceed safe economic precision');
-      notional += Number(sizes[i]) / 100 * price;
-      txHashes.add(trades[i].transactionHash!.trim());
+      if (quantity <= 0n || !Number.isFinite(price) || price <= 0 || price > 1) throw new Error('Invalid successful SELL facts');
+      const hash = trade.transactionHash.toLowerCase();
+      const fingerprint = JSON.stringify([leg.tokenId, 'SELL', trade.trader_side, trade.taker_order_id, quantity.toString(), rawPrice, hash]);
+      const prior = facts.get(trade.id);
+      if (prior !== undefined && prior !== fingerprint) { complete = false; continue; }
+      facts.set(trade.id, fingerprint);
+      units += quantity;
+      notional += Number(quantity) / 100 * price;
+      txHashes.add(hash);
     }
-    const successShares = Number(units) / 100;
-    const weightedPrice = notional / successShares;
-    if (!Number.isFinite(notional) || !Number.isFinite(weightedPrice) || weightedPrice <= 0) {
-      throw new Error('Invalid SELL settlement totals');
-    }
+    if (!complete || units === 0n) return pending;
+    if (units > matched) throw new Error('SELL child sizes exceed sizeMatched');
+    if (units !== matched || !['MATCHED', 'CANCELED'].includes(details.status ?? '') || details.tradeEnumerationPresent !== true) return pending;
+    // FOK plus the full submitted share quantity and resolved children closes this leg.
+    // A partial canceled order remains conservative; no recovery is inferred.
+    if (leg.requestedShares === undefined || units !== parseShares(String(leg.requestedShares))) return pending;
+    if (units > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('SELL shares exceed safe economic precision');
+    const successShares = Number(units) / 100, weightedPrice = notional / successShares;
+    if (!Number.isFinite(notional) || !Number.isFinite(weightedPrice)) throw new Error('Invalid SELL settlement totals');
     return { state: 'TERMINAL_SUCCESS', successShares, weightedPrice, txHashes: [...txHashes],
       ...(includeExactUnits ? { successUnits: units } : {}) };
   }
@@ -1909,7 +1936,7 @@ export class ArbitrageService extends EventEmitter {
       if (leg.submission === 'NOT_SUBMITTED' || leg.submission === 'UNCERTAIN') continue;
       if (!leg.orderId?.trim()) throw new Error('Submitted short-arb leg has no orderId');
       if (!leg.settlement || leg.settlement.state === 'PENDING') {
-        leg.settlement = await this.reconcileSellLeg(leg.orderId, true);
+        leg.settlement = await this.reconcileSellLeg(leg.orderId, true, leg);
       }
       if (leg.settlement.state !== 'PENDING') facts.push(leg.settlement);
     }
@@ -2048,8 +2075,8 @@ export class ArbitrageService extends EventEmitter {
     }
 
     const pending: PendingShortArb = { id: operationId, conditionId: market.conditionId,
-      legA: { tokenId: market.yesTokenId, submission: 'NOT_SUBMITTED' },
-      legB: { tokenId: market.noTokenId, submission: 'NOT_SUBMITTED' }, finalized: false, consumed: false };
+      legA: { tokenId: market.yesTokenId, requestedShares: size, submission: 'NOT_SUBMITTED' },
+      legB: { tokenId: market.noTokenId, requestedShares: size, submission: 'NOT_SUBMITTED' }, finalized: false, consumed: false };
     this.pendingShortArbs.set(operationId, pending);
     const legs = [pending.legA, pending.legB];
     for (let i = 0; i < legs.length; i++) {
@@ -2070,6 +2097,7 @@ export class ArbitrageService extends EventEmitter {
           return ack('SUBMITTED_PENDING');
         }
         if (result.submissionState !== 'ACCEPTED' || !orderId) return ack('SUBMISSION_UNCERTAIN');
+        leg.tradeIds = new Set(result.tradeIds ?? []);
         leg.submission = 'SUBMITTED';
       } catch {
         return ack('SUBMISSION_UNCERTAIN');

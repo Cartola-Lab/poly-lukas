@@ -21,15 +21,15 @@ function fixture() {
   services.push(service);
   const market = { name: 'original', conditionId: 'condition', yesTokenId: 'yes', noTokenId: 'no', negRisk: false };
   const trades: Record<string, TradeStatus> = {
-    a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: 'tx-a' },
-    b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: 'tx-b' },
+    a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: '0x' + '11'.repeat(32) },
+    b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: '0x' + '22'.repeat(32) },
   };
   const trading = {
     initialize: vi.fn().mockResolvedValue(undefined),
     createMarketOrder: vi.fn<TradingService['createMarketOrder']>()
       .mockResolvedValueOnce(accepted('a')).mockResolvedValueOnce(accepted('b')),
-    getOrderFillDetails: vi.fn(async (id: string) => ({ tradeIds: [id], sizeMatched: trades[id].size! })),
-    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => trades[id])),
+    getOrderFillDetails: vi.fn(async (id: string) => ({ id, asset_id: id === 'a' ? 'yes' : 'no', side: 'SELL', status: 'MATCHED', tradeEnumerationPresent: true, tradeIds: [id], sizeMatched: trades[id].size! })),
+    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => ({ ...trades[id], asset_id: id === 'a' ? 'yes' : 'no', side: 'SELL', trader_side: 'TAKER', taker_order_id: id, maker_orders: [] }))),
   };
   const ctf = {
     getAddress: vi.fn().mockReturnValue('wallet'),
@@ -112,7 +112,7 @@ describe('P0.3e internal writer isolation', () => {
 
   it.each(['BALANCED_SUCCESS', 'IMBALANCED'])('holds %s until factual inventory refresh', async state => {
     const h = await pending();
-    if (state === 'IMBALANCED') h.trades.b.size = '5';
+    if (state === 'IMBALANCED') { h.trades.b.size = '5'; h.record.legB.requestedShares = 5; } // Unequal fully filled legs: consumer classification fixture.
     await h.flush();
     expect(h.record.terminalResult?.state).toBe(state);
     expect(h.record.inventoryReconciled).toBe(false);
@@ -134,7 +134,7 @@ describe('P0.3e internal writer isolation', () => {
 
   it('releases consumed IMBALANCED without consumer recovery or residual lock', async () => {
     const h = await pending();
-    h.trades.b.size = '5';
+    h.trades.b.size = '5'; h.record.legB.requestedShares = 5; // Fully filled unequal leg fixture.
     await h.flush();
     await h.service['updateBalance']();
     h.service['consumeTerminalShortArbs']();

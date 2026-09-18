@@ -31,15 +31,15 @@ function fixture() {
   services.push(service);
   const market = { name: 'original', conditionId: 'condition', yesTokenId: 'yes', noTokenId: 'no', negRisk: false };
   const trades: Record<string, TradeStatus> = {
-    a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: 'tx-a' },
-    b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: 'tx-b' },
+    a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: '0x' + '11'.repeat(32) },
+    b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: '0x' + '22'.repeat(32) },
   };
   const trading = {
     initialize: vi.fn().mockResolvedValue(undefined),
     createMarketOrder: vi.fn<TradingService['createMarketOrder']>()
       .mockResolvedValueOnce(accepted('a')).mockResolvedValueOnce(accepted('b')),
-    getOrderFillDetails: vi.fn(async (id: string) => ({ tradeIds: [id], sizeMatched: trades[id].size! })),
-    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => trades[id])),
+    getOrderFillDetails: vi.fn(async (id: string) => ({ id, asset_id: ({a:'yes',b:'no',c:'yes',d:'no'} as Record<string,string>)[id], side: 'SELL', status: 'MATCHED', tradeEnumerationPresent: true, tradeIds: [id], sizeMatched: trades[id].size! })),
+    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => ({ asset_id: ({a:'yes',b:'no',c:'yes',d:'no'} as Record<string,string>)[id], side: 'SELL' as const, taker_order_id:id, trader_side:'TAKER' as const, maker_orders:[], ...trades[id] }))),
   };
   const ctf = {
     getAddress: vi.fn().mockReturnValue('wallet'),
@@ -237,8 +237,8 @@ describe('P0.3e-3b real short submission lifecycle', () => {
     await h.flush();
     expect(record.finalized).toBe(true);
     expect(record.terminalResult).toMatchObject({ state: 'BALANCED_SUCCESS',
-      legA: { successShares: 10, successUnits: 1000n, weightedPrice: 0.6, txHashes: ['tx-a'] },
-      legB: { successShares: 10, successUnits: 1000n, weightedPrice: 0.5, txHashes: ['tx-b'] } });
+      legA: { successShares: 10, successUnits: 1000n, weightedPrice: 0.6, txHashes: ['0x' + '11'.repeat(32)] },
+      legB: { successShares: 10, successUnits: 1000n, weightedPrice: 0.5, txHashes: ['0x' + '22'.repeat(32)] } });
     const terminal = record.terminalResult;
     await h.flush();
     expect(h.pending.get(ack.operationId)).toBe(record);
@@ -415,6 +415,8 @@ describe('short pacing through real automatic and scheduled paths', () => {
     book('yes', 0.6); book('no', 0.5);
     expect(execute).toHaveBeenCalledTimes(1);
     const first = await execute.mock.results[0].value;
+    h.trades.a.size = String(h.trading.createMarketOrder.mock.calls[0][0].amount);
+    h.trades.b.size = String(h.trading.createMarketOrder.mock.calls[1][0].amount);
     expect(first).toMatchObject({ type: 'SHORT_SUBMISSION', status: 'SUBMITTED_PENDING' });
     vi.setSystemTime(104999);
     h.service['checkAndHandleOpportunity']();
@@ -450,7 +452,8 @@ describe('short pacing through real automatic and scheduled paths', () => {
     await h.service.start(h.market);
     const first = await submit(h);
     h.market.conditionId = 'other';
-    h.trading.createMarketOrder.mockResolvedValue(accepted('b'));
+    h.trades.c = {...h.trades.a,id:'c'}; h.trades.d = {...h.trades.b,id:'d'};
+    h.trading.createMarketOrder.mockResolvedValueOnce(accepted('c')).mockResolvedValueOnce(accepted('d'));
     const second = await submit(h);
     h.trading.getOrderFillDetails.mockRejectedValueOnce(new Error('operation query failed'));
     expect(interval).toHaveBeenCalledTimes(1);
@@ -511,14 +514,14 @@ describe('post-terminal inventory release', () => {
     noEconomy(h);
   });
 
-  it('IMBALANCED uneven fills finalized but refresh pending blocks an equivalent short', async () => {
+  it('partial leg remains pending and blocks an equivalent short', async () => {
     const h = fixture();
     h.trades.b.size = '8';
     const first = await submit(h);
     await h.flush();
     const record = h.pending.get(first.operationId)!;
-    expect(record.terminalResult).toMatchObject({ state: 'IMBALANCED' });
-    expect(record.inventoryReconciled).toBe(false);
+    expect(record.terminalResult).toBeUndefined();
+    expect(record.finalized).not.toBe(true);
     expect(await submit(h)).toEqual(first);
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(2);
     expect(h.service.getStats().executionsAttempted).toBe(1);
@@ -535,6 +538,8 @@ describe('post-terminal inventory release', () => {
     });
     book('yes', 0.6); book('no', 0.5);
     const first = await execute.mock.results[0].value;
+    h.trades.a.size = String(h.trading.createMarketOrder.mock.calls[0][0].amount);
+    h.trades.b.size = String(h.trading.createMarketOrder.mock.calls[1][0].amount);
     await h.flush();
     expect(h.pending.get(first.operationId)).toMatchObject({ finalized: true, inventoryReconciled: false });
     let resolveBalance!: (value: string) => void;
@@ -625,36 +630,36 @@ describe('post-terminal inventory release', () => {
     noEconomy(h, 2, 100000, 4);
   });
 
-  it('NO_FILL releases immediately without an extra refresh', async () => {
+  it('FAILED children do not prove NO_FILL or release inventory', async () => {
     const h = fixture();
     h.trades.a = { ...h.trades.a, status: 'FAILED', transactionHash: undefined };
     h.trades.b = { ...h.trades.b, status: 'FAILED', transactionHash: undefined };
     const first = await submit(h);
     await h.flush();
     const record = h.pending.get(first.operationId)!;
-    expect(record.terminalResult).toMatchObject({ state: 'NO_FILL' });
-    expect(record.inventoryReconciled).toBe(true);
+    expect(record.terminalResult).toBeUndefined();
+    expect(record.finalized).not.toBe(true);
     h.trading.createMarketOrder.mockResolvedValue(accepted('a'));
     const second = await submit(h);
-    expect(second.operationId).not.toBe(first.operationId);
-    expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(4);
-    noEconomy(h, 2, 100000);
+    expect(second.operationId).toBe(first.operationId);
+    expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(2);
+    noEconomy(h);
   });
 
-  it('SUBMISSION_REJECTED with a failed submitted leg releases immediately', async () => {
+  it('rejection with a FAILED submitted leg retains unresolved inventory', async () => {
     const h = fixture();
     h.trades.a = { ...h.trades.a, status: 'FAILED', transactionHash: undefined };
     h.trading.createMarketOrder.mockReset().mockResolvedValueOnce(accepted('a')).mockResolvedValueOnce(rejected);
     const first = await submit(h);
     await h.flush();
     const record = h.pending.get(first.operationId)!;
-    expect(record.terminalResult).toMatchObject({ state: 'SUBMISSION_REJECTED', legB: { state: 'REJECTED' } });
-    expect(record.inventoryReconciled).toBe(true);
+    expect(record.terminalResult).toBeUndefined();
+    expect(record.finalized).not.toBe(true);
     h.trading.createMarketOrder.mockResolvedValue(accepted('a'));
     const second = await submit(h);
-    expect(second.operationId).not.toBe(first.operationId);
-    expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(4);
-    noEconomy(h, 2, 100000);
+    expect(second.operationId).toBe(first.operationId);
+    expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(2);
+    noEconomy(h);
   });
 
   it('long arb waits for inventory reconciliation then executes normally', async () => {

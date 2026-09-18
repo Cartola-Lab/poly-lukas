@@ -22,15 +22,15 @@ function fixture() {
   services.push(service);
   const market = { name: 'original', conditionId: 'condition', yesTokenId: 'yes', noTokenId: 'no', negRisk: false };
   const trades: Record<string, TradeStatus> = {
-    a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: 'tx-a' },
-    b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: 'tx-b' },
+    a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: '0x' + '11'.repeat(32) },
+    b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: '0x' + '22'.repeat(32) },
   };
   const trading = {
     initialize: vi.fn().mockResolvedValue(undefined),
     createMarketOrder: vi.fn<TradingService['createMarketOrder']>()
       .mockResolvedValueOnce(accepted('a')).mockResolvedValueOnce(accepted('b')),
-    getOrderFillDetails: vi.fn(async (id: string) => ({ tradeIds: [id], sizeMatched: trades[id].size! })),
-    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => trades[id])),
+    getOrderFillDetails: vi.fn(async (id: string) => ({ id, asset_id: id === 'a' ? 'yes' : 'no', side: 'SELL', status: 'MATCHED', tradeEnumerationPresent: true, tradeIds: [id], sizeMatched: trades[id].size! })),
+    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => ({ ...trades[id], asset_id: id === 'a' ? 'yes' : 'no', side: 'SELL', trader_side: 'TAKER', taker_order_id: id, maker_orders: [] }))),
   };
   const ctf = {
     getAddress: vi.fn().mockReturnValue('wallet'),
@@ -102,7 +102,7 @@ describe('P0.3e rebalancer inventory interlock',()=>{
     if(b==='REJECTED') expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(2);
   });
   it.each(['BALANCED_SUCCESS','IMBALANCED'])('%s waits for post-terminal inventory',async classification=>{
-    const h=await pending();if(classification==='IMBALANCED') h.trades.b.size='8';
+    const h=await pending();if(classification==='IMBALANCED') { h.trades.b.size='8'; h.record.legB.requestedShares=8; } // Fully filled unequal leg fixture.
     await h.flush();expect(h.record.terminalResult?.state).toBe(classification);
     const verify=unchanged(h);await check(h);verify();
     await h.service['updateBalance']();await check(h);
@@ -115,7 +115,9 @@ describe('P0.3e rebalancer inventory interlock',()=>{
   });
   it.each(['NO_FILL','SUBMISSION_REJECTED'])('%s does not require a refresh gate',async state=>{
     const h=await pending('ACCEPTED',state==='NO_FILL'?'ACCEPTED':'REJECTED');
-    for(const trade of Object.values(h.trades)) Object.assign(trade,{status:'FAILED',transactionHash:undefined});
+    // Test the interlock consumer with pre-established terminal leg states, not raw FAILED trades.
+    h.record.legA.settlement={state:'TERMINAL_FAILED'};
+    if(state==='NO_FILL') h.record.legB.settlement={state:'TERMINAL_FAILED'};
     await h.flush();expect(h.record.terminalResult?.state).toBe(state);
     h.record.inventoryReconciled=false; // The exemption depends on facts, not this flag.
     await check(h);expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(3);

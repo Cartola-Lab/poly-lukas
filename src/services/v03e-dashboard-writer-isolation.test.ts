@@ -26,16 +26,16 @@ function arbFixture() {
   services.push(service);
   const market = { name: 'original', conditionId: 'condition', yesTokenId: 'yes', noTokenId: 'no', negRisk: false };
   const trades: Record<string, TradeStatus> = {
-    a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: 'tx-a' },
-    b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: 'tx-b' },
+    a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: '0x' + '11'.repeat(32) },
+    b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: '0x' + '22'.repeat(32) },
   };
   const trading = {
     getAddress: () => wallet,
     initialize: vi.fn().mockResolvedValue(undefined),
     createMarketOrder: vi.fn<TradingService['createMarketOrder']>()
       .mockResolvedValueOnce(accepted('a')).mockResolvedValueOnce(accepted('b')),
-    getOrderFillDetails: vi.fn(async (id: string) => ({ tradeIds: [id], sizeMatched: trades[id].size! })),
-    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => trades[id])),
+    getOrderFillDetails: vi.fn(async (id: string) => ({ id, asset_id: id === 'a' ? 'yes' : 'no', side: 'SELL', status: 'MATCHED', tradeEnumerationPresent: true, tradeIds: [id], sizeMatched: trades[id].size! })),
+    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => ({ ...trades[id], asset_id: id === 'a' ? 'yes' : 'no', side: 'SELL', trader_side: 'TAKER', taker_order_id: id, maker_orders: [] }))),
   };
   const ctf = {
     getAddress: vi.fn().mockReturnValue(wallet),
