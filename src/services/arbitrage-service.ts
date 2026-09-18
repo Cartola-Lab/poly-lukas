@@ -173,6 +173,11 @@ export interface ClearPositionResult {
   totalUsdcRecovered: number;
   success: boolean;
   error?: string;
+  /**
+   * Another `clearPositions(market, true)` for this market was still active, so this call
+   * performed no balance read and no write; `yesBalance`/`noBalance` are 0 placeholders.
+   */
+  withheld?: true;
 }
 
 /** Factual SELL execution attributable to one clearPositions order. */
@@ -538,6 +543,12 @@ export class ArbitrageService extends EventEmitter {
   private pendingClearSells = new Map<string, PendingClearSell>();
   /** Clear SELL submissions per `${conditionId}:${tokenId}`; guards sizing against a stale balance read. */
   private clearSellSubmissions = new Map<string, number>();
+  /**
+   * Condition IDs with a `clearPositions(market, true)` economic phase in flight. Held from
+   * before the balance read until the call settles, so no second call can merge or sell the
+   * same inventory from a snapshot another call's merge may have invalidated.
+   */
+  private activeClearMarkets = new Set<string>();
   private nextClearSellId = 0;
   private clearSellFlushPromise: Promise<void> | null = null;
   private balanceRefreshVersion = 0;
@@ -1312,6 +1323,37 @@ export class ArbitrageService extends EventEmitter {
    * ```
    */
   async clearPositions(market: ArbitrageMarketConfig, execute = false): Promise<ClearPositionResult> {
+    // Dry runs never write, so they neither take nor disturb the economic-write interlock.
+    if (!execute) return this.runClearPositions(market, false);
+
+    // Per-market interlock, acquired before the balance read: a concurrent caller's merge
+    // would otherwise invalidate this call's snapshot before it merges or sells from it. The
+    // loser withholds rather than waits, because after waiting its snapshot would be stale.
+    const key = market.conditionId;
+    if (this.activeClearMarkets.has(key)) {
+      this.log(`⏸️ clearPositions withheld for ${market.name}: another clear operation is active for this market`);
+      return {
+        market,
+        marketStatus: 'unknown',
+        yesBalance: 0,
+        noBalance: 0,
+        actions: [],
+        totalUsdcRecovered: 0,
+        success: false,
+        withheld: true,
+        error: 'clearPositions withheld: another clear operation is active for this market; re-run after it settles',
+      };
+    }
+    this.activeClearMarkets.add(key);
+    try {
+      return await this.runClearPositions(market, true);
+    } finally {
+      this.activeClearMarkets.delete(key);
+    }
+  }
+
+  /** Body of {@link clearPositions}; for `execute=true` the caller holds the market's interlock. */
+  private async runClearPositions(market: ArbitrageMarketConfig, execute: boolean): Promise<ClearPositionResult> {
     if (!this.ctf) {
       return {
         market,

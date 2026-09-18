@@ -69,8 +69,10 @@ function fixture(options: { yes?: string; no?: string } = {}) {
   const pending = service['pendingClearSells'];
   const flush = () => service['flushPendingClearSells']();
   const clear = (execute = true) => service.clearPositions(market, execute);
+  /** Bypasses the per-market interlock so the inner per-token stale-read layer is exercised on its own. */
+  const clearUnguarded = () => service['runClearPositions'](market, true);
   const sells = () => trading.createMarketOrder.mock.calls.filter(([o]) => o.side === 'SELL');
-  return { service, market, trades, orders, balances, trading, ctf, settles, logs, pending, flush, clear, sells };
+  return { service, market, trades, orders, balances, trading, ctf, settles, logs, pending, flush, clear, clearUnguarded, sells };
 }
 type H = ReturnType<typeof fixture>;
 
@@ -309,13 +311,13 @@ describe('P0.3 B4 clearPositions SELL factual authority', () => {
     expect(sum).toBeCloseTo(5.5, 12);
   });
 
-  it('concurrent calls: the SELL is submitted once and its proceeds appear in exactly one result', async () => {
+  it('concurrent calls (interlock bypassed): the SELL is submitted once and its proceeds appear in exactly one result', async () => {
     const h = fixture();
     let release!: (row: OrderRow) => void;
     h.trading.getOrderFillDetails.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
-    const a = h.clear();
+    const a = h.clearUnguarded();
     await new Promise(r => setImmediate(r));
-    const b = h.clear();
+    const b = h.clearUnguarded();
     await new Promise(r => setImmediate(r));
     release({ ...h.orders.cy, tradeIds: [...h.orders.cy.tradeIds] });
     const [ra, rb] = await Promise.all([a, b]);
@@ -329,15 +331,15 @@ describe('P0.3 B4 clearPositions SELL factual authority', () => {
     expect(h.pending.size).toBe(0);
   });
 
-  it('a call whose balance read predates a concurrent SELL submission withholds its own SELL', async () => {
+  it('a call whose balance read predates a concurrent SELL submission withholds its own SELL (interlock bypassed)', async () => {
     const h = fixture();
     let releaseRead!: (b: { yesBalance: string; noBalance: string }) => void;
     h.ctf.getPositionBalanceByTokenIds
       .mockImplementationOnce(() => new Promise(resolve => { releaseRead = resolve; }))
       .mockImplementation(async () => ({ ...h.balances }));
-    const stale = h.clear();
+    const stale = h.clearUnguarded();
     await new Promise(r => setImmediate(r));
-    const fresh = await h.clear();
+    const fresh = await h.clearUnguarded();
     expect(sellActions(fresh)[0]).toMatchObject({ success: true, usdcResult: 5.5 });
     releaseRead({ yesBalance: '10', noBalance: '0' });
     const staleResult = await stale;
