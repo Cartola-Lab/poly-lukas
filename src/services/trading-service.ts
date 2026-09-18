@@ -132,7 +132,8 @@ export interface TradeInfo {
   timestamp: number;
 }
 
-export interface TradeStatus {
+export interface TradeStatus extends Partial<Pick<ClobTrade,
+  'asset_id' | 'side' | 'taker_order_id' | 'maker_orders' | 'trader_side'>> {
   id: string;
   status: string;
   transactionHash?: string;
@@ -501,7 +502,9 @@ export class TradingService {
       const trades = await client.getTrades({ id: tradeId }, true);
       if (trades.length > 0) {
         for (const t of trades) {
-          results.push({ id: t.id, status: t.status, transactionHash: t.transaction_hash, size: t.size, price: t.price });
+          results.push({ id: t.id, status: t.status, transactionHash: t.transaction_hash, size: t.size, price: t.price,
+            asset_id: t.asset_id, side: t.side, taker_order_id: t.taker_order_id,
+            maker_orders: t.maker_orders?.map(order => ({ ...order })), trader_side: t.trader_side });
         }
       } else {
         results.push({ id: tradeId, status: 'UNKNOWN' });
@@ -526,12 +529,17 @@ export class TradingService {
    * does NOT interpret order status, settlement, or failure.
    * Throws on CLOB query failure.
    */
-  async getOrderFillDetails(orderId: string): Promise<{ tradeIds: string[]; sizeMatched: string }> {
+  async getOrderFillDetails(orderId: string): Promise<{
+    tradeIds: string[]; sizeMatched: string; id?: string; asset_id?: string; side?: string;
+  }> {
     const client = await this.ensureInitialized();
     const order = await client.getOrder(orderId);
     return {
       tradeIds: order.associate_trades ?? [],
       sizeMatched: order.size_matched,
+      id: order.id,
+      asset_id: order.asset_id,
+      side: order.side,
     };
   }
 

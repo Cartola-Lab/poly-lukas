@@ -37,7 +37,7 @@ import {
   type Subscription,
   type CryptoPrice,
 } from './realtime-service-v2.js';
-import { TradingService, type MarketOrderParams, type OrderResult } from './trading-service.js';
+import { TradingService, type MarketOrderParams, type OrderResult, type TradeStatus } from './trading-service.js';
 import { MarketService } from './market-service.js';
 import { CTFClient, MergeProvenanceError, RedeemProvenanceError, type MergeProvenance,
   type MergeResult, type RedeemResult, type LifecycleRouting } from '../clients/ctf-client.js';
@@ -85,6 +85,18 @@ export type DipArbInventoryAdmissionGuard = (query: DipArbInventoryQuery & Reado
 export type DipArbInventoryProtection = Readonly<{ blocked: true; reason: string; operationId: string }>;
 type ClobScope = { originMarket: DipArbMarketConfig; wallet: string | undefined; market: DipArbMarketConfig; round: DipArbRoundState; trading: TradingService;
   ctf: CTFClient | null; running: boolean; invocation: symbol; guard: DipArbInventoryAdmissionGuard | undefined };
+type SellSettlementLeg = {
+  tokenId: string; requestedShares: number; attempted: boolean; rejected: boolean;
+  orderId?: string; tradeIds: Set<string>;
+  facts: Map<string, { shares: bigint; price: bigint; hash: string }>;
+  observed: boolean; completeEvidence: boolean; residual?: bigint;
+};
+type SellComposition = Array<{ leg: object; tokenId: string; side: DipArbSide; shares: number } | undefined>;
+type SellSettlement = {
+  scope: ClobScope; legs: SellSettlementLeg[]; emitted: boolean;
+  composition: SellComposition; finalizedComposition?: SellComposition;
+  flight?: Promise<DipArbSettleResult>; finalized?: DipArbSettleResult;
+};
 type ClobLifecycle = { operationId: string; wallet: string; tokenIds: readonly string[];
   writerType: DipArbClobWriter | 'POSITION'; invocation?: symbol; round: DipArbRoundState; scope?: ClobScope;
   submission: 'ACTIVE' | 'ACCEPTED' | 'UNCERTAIN' | 'EXISTING';
@@ -401,6 +413,8 @@ export class DipArbService extends EventEmitter {
   private accountedRedeemTransactions = new Map<string, Readonly<DipArbSettleResult>>();
   private confirmedRedeemLifecycles = new WeakMap<DipArbRoundState, Map<string, DipArbPendingRedemption>>();
   private publicRedeemFlight?: Promise<DipArbSettleResult & DipArbInventoryDiagnostic>;
+  private sellSettlements = new WeakMap<DipArbRoundState, SellSettlement>();
+  private sellEvidenceOwners = new Map<string, SellSettlementLeg>();
   private redeemCheckInterval: ReturnType<typeof setInterval> | null = null;
 
   // Orderbook state
@@ -2661,8 +2675,17 @@ export class DipArbService extends EventEmitter {
           this.log(`Position added to pending redemption queue (will redeem after ${this.autoRotateConfig.redeemWaitMinutes || 5}min)`);
         } else {
           // For sell strategy, execute immediately
+          const sellingRound = this.currentRound;
           const settleResult = await this.settle('sell');
-          if (!isInventoryRefusal(settleResult)) this.emit('settled', settleResult);
+          if (!settleResult.success || settleResult.sellState !== 'COMPLETE') return;
+          const settlement = this.sellSettlements.get(sellingRound);
+          if (!settlement?.finalizedComposition || this.currentRound !== sellingRound ||
+              this.market !== settlement.scope.originMarket ||
+              !this.sameSellComposition(settlement.finalizedComposition, this.captureSellComposition(sellingRound))) return;
+          if (settlement && !settlement.emitted) {
+            settlement.emitted = true;
+            try { this.emit('settled', settleResult); } catch { /* Final facts cannot be replayed by telemetry. */ }
+          }
         }
       }
 
@@ -2810,73 +2833,226 @@ export class DipArbService extends EventEmitter {
   }
 
   private async settleBySell(): Promise<DipArbSettleResult> {
-    const originMarket = this.market, round = this.currentRound, trading = this.tradingService, ctf = this.ctf;
-    const guard = this.inventoryAdmissionGuard, running = this.isRunning, invocation = Symbol();
-    const market = guard && originMarket ? { ...originMarket } : originMarket;
-    const wallet = guard ? this.clobWalletSnapshot(trading) : undefined;
-    const startTime = Date.now();
-
-    if (!trading || !market || !round) {
-      return {
-        success: false,
-        strategy: 'sell',
-        error: 'Trading service or market not available',
-        executionTimeMs: Date.now() - startTime,
-      };
+    const round = this.currentRound, market = this.market, trading = this.tradingService;
+    if (!round || !market || !trading) return { success: false, strategy: 'sell',
+      error: 'Trading service or market not available', executionTimeMs: 0 };
+    let settlement = this.sellSettlements.get(round);
+    if (!settlement) {
+      settlement = { emitted: false, composition: this.captureSellComposition(round),
+        scope: { originMarket: market, market: { ...market }, round, trading,
+        ctf: this.ctf, wallet: this.clobWalletSnapshot(trading), guard: this.inventoryAdmissionGuard,
+        running: this.isRunning, invocation: Symbol() },
+        legs: [round.leg1, round.leg2].filter((leg): leg is NonNullable<typeof leg> => !!leg).map(leg => ({
+          tokenId: leg.tokenId, requestedShares: leg.shares, attempted: false, rejected: false,
+          tradeIds: new Set<string>(), facts: new Map(), observed: false, completeEvidence: false,
+        })) };
+      this.sellSettlements.set(round, settlement);
     }
+    const copy = (result: DipArbSettleResult): DipArbSettleResult => ({ ...result,
+      sellLegs: result.sellLegs?.map(leg => ({ ...leg })) });
+    if (settlement.finalized && settlement.finalizedComposition &&
+        this.sameSellComposition(settlement.finalizedComposition, this.captureSellComposition(round)) &&
+        settlement.scope.originMarket === market) return copy(settlement.finalized);
+    settlement.finalized = undefined;
+    if (!settlement.flight) {
+      const captured = settlement;
+      captured.flight = Promise.resolve().then(() => this.reconcileSellSettlement(captured));
+    }
+    const flight = settlement.flight!;
+    try { return copy(await flight); }
+    finally { if (settlement.flight === flight) settlement.flight = undefined; }
+  }
 
-    const leg1 = round.leg1 ? { ...round.leg1 } : undefined;
-    const leg2 = round.leg2 ? { ...round.leg2 } : undefined;
-    try {
-      let totalReceived = 0;
+  private captureSellComposition(round: DipArbRoundState): SellComposition {
+    return [round.leg1, round.leg2].map(leg => leg
+      ? { leg, tokenId: leg.tokenId, side: leg.side, shares: leg.shares } : undefined);
+  }
 
-      // Sell leg1 position if exists
-      if (leg1) {
-        const leg1Shares = leg1.shares;
-        const result = await this.submitClob({ originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'SETTLE_SELL', {
-          tokenId: leg1.tokenId,
-          side: 'SELL' as Side,
-          amount: leg1Shares,
-        });
+  private sameSellComposition(before: SellComposition, after: SellComposition): boolean {
+    return before.every((leg, i) => leg === undefined ? after[i] === undefined :
+      after[i]?.leg === leg.leg && after[i]?.tokenId === leg.tokenId &&
+      after[i]?.side === leg.side && after[i]?.shares === leg.shares);
+  }
 
-        if (result.success) {
-          totalReceived += leg1Shares * (leg1.side === 'UP'
-            ? (this.upAsks[0]?.price ?? 0.5)
-            : (this.downAsks[0]?.price ?? 0.5));
+  /** Exact fixed-point facts; an invalid observation must never become zero. */
+  private sellUnits(value: unknown, decimals = 6): bigint {
+    if (typeof value !== 'string' || !/^\d+(?:\.\d+)?$/.test(value)) throw new Error('Invalid SELL fact');
+    const [whole, fraction = ''] = value.split('.');
+    if (/[^0]/.test(fraction.slice(decimals))) throw new Error('Inexact SELL fact');
+    return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(fraction.slice(0, decimals).padEnd(decimals, '0'));
+  }
+
+  private sellTradeExecution(trade: TradeStatus, leg: SellSettlementLeg,
+    order: Awaited<ReturnType<TradingService['getOrderFillDetails']>>): { size: string | undefined; price: string | undefined } | undefined {
+    // IDs are opaque: retain exact equality, never lowercase or coerce them.
+    if ((order.id !== undefined && order.id !== leg.orderId) ||
+        (order.asset_id !== undefined && order.asset_id !== leg.tokenId) ||
+        (order.side !== undefined && order.side !== 'SELL') ||
+        typeof trade.taker_order_id !== 'string' || !trade.taker_order_id.trim() ||
+        !Array.isArray(trade.maker_orders)) return;
+    const makers = trade.maker_orders.filter(maker => maker.order_id === leg.orderId);
+    if (trade.taker_order_id === leg.orderId) {
+      if (trade.trader_side !== 'TAKER' || makers.length || trade.asset_id !== leg.tokenId || trade.side !== 'SELL') return;
+      return { size: trade.size, price: trade.price };
+    }
+    if (trade.trader_side !== 'MAKER' || makers.length !== 1) return;
+    const maker = makers[0];
+    // Top-level size/price/side describe the taker. Only this maker allocation
+    // describes our order. An omitted maker side needs explicit order evidence.
+    if (maker.asset_id !== leg.tokenId || (maker.side !== undefined ? maker.side !== 'SELL' :
+        order.id !== leg.orderId || order.asset_id !== leg.tokenId || order.side !== 'SELL')) return;
+    if ((trade.side !== 'BUY' && trade.side !== 'SELL') || !trade.asset_id ||
+        (trade.asset_id === leg.tokenId && trade.side !== 'BUY')) return;
+    if (this.sellUnits(maker.matched_amount) > this.sellUnits(trade.size)) return;
+    return { size: maker.matched_amount, price: maker.price };
+  }
+
+  private async reconcileSellSettlement(settlement: SellSettlement): Promise<DipArbSettleResult> {
+    const startTime = Date.now(), { scope, legs } = settlement;
+    const composition = this.captureSellComposition(scope.round);
+    const compositionUnchanged = () => this.currentRound === scope.round && this.market === scope.originMarket &&
+      this.sameSellComposition(composition, this.captureSellComposition(scope.round));
+    let refusal: InventoryAdmissionRefusal | undefined;
+    for (const leg of legs) {
+      leg.completeEvidence = false;
+      leg.residual = undefined;
+      if (!leg.attempted) {
+        leg.attempted = true; // Installed before transport, including ambiguous exceptions.
+        try {
+          const response = await this.submitClob(scope, 'SETTLE_SELL', {
+            tokenId: leg.tokenId, side: 'SELL', amount: leg.requestedShares,
+          });
+          leg.rejected = response.submissionState === 'REJECTED';
+          if (!leg.rejected && typeof response.orderId === 'string' && response.orderId.trim()) {
+            leg.orderId = response.orderId.trim();
+            for (const id of response.tradeIds ?? []) leg.tradeIds.add(id);
+          }
+        } catch (error) {
+          if (error instanceof InventoryAdmissionRefusal) {
+            leg.attempted = false; refusal = error; break;
+          }
+          // Unknown submission stays unresolved; never retry it blindly.
         }
       }
-
-      // Sell leg2 position if exists
-      if (leg2) {
-        const leg2Shares = leg2.shares;
-        const result = await this.submitClob({ originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'SETTLE_SELL', {
-          tokenId: leg2.tokenId,
-          side: 'SELL' as Side,
-          amount: leg2Shares,
-        });
-
-        if (result.success) {
-          totalReceived += leg2Shares * (leg2.side === 'UP'
-            ? (this.upAsks[0]?.price ?? 0.5)
-            : (this.downAsks[0]?.price ?? 0.5));
+      if (leg.rejected || !leg.orderId) continue;
+      try {
+        const wallet = this.inventoryWallet(scope.wallet ?? '');
+        if (this.inventoryWallet(scope.trading.getAddress()) !== wallet) continue;
+        const orderKey = `${wallet}:order:${leg.orderId}`;
+        const owner = this.sellEvidenceOwners.get(orderKey);
+        if (owner && owner !== leg) continue;
+        this.sellEvidenceOwners.set(orderKey, leg);
+        const details = await scope.trading.getOrderFillDetails(leg.orderId);
+        for (const id of details.tradeIds) leg.tradeIds.add(id);
+        const ids = [...leg.tradeIds];
+        if (!ids.length || ids.some(id => typeof id !== 'string' || !id.trim())) continue;
+        const returnedTrades = await scope.trading.getTradeStatuses(ids);
+        const uniqueTrades = new Map<string, TradeStatus>();
+        const fingerprint = (trade: TradeStatus) => JSON.stringify([trade.status, trade.transactionHash?.toLowerCase(),
+          trade.size, trade.price, trade.asset_id, trade.side, trade.taker_order_id, trade.trader_side, trade.maker_orders]);
+        for (const trade of returnedTrades) {
+          const prior = uniqueTrades.get(trade.id);
+          if (prior && fingerprint(prior) !== fingerprint(trade)) throw new Error('Conflicting duplicate SELL trade');
+          uniqueTrades.set(trade.id, trade);
         }
-      }
-
-      return {
-        success: true,
-        strategy: 'sell',
-        amountReceived: totalReceived,
-        executionTimeMs: Date.now() - startTime,
-      };
-    } catch (error) {
-      if (error instanceof InventoryAdmissionRefusal) return this.inventoryBlocked({ success: false, strategy: 'sell' as const, error: error.message, executionTimeMs: Date.now() - startTime }, error);
-      return {
-        success: false,
-        strategy: 'sell',
-        error: error instanceof Error ? error.message : String(error),
-        executionTimeMs: Date.now() - startTime,
-      };
+        const trades = [...uniqueTrades.values()];
+        if (trades.length !== ids.length || trades.some(t => !ids.includes(t.id))) continue;
+        if (ids.some(id => !details.tradeIds.includes(id))) continue;
+        const staged = new Map(leg.facts);
+        let terminal = true;
+        let attributed = 0n, identitiesComplete = true;
+        for (const trade of trades) {
+          try {
+            const execution = this.sellTradeExecution(trade, leg, details);
+            const tradeOwner = this.sellEvidenceOwners.get(`${wallet}:trade:${trade.id}`);
+            if (!execution || (tradeOwner && tradeOwner !== leg)) throw new Error('Unattributed SELL trade');
+            const shares = this.sellUnits(execution.size);
+            attributed += shares;
+            const confirmed = (trade.status === 'MINED' || trade.status === 'CONFIRMED') &&
+              typeof trade.transactionHash === 'string' && /^0x[0-9a-f]{64}$/i.test(trade.transactionHash);
+            if (!confirmed) {
+              if (staged.has(trade.id)) throw new Error('Conflicting SELL evidence');
+              if (trade.status !== 'FAILED' || trade.transactionHash?.trim()) terminal = false;
+              continue;
+            }
+            const fact = { shares, price: this.sellUnits(execution.price, 18), hash: trade.transactionHash!.toLowerCase() };
+            if (fact.shares <= 0n || fact.price <= 0n || fact.price > 10n ** 18n) throw new Error('Invalid SELL fill');
+            const prior = staged.get(trade.id);
+            if (prior && (prior.shares !== fact.shares || prior.price !== fact.price || prior.hash !== fact.hash)) {
+              throw new Error('Conflicting SELL fill');
+            }
+            staged.set(trade.id, fact);
+          } catch {
+            identitiesComplete = false;
+            terminal = false; // Keep valid siblings; an unproven child cannot complete the order.
+          }
+        }
+        const matched = this.sellUnits(details.sizeMatched);
+        if (attributed > matched || (identitiesComplete && attributed !== matched)) continue;
+        const executed = [...staged.values()].reduce((sum, fact) => sum + fact.shares, 0n);
+        if (executed > this.sellUnits(String(leg.requestedShares))) throw new Error('SELL exceeds requested shares');
+        if (executed > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Unsafe SELL shares');
+        for (const id of staged.keys()) this.sellEvidenceOwners.set(`${wallet}:trade:${id}`, leg);
+        leg.facts = staged;
+        leg.observed = staged.size > 0 || terminal;
+        leg.completeEvidence = terminal;
+        if (!scope.ctf || this.inventoryWallet(scope.ctf.getAddress()) !== this.inventoryWallet(scope.wallet ?? '')) continue;
+        const balances = await scope.ctf.getPositionBalanceByTokenIds(scope.market.conditionId,
+          { yesTokenId: scope.market.upTokenId, noTokenId: scope.market.downTokenId });
+        if (this.inventoryWallet(scope.ctf.getAddress()) !== this.inventoryWallet(scope.wallet ?? '') ||
+            this.inventoryWallet(scope.trading.getAddress()) !== this.inventoryWallet(scope.wallet ?? '')) continue;
+        leg.residual = this.sellUnits(leg.tokenId === scope.market.upTokenId ? balances.yesBalance : balances.noBalance);
+      } catch { /* Keep prior facts and order identity for a later read-only reconciliation. */ }
     }
+    let gross = 0n;
+    const observations = legs.map(leg => {
+      const fills = [...leg.facts.values()];
+      const shares = fills.reduce((sum, fact) => sum + fact.shares, 0n);
+      const proceeds = fills.reduce((sum, fact) => sum + fact.shares * fact.price, 0n);
+      gross += proceeds;
+      const realizedShares = leg.observed ? Number(ethers.utils.formatUnits(shares.toString(), 6)) : undefined;
+      const received = leg.observed ? Number(ethers.utils.formatUnits(proceeds.toString(), 24)) : undefined;
+      return { tokenId: leg.tokenId, requestedShares: leg.requestedShares, orderId: leg.orderId,
+        realizedShares, proceeds: received,
+        executionPrice: realizedShares && received !== undefined ? received / realizedShares : undefined,
+        residual: leg.residual === undefined ? undefined : Number(ethers.utils.formatUnits(leg.residual.toString(), 6)) };
+    });
+    let compositionReady = compositionUnchanged();
+    if (compositionReady && !this.sameSellComposition(settlement.composition, composition)) {
+      // A later call may observe changed legs already closed elsewhere. Verify their
+      // current inventory; never submit extra SELLs or invent proceeds for them.
+      compositionReady = false;
+      try {
+        const wallet = this.inventoryWallet(scope.wallet ?? '');
+        if (scope.ctf && this.inventoryWallet(scope.ctf.getAddress()) === wallet &&
+            this.inventoryWallet(scope.trading.getAddress()) === wallet) {
+          const balances = await scope.ctf.getPositionBalanceByTokenIds(scope.market.conditionId,
+            { yesTokenId: scope.market.upTokenId, noTokenId: scope.market.downTokenId });
+          compositionReady = composition.every(leg => !leg ||
+            (leg.tokenId === scope.market.upTokenId ? this.sellUnits(balances.yesBalance) === 0n :
+              leg.tokenId === scope.market.downTokenId && this.sellUnits(balances.noBalance) === 0n)) &&
+            this.inventoryWallet(scope.ctf.getAddress()) === wallet &&
+            this.inventoryWallet(scope.trading.getAddress()) === wallet;
+        }
+      } catch { /* A changed composition needs a successful factual balance read. */ }
+    }
+    compositionReady = compositionReady && compositionUnchanged();
+    const complete = compositionReady && legs.length > 0 && legs.every(leg => leg.completeEvidence && leg.residual === 0n &&
+      [...leg.facts.values()].reduce((sum, fact) => sum + fact.shares, 0n) === this.sellUnits(String(leg.requestedShares)) &&
+      leg.requestedShares > 0);
+    const result: DipArbSettleResult = { success: complete, strategy: 'sell',
+      sellState: complete ? 'COMPLETE' : !compositionReady || legs.some(leg => !leg.rejected &&
+        (!leg.completeEvidence || leg.residual === undefined)) ? 'PENDING'
+        : observations.some(leg => (leg.realizedShares ?? 0) > 0) ? 'RESIDUAL' : 'NO_FILL',
+      sellLegs: observations,
+      amountReceived: legs.some(leg => leg.observed) ? Number(ethers.utils.formatUnits(gross.toString(), 24)) : undefined,
+      executionTimeMs: Date.now() - startTime };
+    // Cumulative observation only: this path does not increment PnL/fees/stats.
+    if (complete) {
+      settlement.finalized = result;
+      settlement.finalizedComposition = composition;
+    }
+    return refusal ? this.inventoryBlocked(result, refusal) : result;
   }
 
   // ===== Private: Helpers =====

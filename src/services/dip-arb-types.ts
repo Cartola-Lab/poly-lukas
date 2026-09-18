@@ -577,6 +577,17 @@ export const DEFAULT_AUTO_ROTATE_CONFIG: Required<DipArbAutoRotateConfig> = {
  * 结算结果
  */
 export interface DipArbSettleResult {
+  /** SELL results are cumulative factual observations, not accounting deltas. */
+  sellState?: 'PENDING' | 'RESIDUAL' | 'NO_FILL' | 'COMPLETE';
+  sellLegs?: Array<{
+    tokenId: string;
+    requestedShares: number;
+    orderId?: string;
+    realizedShares?: number;
+    executionPrice?: number;
+    proceeds?: number;
+    residual?: number;
+  }>;
   /** 是否成功 */
   success: boolean;
   /** 结算策略 */

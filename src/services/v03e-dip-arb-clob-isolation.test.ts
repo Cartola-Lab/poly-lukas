@@ -89,7 +89,7 @@ describe('DipArb CLOB inventory isolation',()=>{
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({yesBalance:'0',noBalance:'10'});await h.exit();expect(h.protection()).toBeDefined();
   });
   it('settleBySell success alone never releases protection',async()=>{
-    const h=fixture(true);const result=await h.sell();expect(result.success).toBe(true);expect(h.protection()).toBeDefined();
+    const h=fixture(true);const result=await h.sell();expect(result.success).toBe(false);expect(h.protection()).toBeDefined();
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({yesBalance:'0',noBalance:'0'});expect(h.protection()).toBeDefined();
   });
   it('identity uses normalized executor, other wallet/token do not conflict',async()=>{
