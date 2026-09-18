@@ -28,7 +28,7 @@ import {
 } from './realtime-service-v2.js';
 import { TradingService } from './trading-service.js';
 import { MarketService } from './market-service.js';
-import { CTFClient, type TokenIds, type LifecycleRouting } from '../clients/ctf-client.js';
+import { CTFClient, MergeProvenanceError, type TokenIds, type LifecycleRouting, type MergeResult } from '../clients/ctf-client.js';
 import { GammaApiClient } from '../clients/gamma-api.js';
 import { RateLimiter } from '../core/rate-limiter.js';
 import { createUnifiedCache } from '../core/unified-cache.js';
@@ -37,6 +37,7 @@ import {
   calculateExecutableSize,
   calculateNetLongArbProfit,
   calculateNetShortArbProfit,
+  estimateTakerFee,
 } from '../utils/price-utils.js';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
 import type { BookUpdate } from '../core/types.js';
@@ -261,6 +262,21 @@ export interface ArbitrageOpportunity {
   timestamp: number;
 }
 
+/** Factual long-arb economics. Every quantity is derived from confirmed child
+ * trades of this operation's own BUY orders and a receipt-confirmed merge. */
+export interface LongArbFacts {
+  yesOrderId: string;
+  noOrderId: string;
+  yesShares: number;
+  yesCost: number;
+  noShares: number;
+  noCost: number;
+  mergedShares: number;
+  mergeValue: number;
+  feeUsd: number;
+  fillTxHashes: string[];
+}
+
 export interface ArbitrageExecutionResult {
   success: boolean;
   type: 'long' | 'short';
@@ -269,6 +285,12 @@ export interface ArbitrageExecutionResult {
   txHashes: string[];
   error?: string;
   executionTimeMs: number;
+  /** Long-arb operation identity when the result belongs to a reconcilable operation. */
+  operationId?: string;
+  /** BUY reconciliation is incomplete: no terminal claim, no economics, no execution event. */
+  pending?: boolean;
+  /** Present only when `success` was proven from factual fills and a confirmed merge. */
+  facts?: LongArbFacts;
 }
 
 export interface ShortArbSubmissionAck {
@@ -306,6 +328,56 @@ type PendingShortArb = {
   finalized?: boolean;
   inventoryReconciled?: boolean;
 };
+
+type BuyLegSettlement =
+  | { state: 'PENDING' }
+  | { state: 'TERMINAL'; units: bigint; shares: number; cost: number; weightedPrice?: number;
+      /** All confirmed fills share one price, so any sub-quantity has an exact cost. */
+      uniformPrice: boolean; txHashes: string[] };
+
+type PendingLongLeg = {
+  tokenId: string;
+  requestedShares: number;
+  orderId?: string;
+  submission: 'NOT_SUBMITTED' | 'REJECTED' | 'SUBMITTED' | 'UNCERTAIN';
+  tradeIds?: Set<string>;
+  facts?: Map<string, string>;
+  settlement?: BuyLegSettlement;
+};
+
+type LongArbMerge =
+  | { state: 'NOT_STARTED' }
+  | { state: 'IN_FLIGHT' }
+  | { state: 'UNCERTAIN'; txHash?: string }
+  | { state: 'CONFIRMED'; shares: number; value: number; txHash: string };
+
+type PendingLongArb = {
+  id: string;
+  market: ArbitrageMarketConfig;
+  size: number;
+  startedAt: number;
+  legYes: PendingLongLeg;
+  legNo: PendingLongLeg;
+  merge: LongArbMerge;
+  flight?: Promise<ArbitrageExecutionResult | undefined>;
+  result?: ArbitrageExecutionResult;
+  published?: boolean;
+};
+
+const TX_HASH_PATTERN = /^0x[0-9a-f]{64}$/i;
+
+/** CLOB share strings carry at most two decimals; 100 units = 1 share. */
+function parseShareUnits(value: unknown, label: string): bigint {
+  if (typeof value !== 'string' || !/^\d+(?:\.\d{1,2})?$/.test(value)) throw new Error(`Invalid factual ${label} shares`);
+  const [whole, fraction = ''] = value.split('.');
+  return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
+}
+
+function formatShareUnits(units: bigint): string {
+  const whole = units / 100n, fraction = units % 100n;
+  if (fraction === 0n) return whole.toString();
+  return `${whole}.${fraction.toString().padStart(2, '0')}`.replace(/0$/, '');
+}
 
 /** Factual notification only; no realized-profit contract. */
 export type ShortArbSettledLeg = Readonly<{
@@ -378,6 +450,9 @@ export class ArbitrageService extends EventEmitter {
   private nextShortArbId = 0;
   private shortArbConsuming = false;
   private shortArbFlushPromise: Promise<void> | null = null;
+  private pendingLongArbs = new Map<string, PendingLongArb>();
+  private nextLongArbId = 0;
+  private longArbFlushPromise: Promise<void> | null = null;
   private balanceRefreshVersion = 0;
   private lastExecutionTime = 0;
   private lastRebalanceTime = 0;
@@ -501,6 +576,11 @@ export class ArbitrageService extends EventEmitter {
           await this.flushPendingShortArbs();
         } catch (error) {
           try { this.log(`Short-arb flush: ${String(error)}`); } catch { /* preserve future cycles */ }
+        }
+        try {
+          await this.flushPendingLongArbs();
+        } catch (error) {
+          try { this.log(`Long-arb flush: ${String(error)}`); } catch { /* preserve future cycles */ }
         }
         try {
           await this.updateBalance();
@@ -779,6 +859,17 @@ export class ArbitrageService extends EventEmitter {
       }
     }
 
+    // An unresolved long on this market is neither retried nor resubmitted:
+    // its BUY facts are still being reconciled. No attempt, no event.
+    if (opportunity.type === 'long') {
+      const unresolved = this.findPendingLongArb(this.market);
+      if (unresolved) {
+        return { success: false, type: 'long', size: 0, profit: 0, txHashes: [],
+          error: `Long arb ${unresolved.id} pending factual reconciliation`, executionTimeMs: 0,
+          operationId: unresolved.id, pending: true };
+      }
+    }
+
     // Admission refusal, not an economic execution result. No attempts or events.
     const protectedShort = opportunity.type === 'long' ? this.getShortInventoryBlock(this.market) : undefined;
     if (protectedShort) throw new Error(`Inventory write blocked by short ${protectedShort}`);
@@ -821,13 +912,13 @@ export class ArbitrageService extends EventEmitter {
         return result;
       }
 
-      if (result.success) {
-        this.stats.executionsSucceeded++;
-        this.stats.totalProfit += result.profit;
+      if (result.pending) {
+        // BUY legs submitted but not factually reconciled: pace, never claim.
         this.lastExecutionTime = Date.now();
+        return result;
       }
 
-      this.emit('execution', result);
+      this.publishLongArbResult(result);
       return result;
     } finally {
       this.isExecuting = false;
@@ -1694,160 +1785,366 @@ export class ArbitrageService extends EventEmitter {
     }
   }
 
+  private findPendingLongArb(market: ArbitrageMarketConfig | null): PendingLongArb | undefined {
+    if (!market) return;
+    for (const op of this.pendingLongArbs.values()) {
+      if (!op.published && op.market.conditionId === market.conditionId &&
+          op.market.yesTokenId === market.yesTokenId && op.market.noTokenId === market.noTokenId) return op;
+    }
+  }
+
+  /** Session-local effects exactly once per long-arb operation; failure results without
+   * an operation (guard/config/rejection) are published directly. */
+  private publishLongArbResult(result: ArbitrageExecutionResult): void {
+    const op = result.operationId ? this.pendingLongArbs.get(result.operationId) : undefined;
+    if (op) {
+      if (op.published) return;
+      op.published = true;
+    }
+    if (result.success) {
+      this.stats.executionsSucceeded++;
+      this.stats.totalProfit += result.profit;
+      this.lastExecutionTime = Date.now();
+    }
+    try {
+      this.emit('execution', result);
+    } finally {
+      if (op && this.pendingLongArbs.get(op.id) === op) this.pendingLongArbs.delete(op.id);
+    }
+  }
+
   private async executeLongArb(opportunity: ArbitrageOpportunity): Promise<ArbitrageExecutionResult> {
     const startTime = Date.now();
-    const txHashes: string[] = [];
     const size = opportunity.recommendedSize;
+    const market = this.market!;
+    const trading = this.tradingService!;
+    const failure = (error: string): ArbitrageExecutionResult => ({
+      success: false, type: 'long', size, profit: 0, txHashes: [], error, executionTimeMs: Date.now() - startTime,
+    });
 
     this.log(`\nExecuting Long Arb (Buy → Merge)...`);
 
-    try {
-      const { buyYes, buyNo } = opportunity.effectivePrices;
-      const requiredUsdc = (buyYes + buyNo) * size;
-
-      if (this.balance.pUsdBalance < requiredUsdc) {
-        return {
-          success: false,
-          type: 'long',
-          size,
-          profit: 0,
-          txHashes,
-          error: `Insufficient pUSD: have ${this.balance.pUsdBalance.toFixed(2)}, need ${requiredUsdc.toFixed(2)}`,
-          executionTimeMs: Date.now() - startTime,
-        };
-      }
-
-      // Buy both legs sequentially with worst-price caps (PROBLEMS.md #2/#3).
-      // Sequential execution avoids the Promise.all dual-fill race: if the
-      // second leg fails we hold only one side and unwind it immediately
-      // instead of racing two fills. Caps are passed as `price` so the
-      // venue rejects fills beyond max slippage instead of sweeping the book.
-      const buyYesCap = opportunity.priceCaps?.buyYes ?? buyYes * (1 + this.config.maxSlippagePct);
-      const buyNoCap = opportunity.priceCaps?.buyNo ?? buyNo * (1 + this.config.maxSlippagePct);
-      this.log(`  1. Buying legs sequentially (caps YES=${buyYesCap.toFixed(4)}, NO=${buyNoCap.toFixed(4)})...`);
-      const buyYesResult = await this.tradingService!.createMarketOrder({
-        tokenId: this.market!.yesTokenId,
-        side: 'BUY',
-        amount: size * buyYes,
-        price: buyYesCap,
-        orderType: 'FOK',
-      });
-      if (!buyYesResult.success) {
-        return {
-          success: false,
-          type: 'long',
-          size,
-          profit: 0,
-          txHashes,
-          error: `Leg 1 (YES) failed: ${buyYesResult.errorMsg}`,
-          executionTimeMs: Date.now() - startTime,
-        };
-      }
-      const buyNoResult = await this.tradingService!.createMarketOrder({
-        tokenId: this.market!.noTokenId,
-        side: 'BUY',
-        amount: size * buyNo,
-        price: buyNoCap,
-        orderType: 'FOK',
-      });
-
-      const outcomes = this.market!.outcomes || ['YES', 'NO'];
-      this.log(`     ${outcomes[0]}: ${buyYesResult.success ? '✓' : '✗'}, ${outcomes[1]}: ${buyNoResult.success ? '✓' : '✗'}`);
-
-      // Sequential legs: only the second leg can fail here (first leg
-      // returned early above). Unwind the single-sided fill immediately.
-      if (!buyNoResult.success) {
-        this.log(`  ⚠️ Leg 2 (NO) failed after YES filled - unwinding single-sided position...`);
-        await this.fixImbalanceIfNeeded();
-        return {
-          success: false,
-          type: 'long',
-          size,
-          profit: 0,
-          txHashes,
-          error: `Leg 2 (NO) failed: ${buyNoResult.errorMsg}`,
-          executionTimeMs: Date.now() - startTime,
-        };
-      }
-
-      // Merge tokens
-      const tokenIds: TokenIds = {
-        yesTokenId: this.market!.yesTokenId,
-        noTokenId: this.market!.noTokenId,
-      };
-
-      // Update balance to get accurate token counts
-      await this.updateBalance();
-      const heldPairs = Math.min(this.balance.yesTokens, this.balance.noTokens);
-      const mergeSize = Math.floor(Math.min(size, heldPairs) * 1e6) / 1e6;
-
-      if (mergeSize >= this.config.minTradeSize) {
-        this.log(`  2. Merging ${mergeSize.toFixed(2)} pairs...`);
-        try {
-          const mergeResult = await this.ctf!.mergeByTokenIds(
-            this.market!.conditionId,
-            tokenIds,
-            mergeSize.toString(),
-            this.toLifecycleRouting(this.market)
-          );
-          txHashes.push(mergeResult.txHash);
-          this.log(`     TX: ${mergeResult.txHash}`);
-
-          const profit = opportunity.profitRate * mergeSize;
-          this.log(`  ✅ Long Arb completed! Profit: ~$${profit.toFixed(2)}`);
-
-          // Post-fill reconciliation (PROBLEMS.md #10): a "successful" merge
-          // can still leave excess single-sided tokens when fills were
-          // uneven. Refresh balances and unwind any remainder above threshold.
-          await this.updateBalance();
-          const residual = this.balance.yesTokens - this.balance.noTokens;
-          if (Math.abs(residual) > this.config.imbalanceThreshold) {
-            this.log(`  ⚠️ Residual imbalance after merge: ${residual.toFixed(2)} - cleaning up...`);
-            await this.fixImbalanceIfNeeded();
-          }
-
-          return {
-            success: true,
-            type: 'long',
-            size: mergeSize,
-            profit,
-            txHashes,
-            executionTimeMs: Date.now() - startTime,
-          };
-        } catch (mergeError: any) {
-          this.log(`  ⚠️ Merge failed: ${mergeError.message}`);
-          return {
-            success: false,
-            type: 'long',
-            size,
-            profit: 0,
-            txHashes,
-            error: `Merge failed: ${mergeError.message}`,
-            executionTimeMs: Date.now() - startTime,
-          };
-        }
-      }
-
-      return {
-        success: false,
-        type: 'long',
-        size,
-        profit: 0,
-        txHashes,
-        error: `Insufficient pairs for merge: ${heldPairs.toFixed(2)}`,
-        executionTimeMs: Date.now() - startTime,
-      };
-    } catch (error: any) {
-      return {
-        success: false,
-        type: 'long',
-        size,
-        profit: 0,
-        txHashes,
-        error: error.message,
-        executionTimeMs: Date.now() - startTime,
-      };
+    const { buyYes, buyNo } = opportunity.effectivePrices;
+    const requiredUsdc = (buyYes + buyNo) * size;
+    if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(requiredUsdc)) return failure('Invalid long arb size');
+    if (this.balance.pUsdBalance < requiredUsdc) {
+      return failure(`Insufficient pUSD: have ${this.balance.pUsdBalance.toFixed(2)}, need ${requiredUsdc.toFixed(2)}`);
     }
+
+    const op: PendingLongArb = {
+      id: `long-${++this.nextLongArbId}`, market: { ...market }, size, startedAt: startTime,
+      legYes: { tokenId: market.yesTokenId, requestedShares: size, submission: 'NOT_SUBMITTED' },
+      legNo: { tokenId: market.noTokenId, requestedShares: size, submission: 'NOT_SUBMITTED' },
+      merge: { state: 'NOT_STARTED' },
+    };
+    this.pendingLongArbs.set(op.id, op);
+    const pendingResult = (error: string): ArbitrageExecutionResult => ({
+      ...failure(error), operationId: op.id, pending: true,
+    });
+    const outcomes = market.outcomes || ['YES', 'NO'];
+
+    // Submission provenance only. Acceptance never becomes a fill; an exception
+    // after the attempt started cannot prove non-submission.
+    const submitLeg = async (leg: PendingLongLeg, amount: number, price: number): Promise<string | undefined> => {
+      leg.submission = 'UNCERTAIN';
+      try {
+        const result = await trading.createMarketOrder({ tokenId: leg.tokenId, side: 'BUY', amount, price, orderType: 'FOK' });
+        const orderId = typeof result.orderId === 'string' ? result.orderId.trim() : '';
+        if (orderId) {
+          leg.orderId = orderId;
+          leg.tradeIds = new Set(result.tradeIds ?? []);
+        }
+        if (result.submissionState === 'REJECTED') {
+          leg.submission = 'REJECTED';
+          return result.errorMsg || 'venue rejection';
+        }
+        if (result.submissionState === 'ACCEPTED' && orderId) leg.submission = 'SUBMITTED';
+        return result.errorMsg;
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    };
+
+    // Buy both legs sequentially with worst-price caps (PROBLEMS.md #2/#3).
+    // Caps are passed as `price` so the venue rejects fills beyond max slippage.
+    const buyYesCap = opportunity.priceCaps?.buyYes ?? buyYes * (1 + this.config.maxSlippagePct);
+    const buyNoCap = opportunity.priceCaps?.buyNo ?? buyNo * (1 + this.config.maxSlippagePct);
+    this.log(`  1. Buying legs sequentially (caps YES=${buyYesCap.toFixed(4)}, NO=${buyNoCap.toFixed(4)})...`);
+
+    const yesError = await submitLeg(op.legYes, size * buyYes, buyYesCap);
+    if (op.legYes.submission === 'REJECTED') {
+      // Known non-submission: nothing to reconcile, no economic effects.
+      this.pendingLongArbs.delete(op.id);
+      return failure(`Leg 1 (${outcomes[0]}) failed: ${yesError}`);
+    }
+    if (op.legYes.submission !== 'SUBMITTED') {
+      // The YES order may or may not exist. Never open the second side on an
+      // unknown first side; reconcile the first side if it has an identity.
+      this.log(`  ⚠️ Leg 1 (${outcomes[0]}) submission uncertain${op.legYes.orderId ? '' : ' (no order identity)'} - ${outcomes[1]} leg withheld`);
+      const terminal = op.legYes.orderId ? await this.reconcileLongArb(op) : undefined;
+      return terminal ?? pendingResult(`Leg 1 (${outcomes[0]}) submission uncertain: ${yesError ?? 'no acceptance'}`);
+    }
+
+    const noError = await submitLeg(op.legNo, size * buyNo, buyNoCap);
+    this.log(`     ${outcomes[0]}: ✓, ${outcomes[1]}: ${op.legNo.submission === 'REJECTED' ? '✗' : '✓'}`);
+
+    if (op.legNo.submission === 'REJECTED') {
+      // Known non-submission of leg 2: the YES side may be filled. Existing
+      // remediation runs unchanged; the YES facts stay reconcilable.
+      this.log(`  ⚠️ Leg 2 (${outcomes[1]}) rejected after ${outcomes[0]} submission - unwinding single-sided position...`);
+      await this.fixImbalanceIfNeeded();
+    } else if (op.legNo.submission !== 'SUBMITTED') {
+      this.log(`  ⚠️ Leg 2 (${outcomes[1]}) submission uncertain${op.legNo.orderId ? '' : ' (no order identity)'}`);
+    }
+
+    const terminal = await this.reconcileLongArb(op);
+    if (terminal) return terminal;
+    const state = [op.legYes, op.legNo].map((leg, i) =>
+      `${outcomes[i]}=${leg.submission === 'REJECTED' ? 'rejected' : leg.submission === 'NOT_SUBMITTED' ? 'not submitted'
+        : leg.settlement?.state === 'TERMINAL' ? 'terminal' : leg.orderId ? 'pending' : 'unknown'}`).join(', ');
+    const detail = op.legNo.submission === 'REJECTED' ? `Leg 2 (${outcomes[1]}) failed: ${noError}; ` : '';
+    return pendingResult(`${detail}BUY_PENDING: factual reconciliation incomplete (${state})`);
+  }
+
+  /** Single flight per operation; concurrent callers share one reconciliation. */
+  private reconcileLongArb(op: PendingLongArb): Promise<ArbitrageExecutionResult | undefined> {
+    if (op.result) return Promise.resolve(op.result);
+    if (op.flight) return op.flight;
+    const flight = this.reconcileLongArbOnce(op).finally(() => { if (op.flight === flight) op.flight = undefined; });
+    op.flight = flight;
+    return flight;
+  }
+
+  private async reconcileLongArbOnce(op: PendingLongArb): Promise<ArbitrageExecutionResult | undefined> {
+    const size = op.size;
+    const legs = [op.legYes, op.legNo];
+    const finalize = (result: Omit<ArbitrageExecutionResult, 'type' | 'operationId' | 'executionTimeMs'>): ArbitrageExecutionResult => {
+      if (!op.result) op.result = { ...result, type: 'long', operationId: op.id, executionTimeMs: Date.now() - op.startedAt };
+      return op.result;
+    };
+    const failure = (error: string) => finalize({ success: false, size, profit: 0, txHashes: [], error });
+
+    // Known non-orders (rejected or never attempted) carry no fills to prove.
+    const resolved = (leg: PendingLongLeg) => leg.submission === 'REJECTED' || leg.submission === 'NOT_SUBMITTED' ||
+      leg.settlement?.state === 'TERMINAL';
+    for (const leg of legs) {
+      if (resolved(leg) || !leg.orderId) continue;
+      try {
+        leg.settlement = await this.reconcileBuyLeg(leg);
+      } catch (error) {
+        try { this.log(`Long-arb ${op.id} BUY reconciliation: ${String(error)}`); } catch { /* remain pending */ }
+      }
+    }
+    // An UNCERTAIN leg without order identity can never be proven; it stays unresolved.
+    if (!legs.every(resolved)) return undefined;
+
+    const settled = (leg: PendingLongLeg) => leg.settlement?.state === 'TERMINAL' ? leg.settlement : undefined;
+    const yes = settled(op.legYes), no = settled(op.legNo);
+    const yesUnits = yes?.units ?? 0n, noUnits = no?.units ?? 0n;
+    const yesShares = Number(yesUnits) / 100, noShares = Number(noUnits) / 100;
+    const pairedUnits = yesUnits < noUnits ? yesUnits : noUnits;
+    const pairedShares = Number(pairedUnits) / 100;
+    const describe = `YES ${yesShares} / NO ${noShares} attributable shares`;
+
+    if (pairedUnits === 0n) return failure(`No paired factual fills (${describe})`);
+    if (pairedShares < this.config.minTradeSize) return failure(`Insufficient attributable pairs for merge: ${describe}`);
+
+    if (op.merge.state === 'NOT_STARTED') {
+      if (!this.ctf) return undefined;
+      const amount = formatShareUnits(pairedUnits);
+      const tokenIds: TokenIds = { yesTokenId: op.market.yesTokenId, noTokenId: op.market.noTokenId };
+      // Claim before the await so no concurrent pass can submit a second merge.
+      op.merge = { state: 'IN_FLIGHT' };
+      this.log(`  2. Merging ${amount} attributable pairs (${describe})...`);
+      try {
+        const mergeResult = await this.ctf.mergeByTokenIds(op.market.conditionId, tokenIds, amount, this.toLifecycleRouting(op.market));
+        op.merge = this.classifyMergeResult(mergeResult, pairedShares);
+      } catch (error) {
+        if (error instanceof MergeProvenanceError) {
+          const provenance = error.provenance;
+          if (provenance.state === 'NOT_SUBMITTED') {
+            // Proven non-broadcast: the pairs are still held; a later pass may retry.
+            op.merge = { state: 'NOT_STARTED' };
+            this.log(`  ⚠️ Merge not submitted: ${error.message}`);
+            return undefined;
+          }
+          op.merge = provenance.state === 'CONFIRMED' && typeof provenance.transactionHash === 'string' &&
+            TX_HASH_PATTERN.test(provenance.transactionHash)
+            ? { state: 'CONFIRMED', shares: pairedShares, value: pairedShares, txHash: provenance.transactionHash }
+            : { state: 'UNCERTAIN', ...(provenance.transactionHash ? { txHash: provenance.transactionHash } : {}) };
+        } else {
+          op.merge = { state: 'UNCERTAIN' };
+        }
+        if (op.merge.state === 'UNCERTAIN') this.log(`  ⚠️ Merge outcome uncertain: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (op.merge.state === 'IN_FLIGHT' || op.merge.state === 'NOT_STARTED') return undefined;
+    if (op.merge.state === 'UNCERTAIN') {
+      return failure(`Merge outcome uncertain for ${pairedShares} pairs (${describe}); no realized profit booked`);
+    }
+
+    const merge = op.merge;
+    // Post-merge reconciliation (PROBLEMS.md #10): uneven fills can leave
+    // single-sided excess. Existing remediation runs unchanged on the live market.
+    if (this.market && this.market.conditionId === op.market.conditionId &&
+        this.market.yesTokenId === op.market.yesTokenId && this.market.noTokenId === op.market.noTokenId) {
+      await this.updateBalance();
+      const residual = this.balance.yesTokens - this.balance.noTokens;
+      if (Math.abs(residual) > this.config.imbalanceThreshold) {
+        this.log(`  ⚠️ Residual imbalance after merge: ${residual.toFixed(2)} - cleaning up...`);
+        await this.fixImbalanceIfNeeded();
+      }
+    }
+
+    // Exact attribution: the whole leg was merged, or every fill shares one price.
+    const attributedCost = (leg: Extract<BuyLegSettlement, { state: 'TERMINAL' }>): number | undefined =>
+      leg.units === pairedUnits ? leg.cost
+        : leg.uniformPrice && leg.weightedPrice !== undefined ? leg.weightedPrice * pairedShares : undefined;
+    const yesCost = attributedCost(yes!), noCost = attributedCost(no!);
+    if (yesCost === undefined || noCost === undefined) {
+      return failure(`Merged ${merge.shares} pairs (tx ${merge.txHash}) but BUY cost attribution is not exact (${describe}); realized profit withheld`);
+    }
+    const feeUsd = estimateTakerFee(yesCost + noCost, this.config.feeRateBps);
+    const profit = merge.value - yesCost - noCost - feeUsd;
+    if (![yesCost, noCost, feeUsd, profit].every(Number.isFinite)) throw new Error('Invalid long-arb settlement totals');
+    this.log(`  ✅ Long Arb completed: merged ${merge.shares} pairs, cost ${(yesCost + noCost).toFixed(4)}, realized $${profit.toFixed(4)}`);
+
+    return finalize({
+      success: true, size: merge.shares, profit, txHashes: [merge.txHash],
+      facts: {
+        yesOrderId: op.legYes.orderId!, noOrderId: op.legNo.orderId!,
+        yesShares, yesCost, noShares, noCost,
+        mergedShares: merge.shares, mergeValue: merge.value, feeUsd,
+        fillTxHashes: [...new Set([...yes!.txHashes, ...no!.txHashes])],
+      },
+    });
+  }
+
+  /** A merge counts only with receipt-level confirmation from the CTF path. */
+  private classifyMergeResult(result: MergeResult, expectedShares: number): LongArbMerge {
+    const txHash = typeof result?.txHash === 'string' ? result.txHash : undefined;
+    const confirmed = result?.success === true && txHash !== undefined && TX_HASH_PATTERN.test(txHash) &&
+      (result.provenance === undefined || result.provenance.state === 'CONFIRMED');
+    if (!confirmed) return { state: 'UNCERTAIN', ...(txHash ? { txHash } : {}) };
+    // Collateral out equals pairs in by contract; a reported amount must agree.
+    let value = expectedShares;
+    for (const raw of [result.usdcReceived, result.amount]) {
+      if (typeof raw !== 'string' || !/^\d+(?:\.\d+)?$/.test(raw)) continue;
+      const reported = Number(raw);
+      if (!Number.isFinite(reported) || Math.abs(reported - expectedShares) > 1e-6) return { state: 'UNCERTAIN', txHash };
+      value = reported;
+      break;
+    }
+    return { state: 'CONFIRMED', shares: expectedShares, value, txHash: txHash! };
+  }
+
+  private async reconcileBuyLeg(leg: PendingLongLeg): Promise<BuyLegSettlement> {
+    if (!this.tradingService) throw new Error('Trading not configured');
+    if (!leg.orderId) throw new Error('BUY leg has no orderId');
+    const orderId = leg.orderId;
+    const pending: BuyLegSettlement = { state: 'PENDING' };
+    const details = await this.tradingService.getOrderFillDetails(orderId);
+    if (details.id !== orderId || details.asset_id !== leg.tokenId || details.side !== 'BUY' ||
+        !Array.isArray(details.tradeIds)) return pending;
+    const matched = parseShareUnits(details.sizeMatched, 'BUY');
+    const orderTerminal = ['MATCHED', 'CANCELED'].includes(details.status ?? '') && details.tradeEnumerationPresent === true;
+    const known = leg.tradeIds ??= new Set<string>();
+    for (const id of details.tradeIds) known.add(id);
+    const ids = [...known];
+    if (!ids.length) {
+      // A canceled FOK with complete, empty enumeration and zero matched volume never filled.
+      if (details.status === 'CANCELED' && details.tradeEnumerationPresent === true && matched === 0n) {
+        return { state: 'TERMINAL', units: 0n, shares: 0, cost: 0, uniformPrice: true, txHashes: [] };
+      }
+      return pending;
+    }
+    if (ids.some(id => typeof id !== 'string' || !id.trim() || !details.tradeIds.includes(id))) return pending;
+    const trades = await this.tradingService.getTradeStatuses(ids);
+    if (trades.length !== ids.length || new Set(trades.map(t => t.id)).size !== ids.length ||
+        trades.some(t => !known.has(t.id))) return pending;
+    const facts = leg.facts ??= new Map<string, string>();
+    let units = 0n, cost = 0, complete = true;
+    const prices = new Set<string>();
+    const txHashes = new Set<string>();
+    for (const trade of trades) {
+      // Same factual authority as the SELL paths: local allocation, confirmed
+      // status AND transaction identity. Invalid siblings never complete a leg.
+      if (!Array.isArray(trade.maker_orders) || !trade.taker_order_id) { complete = false; continue; }
+      const makers = trade.maker_orders.filter(m => m.order_id === orderId);
+      let size: string | undefined, rawPrice: string | undefined;
+      if (trade.taker_order_id === orderId) {
+        if (trade.trader_side !== 'TAKER' || makers.length || trade.asset_id !== leg.tokenId || trade.side !== 'BUY') {
+          complete = false; continue;
+        }
+        size = trade.size; rawPrice = trade.price;
+      } else {
+        const maker = makers[0];
+        // As maker we bought: the taker sold this token, or bought the complement.
+        if (trade.trader_side !== 'MAKER' || makers.length !== 1 || maker.asset_id !== leg.tokenId ||
+            (maker.side !== undefined && maker.side !== 'BUY') || !trade.asset_id ||
+            !['BUY', 'SELL'].includes(trade.side ?? '') || (trade.asset_id === leg.tokenId && trade.side !== 'SELL')) {
+          complete = false; continue;
+        }
+        size = maker.matched_amount; rawPrice = maker.price;
+        if (parseShareUnits(size, 'BUY') > parseShareUnits(trade.size, 'BUY')) { complete = false; continue; }
+      }
+      const confirmed = ['MINED', 'CONFIRMED'].includes(trade.status) &&
+        typeof trade.transactionHash === 'string' && TX_HASH_PATTERN.test(trade.transactionHash);
+      if (!confirmed) {
+        // A retained fact can never be demoted; a failed child without a hash is a terminal non-fill.
+        if (facts.has(trade.id) || trade.status !== 'FAILED' || trade.transactionHash?.trim()) complete = false;
+        continue;
+      }
+      if (size === undefined) { complete = false; continue; }
+      const quantity = parseShareUnits(size, 'BUY');
+      const price = typeof rawPrice === 'string' && /^\d+(?:\.\d+)?$/.test(rawPrice) ? Number(rawPrice) : NaN;
+      if (quantity <= 0n || !Number.isFinite(price) || price <= 0 || price > 1) throw new Error('Invalid successful BUY facts');
+      const hash = trade.transactionHash!.toLowerCase();
+      const fingerprint = JSON.stringify([leg.tokenId, 'BUY', trade.trader_side, trade.taker_order_id, quantity.toString(), rawPrice, hash]);
+      const prior = facts.get(trade.id);
+      if (prior !== undefined && prior !== fingerprint) { complete = false; continue; }
+      facts.set(trade.id, fingerprint);
+      units += quantity;
+      cost += Number(quantity) / 100 * price;
+      prices.add(rawPrice!);
+      txHashes.add(hash);
+    }
+    if (!complete) return pending;
+    if (units > matched) throw new Error('BUY child sizes exceed sizeMatched');
+    // Matched volume is a completeness check, never a source of shares.
+    if (units !== matched || !orderTerminal) return pending;
+    if (units > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('BUY shares exceed safe economic precision');
+    const shares = Number(units) / 100;
+    if (!Number.isFinite(cost)) throw new Error('Invalid BUY settlement totals');
+    return { state: 'TERMINAL', units, shares, cost, weightedPrice: units > 0n ? cost / shares : undefined,
+      uniformPrice: prices.size <= 1, txHashes: [...txHashes] };
+  }
+
+  /** Periodic reconciliation of long arbs whose BUY legs were not terminal inline.
+   * Holds the execution lock so the merge cannot interleave with another execution. */
+  private flushPendingLongArbs(): Promise<void> {
+    if (this.longArbFlushPromise) return this.longArbFlushPromise;
+    this.longArbFlushPromise = Promise.resolve().then(async () => {
+      if (this.isExecuting) return;
+      this.isExecuting = true;
+      try {
+        for (const [id, op] of [...this.pendingLongArbs]) {
+          // A rebalancer writing this inventory may move the pairs; merge on a later pass.
+          if (op.published || this.isRebalancerWriting(op.market)) continue;
+          try {
+            if (op.id !== id) throw new Error('Long-arb pending ID mismatch');
+            const result = await this.reconcileLongArb(op);
+            if (result) this.publishLongArbResult(result);
+          } catch (error) {
+            // One query/anomaly must not prevent independent operations progressing.
+            try { this.log(`Long-arb reconciliation ${id}: ${String(error)}`); } catch { /* remain pending */ }
+          }
+        }
+      } finally {
+        this.isExecuting = false;
+      }
+    }).finally(() => { this.longArbFlushPromise = null; });
+    return this.longArbFlushPromise;
   }
 
   private async reconcileSellLeg(orderId: string, includeExactUnits = false, leg?: PendingShortLeg): Promise<SellLegSettlement> {

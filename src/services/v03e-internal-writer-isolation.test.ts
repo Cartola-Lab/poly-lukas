@@ -24,12 +24,16 @@ function fixture() {
     a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: '0x' + '11'.repeat(32) },
     b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: '0x' + '22'.repeat(32) },
   };
+  // Long BUY legs ('ly'/'ln') follow the live market tokens and are proven from
+  // BUY-side facts; every other order is a short SELL on the original tokens.
+  const asset = (id: string) => id === 'ly' ? market.yesTokenId : id === 'ln' ? market.noTokenId : id === 'a' ? 'yes' : 'no';
+  const sides: Record<string, 'BUY' | 'SELL'> = {};
   const trading = {
     initialize: vi.fn().mockResolvedValue(undefined),
     createMarketOrder: vi.fn<TradingService['createMarketOrder']>()
       .mockResolvedValueOnce(accepted('a')).mockResolvedValueOnce(accepted('b')),
-    getOrderFillDetails: vi.fn(async (id: string) => ({ id, asset_id: id === 'a' ? 'yes' : 'no', side: 'SELL', status: 'MATCHED', tradeEnumerationPresent: true, tradeIds: [id], sizeMatched: trades[id].size! })),
-    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => ({ ...trades[id], asset_id: id === 'a' ? 'yes' : 'no', side: 'SELL', trader_side: 'TAKER', taker_order_id: id, maker_orders: [] }))),
+    getOrderFillDetails: vi.fn(async (id: string) => ({ id, asset_id: asset(id), side: sides[id] ?? 'SELL', status: 'MATCHED', tradeEnumerationPresent: true, tradeIds: [id], sizeMatched: trades[id].size! })),
+    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => ({ ...trades[id], asset_id: asset(id), side: sides[id] ?? 'SELL', trader_side: 'TAKER', taker_order_id: id, maker_orders: [] }))),
   };
   const ctf = {
     getAddress: vi.fn().mockReturnValue('wallet'),
@@ -51,7 +55,7 @@ function fixture() {
   }, 'fixImbalanceIfNeeded');
   const pending = service['pendingShortArbs'];
   const flush = () => service['flushPendingShortArbs']();
-  return { service, market, trading, ctf, realtime, trades, execution, recovery, pending, flush };
+  return { service, market, trading, ctf, realtime, trades, sides, execution, recovery, pending, flush };
 }
 
 async function submit(h: ReturnType<typeof fixture>, op = opportunity): Promise<ShortArbSubmissionAck> {
@@ -87,6 +91,16 @@ function deferred<T>() {
   return { promise, resolve };
 }
 const long = { ...opportunity, type: 'long' as const };
+const MERGE_TX = '0x' + 'ab'.repeat(32);
+/** Factual long-arb fixture: BUY fills 10 @ 0.4 and 10 @ 0.5, receipt-confirmed merge → realized $1. */
+function armLong(h: ReturnType<typeof fixture>, yesId = 'ly', noId = 'ln') {
+  h.sides[yesId] = 'BUY'; h.sides[noId] = 'BUY';
+  h.trades[yesId] = { id: yesId, status: 'MINED', size: '10', price: '0.4', transactionHash: '0x' + '33'.repeat(32) };
+  h.trades[noId] = { id: noId, status: 'MINED', size: '10', price: '0.5', transactionHash: '0x' + '44'.repeat(32) };
+  h.ctf.mergeByTokenIds.mockResolvedValue({ success: true, txHash: MERGE_TX });
+}
+const queueLong = (h: ReturnType<typeof fixture>) =>
+  h.trading.createMarketOrder.mockResolvedValueOnce(accepted('ly')).mockResolvedValueOnce(accepted('ln'));
 async function blockedLong(h: Awaited<ReturnType<typeof pending>>) {
   const record = structuredClone(h.record), stats = h.service.getStats();
   const orders = h.trading.createMarketOrder.mock.calls.length;
@@ -120,6 +134,7 @@ describe('P0.3e internal writer isolation', () => {
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '10', noBalance: '10' });
     await h.service['updateBalance']();
     expect(h.record.inventoryReconciled).toBe(true);
+    armLong(h); queueLong(h);
     expect(await h.service.execute(long)).toMatchObject({ success: true, type: 'long', profit: 1 });
   });
 
@@ -127,6 +142,7 @@ describe('P0.3e internal writer isolation', () => {
     const h = await pending();
     h.market[key] = 'other';
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '10', noBalance: '10' });
+    armLong(h); queueLong(h);
     expect(await h.service.execute(long)).toMatchObject({ success: true, profit: 1 });
     expect(h.record.finalized).toBe(false);
     expect(h.execution).toHaveBeenCalledTimes(1);
@@ -141,6 +157,7 @@ describe('P0.3e internal writer isolation', () => {
     expect(h.pending.size).toBe(0);
     expect(h.recovery).not.toHaveBeenCalled();
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '10', noBalance: '10' });
+    armLong(h); queueLong(h);
     expect(await h.service.execute(long)).toMatchObject({ success: true, profit: 1 });
   });
 
@@ -148,6 +165,8 @@ describe('P0.3e internal writer isolation', () => {
     const h = fixture();
     const started = deferred<void>(), finish = deferred<Reply & { txHash?: string }>();
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '10', noBalance: '10' });
+    // The fixture's default orders 'a'/'b' are this long's BUY legs.
+    armLong(h, 'a', 'b');
     if (phase === 'BUY') h.trading.createMarketOrder.mockReset()
       .mockImplementationOnce(() => { started.resolve(); return finish.promise; }).mockResolvedValue(accepted('b'));
     else h.ctf.mergeByTokenIds.mockImplementationOnce(() => { started.resolve(); return finish.promise; });
@@ -159,7 +178,7 @@ describe('P0.3e internal writer isolation', () => {
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(orders);
     expect(h.pending.size).toBe(0);
     expect(h.service.getStats().executionsAttempted).toBe(1);
-    finish.resolve(phase === 'BUY' ? accepted('a') : { success: true, txHash: 'merge-tx' });
+    finish.resolve(phase === 'BUY' ? accepted('a') : { success: true, txHash: MERGE_TX });
     expect(await running).toMatchObject({ success: true, profit: 1 });
     expect(h.service['isExecuting']).toBe(false);
   });
