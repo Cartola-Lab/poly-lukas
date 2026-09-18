@@ -269,8 +269,12 @@ export class DipArbService extends EventEmitter {
     try { return trading?.getAddress() ?? ''; } catch { return ''; }
   }
 
-  private async submitClob(scope: ClobScope, writerType: DipArbClobWriter, params: MarketOrderParams): Promise<OrderResult> {
-    if (!scope.guard) return scope.trading.createMarketOrder(params);
+  private async submitClob(scope: ClobScope, writerType: DipArbClobWriter, params: MarketOrderParams,
+    retryTransition?: { retiringIds: ReadonlySet<string>; commit: () => void }): Promise<OrderResult> {
+    if (!scope.guard) {
+      retryTransition?.commit();
+      return scope.trading.createMarketOrder(params);
+    }
     const wallet = this.inventoryWallet(scope.wallet ?? '');
     const token = params.tokenId;
     const current = () => scope.originMarket === this.market && scope.market.upTokenId === this.market.upTokenId &&
@@ -286,6 +290,7 @@ export class DipArbService extends EventEmitter {
     finally { this.admittingInventory = false; }
     if (reason || !current() || scope.round.leg1 !== leg1 || scope.round.leg2 !== leg2 || scope.round.phase !== phase) throw new InventoryAdmissionRefusal(reason || 'Inventory context changed during admission');
     for (const prior of this.clobLifecycles.values()) {
+      if (retryTransition?.retiringIds.has(prior.operationId)) continue;
       if (prior.wallet !== wallet || !prior.tokenIds.includes(token)) continue;
       if (prior.round !== scope.round || prior.submission === 'ACTIVE' || prior.submission === 'UNCERTAIN' ||
           (prior.writerType === 'EMERGENCY_EXIT' || prior.writerType === 'SETTLE_SELL') ||
@@ -293,6 +298,7 @@ export class DipArbService extends EventEmitter {
         throw new InventoryAdmissionRefusal('DipArb inventory lifecycle unresolved');
       }
     }
+    retryTransition?.commit(); // Final identity check after admission; no await before transport.
     const operationId = `dip-clob-${++this.nextClobOperation}`;
     const record: ClobLifecycle = { operationId, wallet, tokenIds: Object.freeze([token]), writerType,
       round: scope.round, scope, invocation: scope.invocation, submission: 'ACTIVE', lifecycle: 'WRITING', tradeIds: [] };
@@ -425,6 +431,8 @@ export class DipArbService extends EventEmitter {
   private publicRedeemFlight?: Promise<DipArbSettleResult & DipArbInventoryDiagnostic>;
   private buyExecutions = new WeakMap<DipArbRoundState, Partial<Record<'leg1' | 'leg2', BuyExecution>>>();
   private buyEvidenceOwners = new Map<string, object>();
+  private emergencySells = new WeakMap<object, { settlement: SellSettlement; entryCost?: number; accounted: boolean; result?: DipArbExecutionResult }>();
+  private emergencyFlights = new WeakMap<object, Promise<DipArbExecutionResult | null>>();
   private sellSettlements = new WeakMap<DipArbRoundState, SellSettlement>();
   private sellEvidenceOwners = new Map<string, SellSettlementLeg>();
   private redeemCheckInterval: ReturnType<typeof setInterval> | null = null;
@@ -1690,23 +1698,156 @@ export class DipArbService extends EventEmitter {
    * Sells the Leg1 tokens at market price to avoid unhedged exposure
    */
   private async emergencyExitLeg1(): Promise<DipArbExecutionResult | null> {
+    const round = this.currentRound;
+    if (!round) return null;
+    const prior = this.emergencyFlights.get(round);
+    if (prior) return prior;
+    const flight = this.runEmergencyExitLeg1();
+    this.emergencyFlights.set(round, flight);
+    try { return await flight; }
+    finally { if (this.emergencyFlights.get(round) === flight) this.emergencyFlights.delete(round); }
+  }
+
+  private async reconcileEmergencySell(leg1: NonNullable<DipArbRoundState['leg1']>): Promise<DipArbExecutionResult> {
+    const attempt = this.emergencySells.get(leg1)!;
+    if (attempt.result) return this.sameSellComposition(attempt.settlement.composition,
+      this.captureSellComposition(attempt.settlement.scope.round)) && this.currentRound === attempt.settlement.scope.round &&
+      this.market === attempt.settlement.scope.originMarket ? { ...attempt.result } :
+      { ...attempt.result, success: false, sellState: 'PENDING', profit: undefined };
+    const { settlement } = attempt;
+    const result = await this.reconcileSellSettlement(settlement);
+    const fact = result.sellLegs?.[0];
+    const unchanged = this.currentRound === settlement.scope.round && this.market === settlement.scope.originMarket &&
+      this.sameSellComposition(settlement.composition, this.captureSellComposition(settlement.scope.round));
+    // Update only the captured position, only when both attributed fills and balance agree.
+    if (unchanged && fact?.realizedShares !== undefined && fact.residual !== undefined &&
+        (fact.residual > 0 || result.success) &&
+        this.sellUnits(String(fact.realizedShares)) + this.sellUnits(String(fact.residual)) ===
+          this.sellUnits(String(fact.requestedShares))) {
+      leg1.shares = fact.residual;
+      if (attempt.entryCost !== undefined) leg1.cost = attempt.entryCost * fact.residual / fact.requestedShares;
+      settlement.composition = this.captureSellComposition(settlement.scope.round);
+    }
+    const output: DipArbExecutionResult = { success: result.success && unchanged, leg: 'exit',
+      roundId: settlement.scope.round.roundId, side: leg1.side, orderId: fact?.orderId,
+      shares: fact?.realizedShares, price: fact?.executionPrice, amountReceived: fact?.proceeds,
+      residual: fact?.residual, profit: undefined, sellState: result.sellState, executionTimeMs: result.executionTimeMs };
+    if (output.success && !attempt.accounted) {
+      attempt.accounted = true;
+      if (attempt.entryCost !== undefined && fact?.proceeds !== undefined) {
+        output.profit = fact.proceeds - attempt.entryCost
+          - estimateTakerFee(attempt.entryCost, this.config.feeRateBps)
+          - estimateTakerFee(fact.proceeds, this.config.feeRateBps);
+        this.stats.totalProfit += output.profit;
+      }
+      leg1.exitPending = false;
+      attempt.result = { ...output };
+      if (settlement.scope.guard) await this.releaseClobAfterExit(settlement.scope, leg1.tokenId);
+      this.log(`Emergency SELL confirmed: ${output.shares} shares, proceeds ${output.amountReceived}`);
+    }
+    return output;
+  }
+
+  /** Retry only an explicitly canceled, never-matched order with no trade history.
+   * CLOB cancellation kills the unfilled remainder, not previously matched trades.
+   * Missing enumeration is UNKNOWN; known failed children are not an empty history.
+   */
+  private async emergencySellCanRetry(leg1: NonNullable<DipArbRoundState['leg1']>): Promise<boolean> {
+    const prior = this.emergencySells.get(leg1);
+    if (!prior || prior.accounted) return false;
+    const { scope, legs } = prior.settlement, leg = legs[0];
+    if (!leg.orderId || leg.facts.size || leg.tradeIds.size || leg1.exitTradeIds?.length) return false;
+    const records = [...this.clobLifecycles.values()].filter(r => r.round === scope.round &&
+      r.writerType === 'EMERGENCY_EXIT' && r.tokenIds.includes(leg.tokenId));
+    if (records.some(r => r.tradeIds.length || r.orderId !== leg.orderId)) return false;
+    const unchanged = () => this.emergencySells.get(leg1) === prior && this.currentRound === scope.round &&
+      this.market === scope.originMarket && this.sameSellComposition(prior.settlement.composition,
+        this.captureSellComposition(scope.round)) && this.inventoryWallet(scope.trading.getAddress()) ===
+        this.inventoryWallet(scope.wallet ?? '');
+    try {
+      if (!unchanged()) return false;
+      const order = await scope.trading.getOrderFillDetails(leg.orderId);
+      // Retain every newly discovered child even when terminality cannot be proved.
+      if (Array.isArray(order.tradeIds)) for (const id of order.tradeIds) leg.tradeIds.add(id);
+      if (order.id !== leg.orderId || order.asset_id !== leg.tokenId || order.side !== 'SELL' ||
+          order.status !== 'CANCELED' || order.tradeEnumerationPresent !== true ||
+          !Array.isArray(order.tradeIds) || order.tradeIds.length || leg.tradeIds.size ||
+          this.sellUnits(order.sizeMatched) !== 0n || !scope.ctf) return false;
+      if (this.inventoryWallet(scope.ctf.getAddress()) !== this.inventoryWallet(scope.wallet ?? '')) return false;
+      const balances = await scope.ctf.getPositionBalanceByTokenIds(scope.market.conditionId,
+        { yesTokenId: scope.market.upTokenId, noTokenId: scope.market.downTokenId });
+      const balance = this.sellUnits(leg.tokenId === scope.market.upTokenId ? balances.yesBalance : balances.noBalance);
+      return unchanged() && !leg.facts.size && !leg.tradeIds.size && !leg1.exitTradeIds?.length &&
+        !records.some(r => r.tradeIds.length) &&
+        this.inventoryWallet(scope.ctf.getAddress()) === this.inventoryWallet(scope.wallet ?? '') &&
+        balance === this.sellUnits(String(leg.requestedShares));
+    } catch { return false; }
+  }
+
+  private async runEmergencyExitLeg1(): Promise<DipArbExecutionResult | null> {
     const originMarket = this.market, round = this.currentRound, trading = this.tradingService, ctf = this.ctf;
     const guard = this.inventoryAdmissionGuard, running = this.isRunning, invocation = Symbol();
-    const market = guard && originMarket ? { ...originMarket } : originMarket;
-    const wallet = guard ? this.clobWalletSnapshot(trading) : undefined;
+    const market = originMarket ? { ...originMarket } : originMarket;
+    const wallet = this.clobWalletSnapshot(trading);
     if (!trading || !market || !round?.leg1) {
       this.log('Cannot exit Leg1: no trading service or position');
       return null;
     }
 
     const leg1 = round.leg1;
-    if (leg1.price === undefined) return null; // Unknown entry cost cannot authorize realized accounting.
-    const entryPrice = leg1.price;
+    const composition = this.captureSellComposition(round);
+    const completed = this.emergencySells.get(leg1)?.result;
+    if (completed) return this.reconcileEmergencySell(leg1);
     const legToken = leg1.tokenId, legSide = leg1.side;
     const startTime = Date.now();
     const DUST_EPSILON = 0.001;
+    let validateRetry: (() => void) | undefined;
+    let retireRetry: (() => void) | undefined;
+    const retryPrior = this.emergencySells.get(leg1);
+    const retiringIds = new Set<string>();
 
     try {
+      // UNKNOWN retains the same attempt. Failed known children never prove order terminality.
+      if (leg1.exitPending) {
+        if (!(await this.emergencySellCanRetry(leg1))) {
+          if (this.emergencySells.has(leg1)) return this.reconcileEmergencySell(leg1);
+          return { success: false, leg: 'exit', roundId: round.roundId,
+            error: 'Prior SELL pending settlement', executionTimeMs: Date.now() - startTime };
+        }
+        const prior = this.emergencySells.get(leg1)!;
+        const identity = Object.freeze({ round, roundId: round.roundId, phase: round.phase,
+          leg: leg1, side: leg1.side, tokenId: leg1.tokenId, shares: leg1.shares,
+          wallet, market: originMarket, conditionId: market.conditionId,
+          upTokenId: market.upTokenId, downTokenId: market.downTokenId, trading, ctf, running, guard });
+        const records = [...this.clobLifecycles.entries()].filter(([, record]) =>
+          record.round === round && record.writerType === 'EMERGENCY_EXIT' &&
+          record.orderId === prior.settlement.legs[0].orderId && record.wallet === this.inventoryWallet(wallet ?? ''));
+        for (const [id] of records) retiringIds.add(id);
+        validateRetry = () => {
+          if (this.currentRound !== identity.round || round.roundId !== identity.roundId || round.phase !== identity.phase ||
+              round.leg1 !== identity.leg || leg1.side !== identity.side || leg1.tokenId !== identity.tokenId ||
+              leg1.shares !== identity.shares || this.market !== identity.market ||
+              this.market?.conditionId !== identity.conditionId || this.market?.upTokenId !== identity.upTokenId ||
+              this.market?.downTokenId !== identity.downTokenId || this.tradingService !== identity.trading ||
+              this.ctf !== identity.ctf || this.isRunning !== identity.running || this.inventoryAdmissionGuard !== identity.guard ||
+              this.inventoryWallet(this.clobWalletSnapshot(trading)) !== this.inventoryWallet(identity.wallet) ||
+              this.inventoryWallet(ctf?.getAddress() ?? '') !== this.inventoryWallet(identity.wallet) ||
+              this.emergencySells.get(leg1) !== prior ||
+              !this.sameSellComposition(composition, this.captureSellComposition(round)) ||
+              records.some(([id, record]) => this.clobLifecycles.get(id) !== record || record.tradeIds.length)) {
+            throw new InventoryAdmissionRefusal('Emergency retry identity changed before submission');
+          }
+        };
+        retireRetry = () => {
+          validateRetry!();
+          for (const [id] of records) this.clobLifecycles.delete(id);
+          this.emergencySells.delete(leg1);
+          leg1.exitTradeIds = undefined;
+          leg1.exitSubmitPrice = undefined;
+          leg1.exitSubmitShares = undefined;
+        };
+      }
+
       // ---- PRE-SUBMIT: read CTF balance as single source of truth ----
       let currentBalance = leg1.shares; // fallback when CTF unavailable
       if (ctf) {
@@ -1731,76 +1872,12 @@ export class DipArbService extends EventEmitter {
         }
       }
 
-      // ---- ZERO BALANCE: position already resolved ----
-      if (currentBalance <= DUST_EPSILON) {
-        if (leg1.exitPending && leg1.exitSubmitPrice !== undefined && leg1.exitSubmitShares !== undefined) {
-          // Delayed settlement confirmation — finalize with stored accounting.
-          const soldPrice = leg1.exitSubmitPrice;
-          const loss = (entryPrice - soldPrice) * leg1.exitSubmitShares
-            + estimateTakerFee(entryPrice * leg1.exitSubmitShares, this.config.feeRateBps)
-            + estimateTakerFee(soldPrice * leg1.exitSubmitShares, this.config.feeRateBps);
-          this.stats.totalProfit -= Math.abs(loss);
-          this.log(`✅ Exit confirmed (delayed): ${leg1.exitSubmitShares.toFixed(2)} ${legSide} @ ~${soldPrice.toFixed(4)} | Loss: $${loss.toFixed(2)}`);
-        } else {
-          // Resolved without known exit attempt — no PnL inventing.
-          this.log('Leg1 position resolved externally — exit PnL unavailable');
-        }
-        leg1.exitPending = undefined;
-        leg1.exitTradeIds = undefined;
-        leg1.exitSubmitPrice = undefined;
-        leg1.exitSubmitShares = undefined;
-        if (guard && currentBalance === 0) await this.releaseClobAfterExit({originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation}, legToken);
-        return { success: true, leg: 'exit', roundId: round.roundId,
-          side: legSide, shares: currentBalance, executionTimeMs: Date.now() - startTime };
+      validateRetry?.();
+      if (retireRetry && currentBalance !== leg1.shares) {
+        throw new InventoryAdmissionRefusal('Emergency retry quantity changed before submission');
       }
-
-      // ---- PENDING GUARD: do not duplicate if prior SELL is unresolved ----
-      if (leg1.exitPending) {
-        const attempts = guard ? [...this.clobLifecycles.values()].filter(record =>
-          record.round === round && record.wallet === this.inventoryWallet(wallet ?? '') &&
-          record.tokenIds.includes(legToken) && record.writerType === 'EMERGENCY_EXIT') : [];
-        const attempt = attempts.length === 1 ? attempts[0] : undefined;
-        const childIds = guard ? (attempt?.submission === 'ACCEPTED' ? [...new Set(attempt.tradeIds)] : [])
-          : leg1.exitTradeIds;
-        if (childIds && childIds.length > 0) {
-          try {
-            const statuses = await trading.getTradeStatuses(childIds);
-            const allFailed = statuses.length > 0 && statuses.every(s => s.status === 'FAILED') &&
-              (!guard || (statuses.length === childIds.length && new Set(statuses.map(s => s.id)).size === childIds.length &&
-                statuses.every(s => childIds.includes(s.id)) && attempt!.tradeIds.every(id => childIds.includes(id))));
-            if (allFailed) {
-              this.log('All prior SELL trades definitively FAILED — clearing pending state for retry');
-              if (guard) {
-                // Delete only the captured failed attempt. A concurrent cleanup/retry owns its own state.
-                if (this.clobLifecycles.get(attempt!.operationId) !== attempt || !leg1.exitPending) {
-                  return this.inventoryBlocked({ success: false, leg: 'exit' as const, roundId: round.roundId,
-                    executionTimeMs: Date.now() - startTime }, new InventoryAdmissionRefusal('Exit attempt changed during reconciliation'));
-                }
-                this.clobLifecycles.delete(attempt!.operationId);
-              }
-              leg1.exitPending = false;
-              leg1.exitTradeIds = undefined;
-              leg1.exitSubmitPrice = undefined;
-              leg1.exitSubmitShares = undefined;
-              // continue to fresh SELL below
-            } else {
-              this.log('Prior SELL pending (trades not all FAILED) — waiting for settlement');
-              return { success: false, leg: 'exit', roundId: round.roundId,
-                error: 'Prior SELL pending settlement', executionTimeMs: Date.now() - startTime };
-            }
-          } catch (err) {
-            this.log(`Trade status query failed — waiting: ${err instanceof Error ? err.message : String(err)}`);
-            return { success: false, leg: 'exit', roundId: round.roundId,
-              error: 'Trade status query failed — waiting', executionTimeMs: Date.now() - startTime };
-            }
-        } else {
-          // exitPending but no trade IDs — ambiguous, wait
-          this.log('Prior SELL pending (no trade IDs) — waiting for settlement');
-          return { success: false, leg: 'exit', roundId: round.roundId,
-            error: 'Prior SELL pending — no trade IDs', executionTimeMs: Date.now() - startTime };
-        }
-      }
-
+      if (currentBalance <= DUST_EPSILON) return { success: false, leg: 'exit', roundId: round.roundId,
+        error: 'No attributed SELL fills; zero balance alone cannot confirm an exit', executionTimeMs: Date.now() - startTime };
       // ---- FRESH SELL using current on-chain balance ----
       const exitAmount = currentBalance;
       const currentPrice = legSide === 'UP'
@@ -1818,60 +1895,42 @@ export class DipArbService extends EventEmitter {
 
       this.log(`Selling ${exitAmount.toFixed(2)} ${legSide} tokens...`);
       const exitFloor = currentPrice * (1 - this.config.maxSlippage);
-      const result = await this.submitClob({ originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation }, 'EMERGENCY_EXIT', {
-        tokenId: legToken, side: 'SELL' as Side,
-        amount: exitAmount, price: exitFloor, orderType: 'FOK' });
-
-      if (!result.success) {
-        this.log(`❌ Leg1 exit failed: ${result.errorMsg}`);
+      const scope: ClobScope = { originMarket: originMarket!, wallet,
+        market: { ...market }, round, trading, ctf, guard, running, invocation };
+      const settlement: SellSettlement = { scope, emitted: false, composition,
+        legs: [{ tokenId: legToken, requestedShares: exitAmount, attempted: true, rejected: false,
+          tradeIds: new Set(), facts: new Map(), observed: false, completeEvidence: false }] };
+      const installAttempt = () => {
+        retireRetry?.();
+        this.emergencySells.set(leg1, { settlement, entryCost: typeof leg1.cost === 'number' &&
+          Number.isFinite(leg1.cost) && leg1.cost >= 0 && exitAmount === leg1.shares ? leg1.cost : undefined, accounted: false });
+        leg1.exitPending = true;
+      };
+      if (!retireRetry) installAttempt();
+      const result = await this.submitClob(scope, 'EMERGENCY_EXIT', {
+        tokenId: legToken, side: 'SELL' as Side, amount: exitAmount, price: exitFloor, orderType: 'FOK' },
+        retireRetry ? { retiringIds, commit: installAttempt } : undefined);
+      if (result.submissionState === 'REJECTED') {
+        this.emergencySells.delete(leg1);
+        leg1.exitPending = false;
         return { success: false, leg: 'exit', roundId: round.roundId,
           error: result.errorMsg, executionTimeMs: Date.now() - startTime };
       }
-
-      // ---- RECORD PENDING ATTEMPT ----
-      leg1.exitPending = true;
+      const factual = settlement.legs[0];
+      factual.orderId = typeof result.orderId === 'string' && result.orderId.trim() ? result.orderId.trim() : undefined;
+      factual.tradeIds = new Set(result.tradeIds ?? []);
       leg1.exitTradeIds = result.tradeIds ?? [];
-      leg1.exitSubmitPrice = currentPrice;
-      leg1.exitSubmitShares = exitAmount;
-
-      // ---- POST-SUBMIT VERIFICATION ----
-      if (ctf) {
-        try {
-          const postPos = await ctf.getPositionBalanceByTokenIds(
-            market.conditionId,
-            { yesTokenId: market.upTokenId, noTokenId: market.downTokenId }
-          );
-          const postHeld = legSide === 'UP'
-            ? parseFloat(postPos.yesBalance)
-            : parseFloat(postPos.noBalance);
-          if (Number.isFinite(postHeld) && postHeld <= DUST_EPSILON) {
-            // Settlement confirmed immediately — finalize PnL.
-            const soldPrice = currentPrice;
-            const loss = (entryPrice - soldPrice) * exitAmount
-              + estimateTakerFee(entryPrice * exitAmount, this.config.feeRateBps)
-              + estimateTakerFee(soldPrice * exitAmount, this.config.feeRateBps);
-            this.stats.totalProfit -= Math.abs(loss);
-            leg1.exitPending = undefined;
-            leg1.exitTradeIds = undefined;
-            leg1.exitSubmitPrice = undefined;
-            leg1.exitSubmitShares = undefined;
-            if (guard && postHeld === 0) await this.releaseClobAfterExit({originMarket: originMarket!, wallet, market: market!, round: round!, trading: trading!, ctf, guard, running, invocation}, legToken);
-            this.log(`✅ Leg1 exit successful: ${exitAmount.toFixed(2)} ${legSide} @ ~${soldPrice.toFixed(4)} | Loss: $${loss.toFixed(2)}`);
-            return { success: true, leg: 'exit', roundId: round.roundId,
-              side: legSide, price: soldPrice, shares: exitAmount, orderId: result.orderId,
-              executionTimeMs: Date.now() - startTime };
-          }
-        } catch {
-          // read failed — preserve pending, retry next cycle
-        }
-      }
-
-      // Settlement not yet confirmed — pending state retained for next cycle.
-      this.log('SELL submitted — awaiting settlement confirmation (retry next cycle)');
-      return { success: false, leg: 'exit', roundId: round.roundId,
-        error: 'SELL submitted — awaiting settlement', executionTimeMs: Date.now() - startTime };
+      this.log('Emergency SELL submitted — awaiting attributed factual fills');
+      return await this.reconcileEmergencySell(leg1);
     } catch (error) {
-      if (error instanceof InventoryAdmissionRefusal) return this.inventoryBlocked({ success: false, leg: 'exit' as const, roundId: round!.roundId, error: error.message, executionTimeMs: Date.now() - startTime }, error);
+      if (error instanceof InventoryAdmissionRefusal) {
+        if (retryPrior && this.emergencySells.get(leg1) === retryPrior) {
+          return { success: false, leg: 'exit', roundId: round.roundId, sellState: 'PENDING',
+            error: error.message, executionTimeMs: Date.now() - startTime };
+        }
+        this.emergencySells.delete(leg1); leg1.exitPending = false;
+        return this.inventoryBlocked({ success: false, leg: 'exit' as const, roundId: round!.roundId, error: error.message, executionTimeMs: Date.now() - startTime }, error);
+      }
       this.log(`❌ Leg1 exit error: ${error instanceof Error ? error.message : String(error)}`);
       return { success: false, leg: 'exit', roundId: round.roundId,
         error: error instanceof Error ? error.message : String(error),

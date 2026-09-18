@@ -531,12 +531,15 @@ export class TradingService {
    */
   async getOrderFillDetails(orderId: string): Promise<{
     tradeIds: string[]; sizeMatched: string; id?: string; asset_id?: string; side?: string;
+    status?: string; tradeEnumerationPresent?: boolean;
   }> {
     const client = await this.ensureInitialized();
     const order = await client.getOrder(orderId);
     return {
       tradeIds: order.associate_trades ?? [],
       sizeMatched: order.size_matched,
+      status: order.status,
+      tradeEnumerationPresent: Array.isArray(order.associate_trades),
       id: order.id,
       asset_id: order.asset_id,
       side: order.side,

@@ -2,22 +2,31 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // P0.3a-3: DipArb emergencyExitLeg1 settlement-safe.
 
-let mockTradingService: { createMarketOrder: ReturnType<typeof vi.fn>; getTradeStatuses: ReturnType<typeof vi.fn> };
-let mockCtf: { getPositionBalanceByTokenIds: ReturnType<typeof vi.fn> };
+let mockTradingService: { createMarketOrder: ReturnType<typeof vi.fn>; getTradeStatuses: ReturnType<typeof vi.fn>; getAddress: ReturnType<typeof vi.fn>; getOrderFillDetails: ReturnType<typeof vi.fn> };
+let mockCtf: { getAddress: ReturnType<typeof vi.fn>; getPositionBalanceByTokenIds: ReturnType<typeof vi.fn> };
 
 beforeEach(() => {
   vi.resetModules();
   vi.stubEnv('DRY_RUN', 'false');
   mockTradingService = {
+    getAddress: vi.fn(() => '0x' + 'ab'.repeat(20)),
+    getOrderFillDetails: vi.fn().mockResolvedValue({ id: '0xorder1', asset_id: 'tok-up', side: 'SELL', tradeIds: ['t1'], sizeMatched: '10' }),
     createMarketOrder: vi.fn().mockResolvedValue({ success: true, orderId: '0xorder1', tradeIds: ['t1'] }),
     getTradeStatuses: vi.fn().mockResolvedValue([{ id: 't1', status: 'MATCHED', transactionHash: '' }]),
   };
   mockCtf = {
+    getAddress: vi.fn(() => '0x' + 'ab'.repeat(20)),
     getPositionBalanceByTokenIds: vi.fn().mockResolvedValue({ yesBalance: '5', noBalance: '2' }),
   };
 });
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+
+function confirmSell() {
+  mockTradingService.getTradeStatuses.mockResolvedValue([{ id: 't1', status: 'CONFIRMED',
+    transactionHash: '0x' + '12'.repeat(32), asset_id: 'tok-up', side: 'SELL', size: '10', price: '0.29',
+    taker_order_id: '0xorder1', trader_side: 'TAKER', maker_orders: [] }]);
+}
 
 async function makeService() {
   const { DipArbService } = await import('./services/dip-arb-service.js');
@@ -25,10 +34,10 @@ async function makeService() {
   Object.assign(service, {
     tradingService: mockTradingService,
     ctf: mockCtf,
-    market: { conditionId: '0x01', upTokenId: 'up-tok', downTokenId: 'down-tok' },
+    market: { conditionId: '0x01', upTokenId: 'tok-up', downTokenId: 'down-tok' },
     currentRound: {
       roundId: 'r1',
-      leg1: { side: 'UP' as const, price: 0.30, shares: 10, tokenId: 'tok-up', timestamp: Date.now() },
+      leg1: { side: 'UP' as const, price: 0.30, cost: 3, shares: 10, tokenId: 'tok-up', timestamp: Date.now() },
     },
     upAsks: [{ price: 0.30 }],
     downAsks: [{ price: 0.70 }],
@@ -50,11 +59,11 @@ describe('P0.3a-3 DipArb emergencyExitLeg1 settlement-safe', () => {
     expect(mockTradingService.createMarketOrder).not.toHaveBeenCalled();
   });
 
-  it('zero pre-balance → no SELL, resolves without PnL when no exit context', async () => {
+  it('zero pre-balance → no SELL, no attributed exit or PnL', async () => {
     mockCtf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '0', noBalance: '2' });
     const service = await makeService();
     const result = await (service as any).emergencyExitLeg1();
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
     expect(mockTradingService.createMarketOrder).not.toHaveBeenCalled();
     expect((service as any).currentRound.leg1.exitPending).toBeUndefined();
   });
@@ -68,16 +77,16 @@ describe('P0.3a-3 DipArb emergencyExitLeg1 settlement-safe', () => {
   });
 
   it('successful SELL + post-balance positive → pending retained, no PnL', async () => {
-    // Set CTF balance to match leg1.shares so exitSubmitShares = 10
+    // Submission identity is retained without estimated economic metadata.
     mockCtf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '10', noBalance: '2' });
     const service = await makeService();
     const result = await (service as any).emergencyExitLeg1();
     expect(result.success).toBe(false);
-    expect(result.error).toContain('awaiting settlement');
+    expect(result.sellState).toBe('PENDING');
     expect((service as any).currentRound.leg1.exitPending).toBe(true);
     expect((service as any).currentRound.leg1.exitTradeIds).toEqual(['t1']);
-    expect((service as any).currentRound.leg1.exitSubmitPrice).toBe(0.30);
-    expect((service as any).currentRound.leg1.exitSubmitShares).toBe(10);
+    expect((service as any).currentRound.leg1.exitSubmitPrice).toBeUndefined();
+    expect((service as any).currentRound.leg1.exitSubmitShares).toBeUndefined();
     expect((service as any).stats.totalProfit).toBe(0); // no PnL yet
   });
 
@@ -87,7 +96,7 @@ describe('P0.3a-3 DipArb emergencyExitLeg1 settlement-safe', () => {
     mockTradingService.createMarketOrder.mockClear();
     const result = await (service as any).emergencyExitLeg1(); // second call
     expect(result.success).toBe(false);
-    expect(result.error).toContain('pending settlement');
+    expect(result.sellState).toBe('PENDING');
     expect(mockTradingService.createMarketOrder).not.toHaveBeenCalled();
   });
 
@@ -98,7 +107,7 @@ describe('P0.3a-3 DipArb emergencyExitLeg1 settlement-safe', () => {
     mockTradingService.createMarketOrder.mockClear();
     const result = await (service as any).emergencyExitLeg1();
     expect(result.success).toBe(false);
-    expect(result.error).toContain('no trade IDs');
+    expect(result.sellState).toBe('PENDING');
     expect(mockTradingService.createMarketOrder).not.toHaveBeenCalled();
   });
 
@@ -109,19 +118,18 @@ describe('P0.3a-3 DipArb emergencyExitLeg1 settlement-safe', () => {
     mockTradingService.createMarketOrder.mockClear();
     const result = await (service as any).emergencyExitLeg1();
     expect(result.success).toBe(false);
-    expect(result.error).toContain('waiting');
+    expect(result.sellState).toBe('PENDING');
     expect(mockTradingService.createMarketOrder).not.toHaveBeenCalled();
   });
 
-  it('pending + all FAILED → fresh SELL allowed with current balance', async () => {
+  it('pending + known FAILED without terminal order proof → no fresh SELL', async () => {
     const service = await makeService();
     await (service as any).emergencyExitLeg1(); // first SELL, sets pending
     mockTradingService.getTradeStatuses.mockResolvedValue([{ id: 't1', status: 'FAILED' }]);
     mockTradingService.createMarketOrder.mockClear();
     const result = await (service as any).emergencyExitLeg1();
-    // After FAILED, pending cleared and new SELL submitted
-    expect(mockTradingService.createMarketOrder).toHaveBeenCalledTimes(1);
-    // New SELL sets pending again (fresh SELL → exitPending = true)
+    // Known failures do not prove order terminality; retain the original attempt.
+    expect(mockTradingService.createMarketOrder).not.toHaveBeenCalled();
     expect((service as any).currentRound.leg1.exitPending).toBe(true);
   });
 
@@ -158,22 +166,24 @@ describe('P0.3a-3 DipArb emergencyExitLeg1 settlement-safe', () => {
     expect((service as any).stats.totalProfit).toBe(0);
   });
 
-  it('delayed CTF zero → finalize using stored exitSubmitPrice and exitSubmitShares', async () => {
+  it('delayed attributed fills + CTF zero → factual completion', async () => {
     mockCtf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '10', noBalance: '2' });
     const service = await makeService();
-    await (service as any).emergencyExitLeg1(); // sets exitSubmitPrice=0.30, exitSubmitShares=10
+    await (service as any).emergencyExitLeg1(); // Submission alone stays pending.
+    confirmSell();
     // Next cycle: CTF balance zero, pending set
     mockCtf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '0', noBalance: '2' });
     mockTradingService.createMarketOrder.mockClear();
     const result = await (service as any).emergencyExitLeg1();
     expect(result.success).toBe(true);
     expect(mockTradingService.createMarketOrder).not.toHaveBeenCalled();
-    // PnL recorded using stored price
+    // PnL uses attributed fill price and factual entry cost.
     expect((service as any).stats.totalProfit).toBeLessThan(0);
-    expect((service as any).currentRound.leg1.exitPending).toBeUndefined();
+    expect((service as any).currentRound.leg1.exitPending).toBe(false);
   });
 
-  it('immediate post-SELL CTF zero → one completion, PnL recorded', async () => {
+  it('immediate confirmed fill + CTF zero → one completion, PnL recorded', async () => {
+    confirmSell();
     mockCtf.getPositionBalanceByTokenIds
       .mockResolvedValueOnce({ yesBalance: '10', noBalance: '2' }) // pre-check
       .mockResolvedValueOnce({ yesBalance: '0', noBalance: '2' });  // post-check
@@ -181,7 +191,7 @@ describe('P0.3a-3 DipArb emergencyExitLeg1 settlement-safe', () => {
     const result = await (service as any).emergencyExitLeg1();
     expect(result.success).toBe(true);
     expect((service as any).stats.totalProfit).toBeLessThan(0);
-    expect((service as any).currentRound.leg1.exitPending).toBeUndefined();
+    expect((service as any).currentRound.leg1.exitPending).toBe(false);
   });
 
   it('unconfirmed exit keeps round in leg1_filled phase', async () => {
@@ -199,6 +209,7 @@ describe('P0.3a-3 DipArb emergencyExitLeg1 settlement-safe', () => {
   });
 
   it('confirmed exit advances lifecycle: phase=expired, counters incremented', async () => {
+    confirmSell();
     mockCtf.getPositionBalanceByTokenIds
       .mockResolvedValueOnce({ yesBalance: '10', noBalance: '2' })
       .mockResolvedValueOnce({ yesBalance: '0', noBalance: '2' });

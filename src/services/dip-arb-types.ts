@@ -386,6 +386,11 @@ export interface DipArbExecutionResult {
   side?: DipArbSide;
   /** 成交价格 */
   price?: number;
+  /** Cumulative attributed emergency SELL facts, never submission estimates. */
+  amountReceived?: number;
+  residual?: number;
+  sellState?: 'PENDING' | 'RESIDUAL' | 'NO_FILL' | 'COMPLETE';
+  profit?: number;
   /** Factual BUY cost when known. */
   cost?: number;
   /** 成交份额 */

@@ -9,12 +9,12 @@ function fixture(existing = false, isolation = true) {
     const submissions = trading.createMarketOrder.mock.calls;
     const index = trading.createMarketOrder.mock.results.findIndex((_: unknown, i: number) => id === `order-${i + 1}`);
     const params = submissions[index >= 0 ? index : 0]?.[0] as any;
-    return { price: String(params?.price ?? .4), token: params?.tokenId ?? 'up', size: String(params?.side === 'SELL' ? params.amount : (params?.amount ?? 4) / (params?.price ?? .4)) };
+    return { side: params?.side ?? 'BUY', price: String(params?.price ?? .4), token: params?.tokenId ?? 'up', size: String(params?.side === 'SELL' ? params.amount : (params?.amount ?? 4) / (params?.price ?? .4)) };
   };
   const trading = { getAddress: vi.fn(() => wallet), createMarketOrder: vi.fn().mockImplementation(async () => accepted(`order-${++n}`)),
-    getOrderFillDetails: vi.fn(async (id: string): Promise<any> => ({ id, asset_id: factualBuy(id).token, side: 'BUY', tradeIds: [id], sizeMatched: factualBuy(id).size })),
+    getOrderFillDetails: vi.fn(async (id: string): Promise<any> => ({ id, asset_id: factualBuy(id).token, side: factualBuy(id).side, tradeIds: [id], sizeMatched: factualBuy(id).size })),
     getTradeStatuses: vi.fn(async (ids: string[]): Promise<any[]> => ids.map(id => ({ id, status:'MINED', transactionHash:'0x'+'12'.repeat(32), size:factualBuy(id).size,
-      price:factualBuy(id).price, asset_id:factualBuy(id).token, side:'BUY', taker_order_id:id, trader_side:'TAKER', maker_orders:[] }))) };
+      price:factualBuy(id).price, asset_id:factualBuy(id).token, side:factualBuy(id).side, taker_order_id:id, trader_side:'TAKER', maker_orders:[] }))) };
   const ctf = { getAddress: () => wallet, getPositionBalanceByTokenIds: vi.fn().mockResolvedValue({yesBalance:'10',noBalance:'10'}) };
   const service = new DipArbService({} as any,trading as any,{} as any);
   const round: any = {roundId:'r1',phase:existing?'leg1_filled':'waiting',startTime:Date.now(),
@@ -176,7 +176,7 @@ describe('DipArb CLOB inventory isolation',()=>{
     expect(h.events.execution).not.toHaveBeenCalled();expect(h.events.inventoryBlocked).toHaveBeenCalledTimes(1);
   });
   it('setter does not resurrect factually closed leg protection',async()=>{
-    const h=fixture(true);h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({yesBalance:'0',noBalance:'10'});
+    const h=fixture(true);h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({yesBalance:'0',noBalance:'10'}).mockResolvedValueOnce({yesBalance:'10',noBalance:'10'});
     await h.exit();expect(h.protection()).toBeUndefined();h.service.setInventoryAdmissionGuard(h.guard);expect(h.protection()).toBeUndefined();
   });
 
@@ -306,7 +306,8 @@ describe('DipArb CLOB inventory isolation',()=>{
     h.trading.getOrderFillDetails.mockResolvedValue({ tradeIds: [], sizeMatched: '10' });
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '0', noBalance: '0' });
     await h.service['checkAndStartNewRound']();
-    expect(h.round.phase).toBe('expired');
+    expect(h.round.phase).toBe('leg1_filled'); // Zero balance is not an attributed emergency exit.
+    h.round.phase = 'expired'; // Exercise the existing late-fact cleanup after external rotation.
     expect(h.protection()).toBeDefined();
     await h.service['checkAndStartNewRound']();
     const b = h.service['currentRound']!;
@@ -502,9 +503,10 @@ describe('DipArb CLOB inventory isolation',()=>{
     expect(h.protection()).toBeDefined();
   });
 
-  it('discovered all-failed exit children retire only that attempt and preserve protected retry', async () => {
+  it('discovered failed children preserve the attempt without terminal order proof', async () => {
     const h = fixture(true);
     h.trading.createMarketOrder.mockResolvedValueOnce({ ...accepted('sell-1'), tradeIds: ['a'] });
+    h.trading.getOrderFillDetails.mockResolvedValueOnce({ tradeIds: ['a'], sizeMatched: '10' });
     await h.exit();
     const first = [...h.service['clobLifecycles'].values()].find(r => r.writerType === 'EMERGENCY_EXIT')!;
     h.trading.getOrderFillDetails.mockResolvedValue({ tradeIds: ['a', 'b'], sizeMatched: '10' });
@@ -515,31 +517,15 @@ describe('DipArb CLOB inventory isolation',()=>{
     h.trading.getTradeStatuses.mockImplementation(async ids => ids.map(id => ({ id, status: 'FAILED', transactionHash: '', size: '5' })));
     const position = h.round.leg1;
     const stats = economicStats(h.service);
-    h.guard.mockImplementation(() => {
-      expect(h.round.leg1.exitPending).toBe(false);
-      expect(h.protection()).toBeDefined();
-      expect(h.service['clobLifecycles'].has(first.operationId)).toBe(false);
-      return 'EXTERNAL_CONFLICT';
-    });
-    expect(await h.exit()).toMatchObject({ status: 'BLOCKED_INVENTORY' });
+    expect(await h.exit()).toMatchObject({ success: false, orderId: 'sell-1' });
     expect(h.trading.getTradeStatuses).toHaveBeenLastCalledWith(['a', 'b']);
     expect(h.round.leg1).toBe(position);
     expect(position.shares).toBe(10);
-    expect(position.exitPending).toBe(false);
+    expect(position.exitPending).toBe(true);
     expect(h.protection()).toBeDefined();
+    await h.exit();
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(1);
-    h.guard.mockReturnValue(undefined);
-    h.trading.createMarketOrder.mockResolvedValueOnce({ ...accepted('sell-2'), tradeIds: ['c'] });
-    await h.exit();
-    expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(2);
-    expect(h.trading.createMarketOrder.mock.calls.every(([p]) => p.side === 'SELL' && p.amount === 10)).toBe(true);
-    const second = [...h.service['clobLifecycles'].values()].find(r => r.writerType === 'EMERGENCY_EXIT')!;
-    expect(second.operationId).not.toBe(first.operationId);
-    expect(second).toMatchObject({ orderId: 'sell-2', tradeIds: ['c'], submission: 'ACCEPTED' });
-    h.trading.getTradeStatuses.mockResolvedValue([{ id: 'c', status: 'MATCHED', transactionHash: '', size: '10' }]);
-    await h.exit();
-    expect(h.service['clobLifecycles'].get(second.operationId)).toBe(second);
-    expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(2);
+    expect(h.service['clobLifecycles'].get(first.operationId)).toBe(first);
     expect(economicStats(h.service)).toEqual(stats);
     for (const key of ['execution', 'settled', 'roundComplete'] as const) expect(h.events[key]).not.toHaveBeenCalled();
   });
@@ -547,6 +533,7 @@ describe('DipArb CLOB inventory isolation',()=>{
   it.each(['missing', 'pending', 'success'])('discovered child %s prevents all-failed cleanup', async state => {
     const h = fixture(true);
     h.trading.createMarketOrder.mockResolvedValueOnce({ ...accepted('sell-1'), tradeIds: ['a'] });
+    h.trading.getOrderFillDetails.mockResolvedValueOnce({ tradeIds: ['a'], sizeMatched: '10' });
     await h.exit();
     h.trading.getOrderFillDetails.mockResolvedValue({ tradeIds: ['a', 'b'], sizeMatched: '10' });
     h.trading.getTradeStatuses.mockResolvedValue([]);
@@ -565,9 +552,10 @@ describe('DipArb CLOB inventory isolation',()=>{
     expect(h.protection()).toBeDefined();
   });
 
-  it('concurrent failed-exit cleanup cannot remove the independent retry', async () => {
+  it('concurrent known-failed observations retain the original exit', async () => {
     const h = fixture(true);
     h.trading.createMarketOrder.mockResolvedValueOnce({ ...accepted('sell-1'), tradeIds: ['a'] });
+    h.trading.getOrderFillDetails.mockResolvedValueOnce({ tradeIds: ['a'], sizeMatched: '10' });
     await h.exit();
     const facts = deferred();
     h.trading.getTradeStatuses.mockReturnValue(facts.promise);
@@ -576,9 +564,9 @@ describe('DipArb CLOB inventory isolation',()=>{
     await Promise.resolve(); await Promise.resolve();
     facts.resolve([{ id: 'a', status: 'FAILED', size: '10' }]);
     await Promise.all([one, two]);
-    expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(2);
+    expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(1);
     expect([...h.service['clobLifecycles'].values()].filter(r => r.writerType === 'EMERGENCY_EXIT'))
-      .toEqual([expect.objectContaining({ orderId: 'sell-2', tradeIds: ['c'] })]);
+      .toEqual([expect.objectContaining({ orderId: 'sell-1', tradeIds: ['a'] })]);
     expect(h.round.leg1.exitPending).toBe(true);
     expect(h.protection()).toBeDefined();
   });
