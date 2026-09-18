@@ -49,10 +49,10 @@ describe.each(['BUY', 'SELL'] as const)('P0.3j.1 %s factual authority', side => 
     h.trading.getTradeStatuses.mockResolvedValue([taker(side)]); await h.flush();
     expect(h.record).toHaveBeenCalledTimes(1);
   });
-  it.each([false, true])('valid taker books once (guard=%s), preserving sizing and acceptance metrics', async guard => {
+  it.each([false, true])('valid taker books once (guard=%s), preserving sizing with metrics deferred to fills', async guard => {
     const h = await fixture(side, guard);
-    expect(h.record).not.toHaveBeenCalled(); expect(h.sub.stats.tradesExecuted).toBe(1);
-    expect(h.sub.stats.totalUsdcSpent).toBe(4); expect(h.sub.stats.totalFeesEstimateUsd).toBe(.04);
+    expect(h.record).not.toHaveBeenCalled(); expect(h.sub.stats.tradesExecuted).toBe(0);
+    expect(h.sub.stats.totalUsdcSpent).toBe(0); expect(h.sub.stats.totalFeesEstimateUsd).toBe(0);
     expect(h.trading.createMarketOrder.mock.calls[0]).toEqual([expect.objectContaining({ side, amount: side === 'BUY' ? 4 : 10 })]);
     await h.flush(); await h.flush();
     expect(h.record).toHaveBeenCalledTimes(1); expect(h.record).toHaveBeenCalledWith('token', side, 10, .5, .05);

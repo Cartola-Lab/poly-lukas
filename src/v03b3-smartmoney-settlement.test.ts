@@ -57,9 +57,9 @@ describe('P0.3b-3 Smart Money settlement accounting', () => {
   it('MATCHED waits, then attributed MINED fill resolves exactly once', async () => {
     const h = await setup();
     expect(h.record).not.toHaveBeenCalled();
-    expect(h.sub.stats.tradesExecuted).toBe(1);
-    expect(h.sub.stats.totalUsdcSpent).toBe(4);
-    expect(h.sub.stats.totalFeesEstimateUsd).toBe(0.04);
+    expect(h.sub.stats.tradesExecuted).toBe(0);
+    expect(h.sub.stats.totalUsdcSpent).toBe(0);
+    expect(h.sub.stats.totalFeesEstimateUsd).toBe(0);
     await h.flush();
     expect(h.record).not.toHaveBeenCalled();
     h.trading.getTradeStatuses.mockResolvedValue([child('a', 'MINED', '4.25', '0.4', 'hash')]);
@@ -173,7 +173,7 @@ describe('P0.3b-3 Smart Money settlement accounting', () => {
     h.trading.createMarketOrder.mockResolvedValue({ success: true, orderId });
     await h.emit(); await h.flush();
     expect(h.record).not.toHaveBeenCalled(); expect(console.warn).toHaveBeenCalled();
-    expect(h.sub.stats.tradesExecuted).toBe(2);
+    expect(h.sub.stats.tradesExecuted).toBe(0);
   });
 
   it.each([undefined, '', 'abc', '0', '-0.2'])('missing/invalid success price %s preserves pending', async price => {

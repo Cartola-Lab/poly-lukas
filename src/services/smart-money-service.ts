@@ -243,13 +243,13 @@ export interface AutoCopyTradingOptions {
    */
   preExecutionGuard?: PreExecutionGuard;
 
-  /** Callbacks */
+  /** Once per order, on its first reconciled execution; size/price describe that factual delta. */
   onTrade?: (trade: SmartMoneyTrade, result: OrderResult) => void;
   /**
    * Fired when an executed copy closes (part of) a tracked lot, with the
    * realized PnL for that close (USDC, net of estimated fees). This is the
    * audit-#2 fix: copy performance is measured from closes, not $0 per copy.
-   * Fill prices are estimates (limit used); see CopyPnlTracker docs.
+   * Quantity and price come from reconciled fills; fees retain the configured estimate.
    */
   onCopyPnl?: (info: {
     tokenId: string;
@@ -290,9 +290,11 @@ function normalizeAutoCopyOptions(options: AutoCopyTradingOptions) {
 export interface AutoCopyTradingStats {
   startTime: number;
   tradesDetected: number;
+  /** Orders with at least one reconciled factual fill (BUY or SELL). */
   tradesExecuted: number;
   tradesSkipped: number;
   tradesFailed: number;
+  /** Cumulative factual BUY notional; SELL does not subtract from this total. */
   totalUsdcSpent: number;
   /** Estimated taker fees paid across executed copies (USDC) */
   totalFeesEstimateUsd: number;
@@ -1324,7 +1326,7 @@ export class SmartMoneyService {
 
     // Subscription-local state: no timers or persistence. Retain finalized IDs to
     // reject a repeated order result even after its pending entry is removed.
-    const pendingFills = new Map<string, { tokenId: string; side: 'BUY' | 'SELL'; ids?: Set<string>; facts?: Map<string, string>;
+    const pendingFills = new Map<string, { tokenId: string; side: 'BUY' | 'SELL'; sourceTrade: SmartMoneyTrade; walletAddr: string; executionCounted?: boolean; ids?: Set<string>; facts?: Map<string, string>;
       accounted?: Set<string>; accountingUncertain?: boolean; unresolvedSellShares?: number }>();
     const inventory = options.inventoryAdmissionGuard && !dryRun
       ? { writers: new Map<string, CopyInventoryWriter>(), pending: pendingFills, tracker: pnlTracker } as CopyInventoryContext
@@ -1431,6 +1433,27 @@ export class SmartMoneyService {
             fill.accountingUncertain = true;
             for (const id of newIds) accounted.add(id);
             const price = notional / settledShares;
+            // Execution metrics share the already-claimed factual delta, independent
+            // of how much of a SELL has a known local FIFO cost basis.
+            const firstExecution = !fill.executionCounted;
+            fill.executionCounted = true;
+            if (firstExecution) {
+              stats.tradesExecuted++;
+              this.getOrCreateWalletHealth(fill.walletAddr).copiesExecuted++;
+              this.bumpWalletCounter(stats, fill.walletAddr, 'executed');
+            }
+            if (fill.side === 'BUY') stats.totalUsdcSpent += notional;
+            stats.totalFeesEstimateUsd += settledFee;
+            if (firstExecution) {
+              try {
+                options.onTrade?.({ ...fill.sourceTrade, tokenId: fill.tokenId,
+                  side: fill.side, size: settledShares, price, txHash: undefined },
+                  { success: true, orderId, tradeIds: [...newIds] });
+              } catch (error) {
+                // An observer cannot replay metrics or interrupt FIFO accounting.
+                console.warn('[SmartMoneyService] Execution observer failed:', error);
+              }
+            }
             let close = { closedSize: 0, realizedUsd: 0 };
             if (fill.side === 'BUY') {
               close = pnlTracker.recordFill(fill.tokenId, fill.side, settledShares, price, settledFee);
@@ -1617,7 +1640,6 @@ export class SmartMoneyService {
             : referencePrice * (1 - maxSlippage);
 
           const usdcAmount = copyValue; // Already calculated above
-          const feeEstimate = estimateTakerFee(usdcAmount, feeRateBps);
 
           // Audit #4: risk gate on exposure-opening (BUY) copies only.
           if (trade.side === 'BUY') {
@@ -1679,7 +1701,7 @@ export class SmartMoneyService {
               } else if (result.submissionState === 'ACCEPTED' && orderId) {
                 // A reused order identity cannot prove ownership of this new attempt.
                 if (!finalizedOrderIds.has(orderId) && !pendingFills.has(orderId)) {
-                  pendingFills.set(orderId, { tokenId, side: trade.side, ids: new Set(result.tradeIds ?? []) });
+                  pendingFills.set(orderId, { tokenId, side: trade.side, sourceTrade: { ...trade }, walletAddr, ids: new Set(result.tradeIds ?? []) });
                   inventory.writers.delete(writer.localOperationId);
                 } else writer.state = 'UNCERTAIN';
               } else writer.state = 'UNCERTAIN';
@@ -1687,18 +1709,13 @@ export class SmartMoneyService {
           }
 
           if (result.success) {
-            stats.tradesExecuted++;
-            stats.totalUsdcSpent += usdcAmount;
-            stats.totalFeesEstimateUsd += feeEstimate;
-            health.copiesExecuted++;
             health.consecutiveFailures = 0;
-            this.bumpWalletCounter(stats, walletAddr, 'executed');
             if (!dryRun && !inventory) {
               const orderId = typeof result.orderId === 'string' ? result.orderId.trim() : '';
               if (!orderId) {
                 console.warn('[SmartMoneyService] Successful copy without usable orderId; accounting withheld');
               } else if (!finalizedOrderIds.has(orderId) && !pendingFills.has(orderId)) {
-                pendingFills.set(orderId, { tokenId, side: trade.side, ids: new Set(result.tradeIds ?? []) });
+                pendingFills.set(orderId, { tokenId, side: trade.side, sourceTrade: { ...trade }, walletAddr, ids: new Set(result.tradeIds ?? []) });
               }
             }
           } else {
@@ -1718,7 +1735,6 @@ export class SmartMoneyService {
                 (result.submissionState === 'ACCEPTED' || (!inventory && result.success))))) {
             unsettledSubmissions.delete(submission);
           }
-          options.onTrade?.(trade, result);
         } catch (error) {
           if (!submissionStarted && !isCurrent()) return;
           stats.tradesFailed++;

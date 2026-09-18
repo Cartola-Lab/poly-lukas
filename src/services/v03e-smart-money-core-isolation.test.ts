@@ -121,7 +121,8 @@ describe('P0.3e Smart Money core inventory isolation', () => {
       return original(id, value);
     };
     h.onTrade.mockImplementation(() => expect(h.protection()).toMatchObject({ reason: 'SMART_MONEY_PENDING' }));
-    await h.emit(); expect(h.onTrade).toHaveBeenCalledTimes(1);
+    await h.emit(); expect(h.onTrade).not.toHaveBeenCalled();
+    h.terminal(); await h.flush(); expect(h.onTrade).toHaveBeenCalledTimes(1);
   });
   it('REJECTED releases only the attempt', async () => {
     const h = await fixture(); h.trading.createMarketOrder.mockResolvedValueOnce({ success: false, submissionState: 'REJECTED' });
@@ -220,7 +221,7 @@ describe('P0.3e Smart Money core inventory isolation', () => {
     expect(h.trading.getAddress).not.toHaveBeenCalled();
     expect(h.protection()).toBeUndefined();
     h.terminal(); await h.flush();
-    expect(h.sub.stats.tradesExecuted).toBe(2);
+    expect(h.sub.stats.tradesExecuted).toBe(1);
   });
   it('admission runs after asynchronous quote preparation', async () => {
     const guard = vi.fn<NonNullable<AutoCopyTradingOptions['inventoryAdmissionGuard']>>(() => undefined);
@@ -243,9 +244,10 @@ describe('P0.3e Smart Money core inventory isolation', () => {
     h.trading.createMarketOrder.mockResolvedValueOnce(accepted('order-1'));
     await h.emit(); expect(h.protection()).toMatchObject({ reason: 'SMART_MONEY_UNCERTAIN' });
   });
-  it('onTrade exception after acceptance does not orphan an active writer', async () => {
+  it('onTrade exception after factual execution does not orphan its lifecycle', async () => {
     const h = await fixture(); h.onTrade.mockImplementation(() => { throw new Error('callback'); });
-    await h.emit(); h.terminal('10', true); await h.flush(); expect(h.protection()).toBeUndefined();
+    await h.emit(); expect(h.onTrade).not.toHaveBeenCalled(); h.terminal(); await h.flush();
+    expect(h.onTrade).toHaveBeenCalledTimes(1); expect(h.protection()?.reason).toBe('SMART_MONEY_OPEN_LOT');
   });
   it('onCopyPnl exception after full close does not retain a stale lock or replay accounting', async () => {
     const h = await fixture(); await h.emit(); h.terminal(); await h.flush(); await h.emit('SELL');

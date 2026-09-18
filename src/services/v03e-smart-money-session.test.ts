@@ -100,7 +100,9 @@ describe('Smart Money single economic session pause/resume', () => {
     expect(h.trading.createMarketOrder).not.toHaveBeenCalled(); expect(h.onTrade).not.toHaveBeenCalled();
     expect(h.session.stats.tradesFailed).toBe(0); expect(h.protection()).toBeUndefined();
     const fresh = h.emit(); await vi.advanceTimersByTimeAsync(100); await fresh;
-    expect(h.onTrade).toHaveBeenCalledTimes(1);
+    expect(h.onTrade).not.toHaveBeenCalled();
+    expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(dryRun ? 0 : 1);
+    if (!dryRun) { h.terminal(); await h.session.reconcile(); expect(h.onTrade).toHaveBeenCalledTimes(1); }
   });
   it('stale quote callback cannot register a writer or submit', async () => {
     const h = await fixture(), quote = deferred<any>();
@@ -140,8 +142,8 @@ describe('Smart Money single economic session pause/resume', () => {
     await running;
     expect(h.protection()?.reason).toBe(submissionState === 'ACCEPTED' ? 'SMART_MONEY_PENDING'
       : submissionState === 'UNCERTAIN' ? 'SMART_MONEY_UNCERTAIN' : undefined);
-    expect(h.onTrade).toHaveBeenCalledTimes(1);
-    if (submissionState === 'ACCEPTED') { h.terminal(); await h.session.reconcile(); expect(h.protection()?.reason).toBe('SMART_MONEY_OPEN_LOT'); }
+    expect(h.onTrade).not.toHaveBeenCalled();
+    if (submissionState === 'ACCEPTED') { h.terminal(); await h.session.reconcile(); expect(h.protection()?.reason).toBe('SMART_MONEY_OPEN_LOT'); expect(h.onTrade).toHaveBeenCalledTimes(1); }
   });
   it.each([false, true])('concurrent reconciles share one promise (paused=%s)', async paused => {
     const h = await fixture(); await h.emit(); if (paused) h.session.stop();
