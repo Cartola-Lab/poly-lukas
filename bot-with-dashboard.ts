@@ -1429,10 +1429,14 @@ async function setupDipArb(sdk: PolymarketSDK) {
       // expired / partial: book only when Leg1 was actually exited for a price
       const leg1 = r.leg1;
       const exit = r.exitResult;
-      if (leg1 && exit?.success && (exit.shares ?? 0) > 0 && exit.price !== undefined) {
+      if (leg1 && typeof leg1.price === 'number' && Number.isFinite(leg1.price) &&
+          exit?.success && typeof exit.price === 'number' && Number.isFinite(exit.price) &&
+          typeof exit.shares === 'number' && Number.isFinite(exit.shares) && exit.shares > 0) {
         const netProfit = (exit.price - leg1.price) * (exit.shares ?? 0);
         recordRealized(netProfit);
         log('TRADE', `DipArb round ${r.roundId.slice(0, 12)} ${r.status}: exited Leg1 ${exit.shares!.toFixed(1)} @ $${exit.price.toFixed(3)} → $${netProfit.toFixed(2)}`);
+      } else if (leg1 && (typeof leg1.price !== 'number' || !Number.isFinite(leg1.price))) {
+        log('WARN', `DipArb round ${r.roundId.slice(0, 12)} ${r.status}: entry price UNKNOWN; no realized accounting; position state preserved`);
       } else {
         log('WARN', `DipArb round ${r.roundId.slice(0, 12)} ${r.status}: no booked exit${exit ? ` (${exit.error ?? 'exit failed'})` : ''} — PnL untracked, exposure sync will reflect it`);
       }

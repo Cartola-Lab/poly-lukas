@@ -97,7 +97,7 @@ describe.each([false, true])('P0.3g.1 BUY quantity (guard=%s)', guard => {
     expect(h.round[`leg${leg}`]).toBeUndefined();
     expect(h.round.phase).toBe(leg === 1 ? 'waiting' : 'leg1_filled');
     expect(h.events.roundComplete).not.toHaveBeenCalled();
-    expect(await h.run()).toMatchObject({ success: true, shares: 10, price: .4 });
+    expect(await h.run()).toMatchObject({ success: true, shares: 10, price: .3 });
     const stats = h.service.getStats();
     await h.run();
     expect(h.trading.createMarketOrder).toHaveBeenCalledTimes(1);
@@ -240,8 +240,8 @@ describe.each([false, true])('P0.3g.1 BUY quantity (guard=%s)', guard => {
     const h = fixture(1, guard);
     const client = { getOrder: vi.fn(async () => ({ id: 'order', asset_id: 'up', side: 'BUY', size_matched: '10', associate_trades: ['fill'] })),
       getTrades: vi.fn(async () => [{ ...h.trade(), transaction_hash: hash, trader_side: 'MAKER', taker_order_id: 'other', side: 'SELL', size: '100',
-        maker_orders: [{ order_id: 'order', asset_id: 'up', side: 'BUY', matched_amount: '10', price: '.4' },
-          { order_id: 'another', asset_id: 'up', side: 'BUY', matched_amount: '90', price: '.4' }] }]) };
+        maker_orders: [{ order_id: 'order', asset_id: 'up', side: 'BUY', matched_amount: '10', price: '0.4' },
+          { order_id: 'another', asset_id: 'up', side: 'BUY', matched_amount: '90', price: '0.4' }] }]) };
     Object.assign(h.trading, { ensureInitialized: async () => client,
       getOrderFillDetails: TradingService.prototype.getOrderFillDetails, getTradeStatuses: TradingService.prototype.getTradeStatuses });
     expect(await h.run()).toMatchObject({ success: true, shares: 10 });

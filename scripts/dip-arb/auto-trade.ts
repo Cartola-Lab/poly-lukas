@@ -388,12 +388,19 @@ async function main() {
 
     // Show current position
     if (round) {
-      if (round.phase === 'leg1_filled' && round.leg1) {
+      if (round.phase === 'leg1_filled' && round.leg1 && round.leg1.shares > 0 && round.leg1.price !== undefined && round.leg1.cost !== undefined && !(round.leg2 && round.leg2.shares > 0)) {
         log(`  📊 Position: ${round.leg1.shares}x ${round.leg1.side} @ ${round.leg1.price.toFixed(4)} | Waiting for Leg2...`);
-      } else if (round.phase === 'completed' && round.leg1 && round.leg2) {
+      } else if (round.phase === 'completed' && round.leg1 && round.leg1.shares > 0 && round.leg2 && round.leg2.shares > 0 && round.leg1.price !== undefined && round.leg2.price !== undefined && round.leg1.cost !== undefined && round.leg2.cost !== undefined) {
         const totalCost = round.leg1.price + round.leg2.price;
         const profit = (1 - totalCost) * round.leg1.shares;
         log(`  📊 Position: ${round.leg1.shares}x UP + ${round.leg2.shares}x DOWN | Cost: ${totalCost.toFixed(4)} | Profit: $${profit.toFixed(2)}`);
+      } else if ((round.leg1 && round.leg1.shares > 0) || (round.leg2 && round.leg2.shares > 0)) {
+        for (const leg of [round.leg1, round.leg2]) {
+          if (!leg || leg.shares <= 0) continue;
+          const price = leg.price === undefined ? 'UNKNOWN' : leg.price.toFixed(4);
+          const cost = leg.cost === undefined ? 'UNKNOWN' : leg.cost.toFixed(4);
+          log(`  📊 Position: ${leg.shares}x ${leg.side} @ ${price} | Cost: ${cost} | Phase: ${round.phase}`);
+        }
       } else if (round.phase === 'waiting') {
         log(`  📊 Position: None (waiting for signal)`);
       }

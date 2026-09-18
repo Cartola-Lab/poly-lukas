@@ -9,12 +9,12 @@ function fixture(existing = false, isolation = true) {
     const submissions = trading.createMarketOrder.mock.calls;
     const index = trading.createMarketOrder.mock.results.findIndex((_: unknown, i: number) => id === `order-${i + 1}`);
     const params = submissions[index >= 0 ? index : 0]?.[0] as any;
-    return { token: params?.tokenId ?? 'up', size: String(params?.side === 'SELL' ? params.amount : (params?.amount ?? 4) / (params?.price ?? .4)) };
+    return { price: String(params?.price ?? .4), token: params?.tokenId ?? 'up', size: String(params?.side === 'SELL' ? params.amount : (params?.amount ?? 4) / (params?.price ?? .4)) };
   };
   const trading = { getAddress: vi.fn(() => wallet), createMarketOrder: vi.fn().mockImplementation(async () => accepted(`order-${++n}`)),
     getOrderFillDetails: vi.fn(async (id: string): Promise<any> => ({ id, asset_id: factualBuy(id).token, side: 'BUY', tradeIds: [id], sizeMatched: factualBuy(id).size })),
     getTradeStatuses: vi.fn(async (ids: string[]): Promise<any[]> => ids.map(id => ({ id, status:'MINED', transactionHash:'0x'+'12'.repeat(32), size:factualBuy(id).size,
-      asset_id:factualBuy(id).token, side:'BUY', taker_order_id:id, trader_side:'TAKER', maker_orders:[] }))) };
+      price:factualBuy(id).price, asset_id:factualBuy(id).token, side:'BUY', taker_order_id:id, trader_side:'TAKER', maker_orders:[] }))) };
   const ctf = { getAddress: () => wallet, getPositionBalanceByTokenIds: vi.fn().mockResolvedValue({yesBalance:'10',noBalance:'10'}) };
   const service = new DipArbService({} as any,trading as any,{} as any);
   const round: any = {roundId:'r1',phase:existing?'leg1_filled':'waiting',startTime:Date.now(),

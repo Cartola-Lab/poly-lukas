@@ -254,7 +254,9 @@ export interface DipArbLegInfo {
   /** 买入侧 */
   side: DipArbSide;
   /** 成交价格 */
-  price: number;
+  price: number | undefined;
+  /** Factual aggregate BUY cost; unknown until every fill has a valid price. */
+  cost?: number;
   /** 份额数量 */
   shares: number;
   /** 成交时间 */
@@ -384,6 +386,8 @@ export interface DipArbExecutionResult {
   side?: DipArbSide;
   /** 成交价格 */
   price?: number;
+  /** Factual BUY cost when known. */
+  cost?: number;
   /** 成交份额 */
   shares?: number;
   /** 订单 ID */
@@ -457,7 +461,8 @@ export interface DipArbStats {
     roundId: string;
     phase: DipArbPhase;
     priceToBeat: number;
-    leg1?: { side: DipArbSide; price: number };
+    leg1?: Pick<DipArbLegInfo, 'side' | 'tokenId' | 'shares' | 'price' | 'cost'>;
+    leg2?: Pick<DipArbLegInfo, 'side' | 'tokenId' | 'shares' | 'price' | 'cost'>;
   };
 }
 
