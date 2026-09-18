@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ArbitrageService, type ArbitrageMarketConfig, type ClearPositionResult } from './arbitrage-service.js';
 import type { TradingService, TradeStatus } from './trading-service.js';
+import { MergeProvenanceError } from '../clients/ctf-client.js';
 
 vi.mock('../core/rate-limiter.js', () => ({ RateLimiter: class {} }));
 
@@ -174,13 +175,13 @@ describe('P0.3 clearPositions concurrent-merge interlock', () => {
     expect(ra.totalUsdcRecovered).toBe(10);
   });
 
-  it('a merge that throws releases the interlock and a later new call runs normally', async () => {
+  it('a merge that throws (proven not submitted) releases the interlock and a later new call runs normally', async () => {
     const h = fixture();
-    h.ctf.mergeByTokenIds.mockRejectedValueOnce(new Error('merge reverted'));
+    h.ctf.mergeByTokenIds.mockRejectedValueOnce(new MergeProvenanceError(new Error('merge reverted'), { state: 'NOT_SUBMITTED' }));
     const first = await h.clear();
     expect(byType(first, 'merge')[0]).toMatchObject({ success: false, usdcResult: 0, error: 'merge reverted' });
     expect(h.active.size).toBe(0);
-    // Single-call merge failure keeps the pre-existing fallback: residual SELLs from its own read.
+    // A proven non-broadcast keeps the pre-existing fallback: residual SELLs from its own read.
     expect(h.sells().map(([o]) => [o.tokenId, o.amount])).toEqual([['yes', 10], ['no', 10]]);
     h.orders.cy = { ...h.orders.cy, sizeMatched: '10' }; h.trades.ty.size = '10';
     h.orders.cn = { ...h.orders.cn, sizeMatched: '10' }; h.trades.tn.size = '10';

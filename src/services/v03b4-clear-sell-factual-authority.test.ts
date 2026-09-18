@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ArbitrageService, type ClearAction, type ClearPositionResult } from './arbitrage-service.js';
 import type { TradingService, TradeStatus } from './trading-service.js';
+import { MergeProvenanceError } from '../clients/ctf-client.js';
 
 vi.mock('../core/rate-limiter.js', () => ({ RateLimiter: class {} }));
 
@@ -350,10 +351,10 @@ describe('P0.3 B4 clearPositions SELL factual authority', () => {
 });
 
 describe('P0.3 B4 clearPositions multi-side accounting', () => {
-  /** YES 10 / NO 10 with a failing merge: both sides are sold independently. */
+  /** YES 10 / NO 10 with a merge proven never broadcast: both sides are sold independently. */
   function twoSided() {
     const h = fixture({ yes: '10', no: '10' });
-    h.ctf.mergeByTokenIds.mockRejectedValue(new Error('merge reverted'));
+    h.ctf.mergeByTokenIds.mockRejectedValue(new MergeProvenanceError(new Error('merge reverted'), { state: 'NOT_SUBMITTED' }));
     return h;
   }
 

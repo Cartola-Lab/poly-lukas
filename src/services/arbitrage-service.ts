@@ -28,7 +28,7 @@ import {
 } from './realtime-service-v2.js';
 import { TradingService } from './trading-service.js';
 import { MarketService } from './market-service.js';
-import { CTFClient, MergeProvenanceError, type TokenIds, type LifecycleRouting, type MergeResult, type RedeemResult } from '../clients/ctf-client.js';
+import { CTFClient, MergeProvenanceError, type TokenIds, type LifecycleRouting, type MergeResult, type RedeemResult, type TransactionStatus } from '../clients/ctf-client.js';
 import { GammaApiClient } from '../clients/gamma-api.js';
 import { RateLimiter } from '../core/rate-limiter.js';
 import { createUnifiedCache } from '../core/unified-cache.js';
@@ -167,6 +167,7 @@ export interface SettleResult {
 export interface ClearPositionResult {
   market: ArbitrageMarketConfig;
   marketStatus: 'active' | 'resolved' | 'unknown';
+  /** Balances read by this call; 0 placeholders when it read nothing (withheld, or an unresolved-merge reconciliation call). */
   yesBalance: number;
   noBalance: number;
   actions: ClearAction[];
@@ -194,9 +195,14 @@ export interface ClearAction {
   txHash?: string;
   success: boolean;
   error?: string;
-  /** SELL operation identity when the action is a reconcilable local order. */
+  /** Identity of a reconcilable local operation: a clear SELL order or a clear merge attempt. */
   operationId?: string;
-  /** SELL submitted but not factually reconciled: zero proceeds, no success claim. */
+  /**
+   * A real economic operation whose outcome is not factually known: a SELL order awaiting
+   * fills, or a merge transaction that may have been broadcast but has no confirmed or
+   * reverted receipt yet. Zero proceeds, no success claim. Distinct from a `withheld` result,
+   * which owns no venue or on-chain action at all.
+   */
   pending?: boolean;
   /** Present for terminal SELL actions; `usdcResult` equals `facts.proceedsUsd`. */
   facts?: ClearSellFacts;
@@ -412,6 +418,31 @@ type PendingClearSell = {
   reported?: boolean;
 };
 
+/**
+ * One clearPositions merge whose on-chain outcome is not factually known: the transaction may
+ * have been broadcast (SUBMITTED/UNCERTAIN provenance, or an unclassified throw). While the
+ * record exists no merge or SELL may be authorized for the market; only the recorded
+ * transaction's own receipt resolves it, never a balance read. At most one per conditionId.
+ */
+type PendingClearMerge = {
+  id: string;
+  market: Pick<ArbitrageMarketConfig, 'name' | 'conditionId' | 'yesTokenId' | 'noTokenId'>;
+  /** Pairs requested in the merge transaction; collateral received if and only if it confirmed. */
+  pairs: number;
+  /** Well-formed transaction hash when the client exposed one; without it the record cannot be resolved. */
+  txHash?: string;
+  /** Client classification at throw time; UNKNOWN for an exception the client did not classify. */
+  provenance: 'SUBMITTED' | 'UNCERTAIN' | 'UNKNOWN';
+  error: string;
+  submittedAt: number;
+};
+
+/** How a thrown clear merge is treated; only a proven non-broadcast may reuse the pre-merge snapshot. */
+type ClearMergeThrow =
+  | { state: 'NOT_SUBMITTED' }
+  | { state: 'CONFIRMED'; txHash: string }
+  | { state: 'UNRESOLVED'; provenance: PendingClearMerge['provenance']; txHash?: string };
+
 type LongArbMerge =
   | { state: 'NOT_STARTED' }
   | { state: 'IN_FLIGHT' }
@@ -452,6 +483,20 @@ function formatShareUnits(units: bigint): string {
  * a missing/invalid `usdcReceived`). The client resolves only after the receipt
  * is verified, so a present provenance must agree with that contract.
  */
+/**
+ * Classifies a thrown clear merge. Only the client's typed NOT_SUBMITTED proves no broadcast;
+ * a typed CONFIRMED with a well-formed hash proves the merge landed. Everything else, including
+ * an exception the client did not classify, may have been broadcast and stays unresolved.
+ */
+function classifyClearMergeThrow(error: unknown): ClearMergeThrow {
+  if (!(error instanceof MergeProvenanceError)) return { state: 'UNRESOLVED', provenance: 'UNKNOWN' };
+  const { state, transactionHash } = error.provenance;
+  const txHash = typeof transactionHash === 'string' && TX_HASH_PATTERN.test(transactionHash) ? transactionHash : undefined;
+  if (state === 'NOT_SUBMITTED') return { state: 'NOT_SUBMITTED' };
+  if (state === 'CONFIRMED' && txHash) return { state: 'CONFIRMED', txHash };
+  return { state: 'UNRESOLVED', provenance: state === 'SUBMITTED' ? 'SUBMITTED' : 'UNCERTAIN', ...(txHash ? { txHash } : {}) };
+}
+
 function factualRedeemPayout(result: RedeemResult): number | undefined {
   if (!result || result.success !== true) return undefined;
   if (result.provenance !== undefined && result.provenance.state !== 'CONFIRMED') return undefined;
@@ -549,6 +594,9 @@ export class ArbitrageService extends EventEmitter {
    * same inventory from a snapshot another call's merge may have invalidated.
    */
   private activeClearMarkets = new Set<string>();
+  /** Unresolved clear merges keyed by conditionId; checked under the interlock before any balance read. */
+  private pendingClearMerges = new Map<string, PendingClearMerge>();
+  private nextClearMergeId = 0;
   private nextClearSellId = 0;
   private clearSellFlushPromise: Promise<void> | null = null;
   private balanceRefreshVersion = 0;
@@ -1367,6 +1415,13 @@ export class ArbitrageService extends EventEmitter {
       };
     }
 
+    // Under the interlock and before any balance read: an earlier merge whose outcome is
+    // unknown owns this market's inventory decision until its own transaction resolves.
+    if (execute) {
+      const unresolved = this.pendingClearMerges.get(market.conditionId);
+      if (unresolved) return this.reconcileClearMergeCall(unresolved, market);
+    }
+
     const tokenIds: TokenIds = {
       yesTokenId: market.yesTokenId,
       noTokenId: market.noTokenId,
@@ -1550,7 +1605,9 @@ export class ArbitrageService extends EventEmitter {
       let unpairedYes = yesBalance - pairedTokens;
       let unpairedNo = noBalance - pairedTokens;
 
-      // Step 1: Merge paired tokens
+      // Step 1: Merge paired tokens. Residual SELLs are sized from the balance read above,
+      // which is only valid if the merge provably did not consume inventory.
+      let residualsAuthorized = true;
       if (pairedTokens >= 1) {
         const mergeAmount = Math.floor(pairedTokens * 1e6) / 1e6;
         try {
@@ -1570,17 +1627,51 @@ export class ArbitrageService extends EventEmitter {
           totalUsdcRecovered += mergeAmount;
           this.log(`   ✅ Merged: ${mergeAmount.toFixed(4)} pairs → $${mergeAmount.toFixed(2)} USDC`);
         } catch (error: any) {
-          actions.push({
-            type: 'merge',
-            amount: mergeAmount,
-            usdcResult: 0,
-            success: false,
-            error: error.message,
-          });
-          this.log(`   ❌ Merge failed: ${error.message}`);
-          // Update unpaired amounts since merge failed
-          unpairedYes = yesBalance;
-          unpairedNo = noBalance;
+          const message = error instanceof Error ? error.message : String(error);
+          const outcome = classifyClearMergeThrow(error);
+          if (outcome.state === 'NOT_SUBMITTED') {
+            // Proven non-broadcast: the pairs are still held, so the read above still sizes them.
+            actions.push({
+              type: 'merge',
+              amount: mergeAmount,
+              usdcResult: 0,
+              success: false,
+              error: message,
+            });
+            this.log(`   ❌ Merge failed: ${message}`);
+            // Update unpaired amounts since merge failed
+            unpairedYes = yesBalance;
+            unpairedNo = noBalance;
+          } else if (outcome.state === 'CONFIRMED') {
+            // The client proved confirmation before failing; the pairs are gone and the
+            // read above no longer describes inventory, so nothing is sold this call.
+            actions.push({
+              type: 'merge',
+              amount: mergeAmount,
+              usdcResult: mergeAmount,
+              txHash: outcome.txHash,
+              success: true,
+            });
+            totalUsdcRecovered += mergeAmount;
+            residualsAuthorized = false;
+            this.log(`   ✅ Merged: ${mergeAmount.toFixed(4)} pairs → $${mergeAmount.toFixed(2)} USDC (confirmed; client error after receipt: ${message}); residuals need a fresh read`);
+          } else {
+            // May have been broadcast: block every write on this market until the
+            // transaction itself confirms or reverts. Installed before the guard releases.
+            const record: PendingClearMerge = {
+              id: `clear-merge-${++this.nextClearMergeId}`,
+              market: { name: market.name, conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId },
+              pairs: mergeAmount,
+              ...(outcome.txHash ? { txHash: outcome.txHash } : {}),
+              provenance: outcome.provenance,
+              error: message,
+              submittedAt: Date.now(),
+            };
+            this.pendingClearMerges.set(market.conditionId, record);
+            actions.push(this.pendingClearMergeAction(record, `merge outcome ${outcome.provenance.toLowerCase()}: ${message}`));
+            residualsAuthorized = false;
+            this.log(`   ⏳ Merge outcome uncertain (${record.id}${record.txHash ? `, tx ${record.txHash}` : ', no tx hash'}): ${message}; no SELL until resolved`);
+          }
         }
       }
 
@@ -1645,8 +1736,10 @@ export class ArbitrageService extends EventEmitter {
           totalUsdcRecovered += reported.usdcResult;
         }
       };
-      await sellSide('sell_yes', unpairedYes);
-      await sellSide('sell_no', unpairedNo);
+      if (residualsAuthorized) {
+        await sellSide('sell_yes', unpairedYes);
+        await sellSide('sell_no', unpairedNo);
+      }
     }
 
     const allSuccess = actions.every((a) => a.success);
@@ -2375,6 +2468,60 @@ export class ArbitrageService extends EventEmitter {
   private pendingClearAction(record: PendingClearSell): ClearAction {
     return { type: record.type, amount: 0, usdcResult: 0, success: false, operationId: record.id, pending: true,
       error: `SELL_PENDING: factual reconciliation incomplete (${record.leg.orderId ? 'order ' + record.leg.orderId : 'no order identity'})` };
+  }
+
+  private pendingClearMergeAction(record: PendingClearMerge, reason: string): ClearAction {
+    return { type: 'merge', amount: 0, usdcResult: 0, success: false, operationId: record.id, pending: true,
+      ...(record.txHash ? { txHash: record.txHash } : {}),
+      error: `MERGE_PENDING: ${record.pairs} pairs unresolved (${reason})` };
+  }
+
+  /**
+   * A guarded `clearPositions(market, true)` call that found an unresolved merge for the market.
+   * It performs no balance read and no write: the recorded transaction's own receipt is the only
+   * thing that may settle it. CONFIRMED books the recorded pairs exactly once under the audited
+   * merge contract; REVERTED releases the record with zero recovery; `pending`, `failed`
+   * (RPC/read failure or "not found", not proof of non-execution), a lookup throw, or a missing
+   * hash keep it unresolved. Residual inventory is handled by a later call from a fresh read.
+   */
+  private async reconcileClearMergeCall(record: PendingClearMerge, market: ArbitrageMarketConfig): Promise<ClearPositionResult> {
+    const base = { market, marketStatus: 'unknown' as const, yesBalance: 0, noBalance: 0 };
+    this.log(`\n🧹 Clearing positions: ${market.name}`);
+    this.log(`   ⏳ Unresolved clear merge ${record.id}: ${record.pairs} pairs${record.txHash ? `, tx ${record.txHash}` : ', no tx hash'}; no new write until it resolves`);
+
+    let action: ClearAction;
+    let recovered = 0;
+    if (!record.txHash || !this.ctf) {
+      action = this.pendingClearMergeAction(record, !record.txHash ? 'no transaction identity; cannot be proven' : 'CTF client not configured');
+    } else {
+      let status: TransactionStatus | undefined;
+      try {
+        status = await this.ctf.getTransactionStatus(record.txHash);
+      } catch (error) {
+        this.log(`   ⚠️ Merge ${record.id} status lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      const sameTx = status !== undefined && typeof status.txHash === 'string' && status.txHash.toLowerCase() === record.txHash.toLowerCase();
+      if (sameTx && status!.status === 'confirmed') {
+        if (this.pendingClearMerges.get(record.market.conditionId) === record) this.pendingClearMerges.delete(record.market.conditionId);
+        action = { type: 'merge', amount: record.pairs, usdcResult: record.pairs, txHash: record.txHash, success: true, operationId: record.id };
+        recovered = record.pairs;
+        this.log(`   ✅ Merged: ${record.pairs.toFixed(4)} pairs → $${record.pairs.toFixed(2)} USDC (${record.id} confirmed on-chain); residuals need a fresh read`);
+      } else if (sameTx && status!.status === 'reverted') {
+        if (this.pendingClearMerges.get(record.market.conditionId) === record) this.pendingClearMerges.delete(record.market.conditionId);
+        const reason = status!.errorReason ? `: ${status!.errorReason}` : '';
+        action = { type: 'merge', amount: 0, usdcResult: 0, txHash: record.txHash, success: false, operationId: record.id,
+          error: `Merge reverted on-chain${reason}` };
+        this.log(`   ❌ Merge ${record.id} reverted on-chain${reason}; inventory unchanged, a later call may re-plan from a fresh read`);
+      } else {
+        const seen = !status ? 'status unavailable' : !sameTx ? 'status for a different transaction' : `transaction ${status.status}`;
+        action = this.pendingClearMergeAction(record, `${seen}; not proof of execution or non-execution`);
+        this.log(`   ⏳ Merge ${record.id} still unresolved (${seen}); no SELL, no new merge`);
+      }
+    }
+
+    const result: ClearPositionResult = { ...base, actions: [action], totalUsdcRecovered: recovered, success: action.success };
+    this.emit('settle', result);
+    return result;
   }
 
   /** Read-only reconciliation of unresolved clear SELLs; submits nothing, reports nothing. */
