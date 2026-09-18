@@ -175,13 +175,26 @@ export interface ClearPositionResult {
   error?: string;
 }
 
+/** Factual SELL execution attributable to one clearPositions order. */
+export interface ClearSellFacts extends RebalanceSellFacts {
+  /** Sum of confirmed fill quantity × fill price; the only source of `usdcResult`. */
+  proceedsUsd: number;
+}
+
 export interface ClearAction {
   type: 'merge' | 'sell_yes' | 'sell_no' | 'redeem';
+  /** For terminal SELL actions: factually sold shares (see `facts.requestedShares` for the order size). */
   amount: number;
   usdcResult: number;
   txHash?: string;
   success: boolean;
   error?: string;
+  /** SELL operation identity when the action is a reconcilable local order. */
+  operationId?: string;
+  /** SELL submitted but not factually reconciled: zero proceeds, no success claim. */
+  pending?: boolean;
+  /** Present for terminal SELL actions; `usdcResult` equals `facts.proceedsUsd`. */
+  facts?: ClearSellFacts;
 }
 
 // ===== Market Scanning Types =====
@@ -378,6 +391,22 @@ type PendingRebalanceSell = {
   published?: boolean;
 };
 
+/** One clearPositions SELL: retained until its terminal facts are reported by exactly one call. */
+type PendingClearSell = {
+  id: string;
+  type: 'sell_yes' | 'sell_no';
+  market: Pick<ArbitrageMarketConfig, 'conditionId' | 'yesTokenId' | 'noTokenId'>;
+  label: string;
+  leg: PendingFillLeg;
+  submittedAt: number;
+  flight?: Promise<ClearAction | undefined>;
+  terminal?: ClearAction;
+  /** Terminal outcome logged (inline or by the periodic flush). */
+  logged?: boolean;
+  /** Terminal outcome returned in a ClearPositionResult; the record is released with it. */
+  reported?: boolean;
+};
+
 type LongArbMerge =
   | { state: 'NOT_STARTED' }
   | { state: 'IN_FLIGHT' }
@@ -491,6 +520,11 @@ export class ArbitrageService extends EventEmitter {
   private rebalanceSellFlushPromise: Promise<void> | null = null;
   /** Publication claims keyed by the shared terminal result object, which outlives the pending record. */
   private publishedRebalanceSells = new WeakSet<RebalanceResult>();
+  private pendingClearSells = new Map<string, PendingClearSell>();
+  /** Clear SELL submissions per `${conditionId}:${tokenId}`; guards sizing against a stale balance read. */
+  private clearSellSubmissions = new Map<string, number>();
+  private nextClearSellId = 0;
+  private clearSellFlushPromise: Promise<void> | null = null;
   private balanceRefreshVersion = 0;
   private lastExecutionTime = 0;
   private lastRebalanceTime = 0;
@@ -624,6 +658,11 @@ export class ArbitrageService extends EventEmitter {
           await this.flushPendingRebalanceSells();
         } catch (error) {
           try { this.log(`Rebalance SELL flush: ${String(error)}`); } catch { /* preserve future cycles */ }
+        }
+        try {
+          await this.flushPendingClearSells();
+        } catch (error) {
+          try { this.log(`Clear SELL flush: ${String(error)}`); } catch { /* preserve future cycles */ }
         }
         try {
           await this.updateBalance();
@@ -1276,7 +1315,12 @@ export class ArbitrageService extends EventEmitter {
       noTokenId: market.noTokenId,
     };
 
-    // Get token balances
+    // Get token balances. SELL sizing below is only valid while no clear SELL on the
+    // token has been submitted since this read (its fills would not be in it).
+    const submissionsAtRead = {
+      sell_yes: this.clearSellSubmissions.get(`${market.conditionId}:${market.yesTokenId}`) ?? 0,
+      sell_no: this.clearSellSubmissions.get(`${market.conditionId}:${market.noTokenId}`) ?? 0,
+    };
     const positions = await this.ctf.getPositionBalanceByTokenIds(market.conditionId, tokenIds);
     const yesBalance = parseFloat(positions.yesBalance);
     const noBalance = parseFloat(positions.noBalance);
@@ -1468,76 +1512,69 @@ export class ArbitrageService extends EventEmitter {
         }
       }
 
-      // Step 2: Sell unpaired tokens
-      if (this.tradingService && unpairedYes >= this.config.minTradeSize) {
-        try {
-          const sellAmount = Math.floor(unpairedYes * 1e6) / 1e6;
-          const result = await this.tradingService.createMarketOrder({
-            tokenId: market.yesTokenId,
-            side: 'SELL',
-            amount: sellAmount,
-            orderType: 'FOK',
-          });
-          if (result.success) {
-            // Estimate USDC received (conservative estimate since we don't have exact trade info)
-            const usdcReceived = sellAmount * 0.5; // Assume ~0.5 average price
-            actions.push({
-              type: 'sell_yes',
-              amount: sellAmount,
-              usdcResult: usdcReceived,
-              success: true,
-            });
-            totalUsdcRecovered += usdcReceived;
-            this.log(`   ✅ Sold YES: ${sellAmount.toFixed(4)} → ~$${usdcReceived.toFixed(2)} USDC`);
-          } else {
-            throw new Error(result.errorMsg || 'Sell failed');
-          }
-        } catch (error: any) {
-          actions.push({
-            type: 'sell_yes',
-            amount: unpairedYes,
-            usdcResult: 0,
-            success: false,
-            error: error.message,
-          });
-          this.log(`   ❌ Sell YES failed: ${error.message}`);
-        }
-      }
+      // Step 2: Sell unpaired tokens. Acceptance is not execution: sold shares and
+      // proceeds come only from confirmed fills attributed to our own order.
+      const sellSide = async (type: 'sell_yes' | 'sell_no', unpaired: number): Promise<void> => {
+        if (!this.tradingService) return;
+        const label = type === 'sell_yes' ? 'YES' : 'NO';
+        const tokenId = type === 'sell_yes' ? market.yesTokenId : market.noTokenId;
 
-      if (this.tradingService && unpairedNo >= this.config.minTradeSize) {
-        try {
-          const sellAmount = Math.floor(unpairedNo * 1e6) / 1e6;
-          const result = await this.tradingService.createMarketOrder({
-            tokenId: market.noTokenId,
-            side: 'SELL',
-            amount: sellAmount,
-            orderType: 'FOK',
-          });
-          if (result.success) {
-            // Estimate USDC received (conservative estimate since we don't have exact trade info)
-            const usdcReceived = sellAmount * 0.5; // Assume ~0.5 average price
-            actions.push({
-              type: 'sell_no',
-              amount: sellAmount,
-              usdcResult: usdcReceived,
-              success: true,
-            });
-            totalUsdcRecovered += usdcReceived;
-            this.log(`   ✅ Sold NO: ${sellAmount.toFixed(4)} → ~$${usdcReceived.toFixed(2)} USDC`);
-          } else {
-            throw new Error(result.errorMsg || 'Sell failed');
+        // An earlier SELL on this token owns the inventory until its facts are known and
+        // reported; the balance read above predates them, so it sizes nothing this call.
+        const prior = this.findPendingClearSell(market, tokenId);
+        if (prior) {
+          const terminal = await this.reconcileClearSell(prior);
+          if (!terminal) {
+            actions.push(this.pendingClearAction(prior));
+            this.log(`   ⏳ Sell ${label} ${prior.id} still awaiting factual fills; no new order`);
+            return;
           }
-        } catch (error: any) {
-          actions.push({
-            type: 'sell_no',
-            amount: unpairedNo,
-            usdcResult: 0,
-            success: false,
-            error: error.message,
-          });
-          this.log(`   ❌ Sell NO failed: ${error.message}`);
+          const reported = this.reportClearSell(prior, terminal);
+          if (reported) {
+            actions.push(reported);
+            totalUsdcRecovered += reported.usdcResult;
+          }
+          return;
         }
-      }
+
+        if (unpaired < this.config.minTradeSize) return;
+        const submissionKey = `${market.conditionId}:${tokenId}`;
+        if ((this.clearSellSubmissions.get(submissionKey) ?? 0) !== submissionsAtRead[type]) {
+          actions.push({ type, amount: 0, usdcResult: 0, success: false,
+            error: `SELL ${label} withheld: a clear SELL was submitted after this balance read; re-run clearPositions` });
+          this.log(`   ⏸️ Sell ${label} withheld: inventory changed since balance read`);
+          return;
+        }
+        const sellAmount = Math.floor(unpaired * 1e6) / 1e6;
+        this.clearSellSubmissions.set(submissionKey, submissionsAtRead[type] + 1);
+        const record: PendingClearSell = {
+          id: `clear-sell-${++this.nextClearSellId}`, type, label, submittedAt: Date.now(),
+          market: { conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId },
+          leg: { tokenId, requestedShares: sellAmount, submission: 'UNCERTAIN' },
+        };
+        this.pendingClearSells.set(record.id, record);
+        const { rejected } = await this.submitSellLeg(record.leg, label, { tokenId, side: 'SELL', amount: sellAmount, orderType: 'FOK' });
+        if (rejected !== undefined) {
+          // Known non-submission: nothing to reconcile.
+          this.pendingClearSells.delete(record.id);
+          actions.push({ type, amount: 0, usdcResult: 0, success: false, error: rejected });
+          this.log(`   ❌ Sell ${label} failed: ${rejected}`);
+          return;
+        }
+        const terminal = await this.reconcileClearSell(record);
+        if (!terminal) {
+          actions.push(this.pendingClearAction(record));
+          this.log(`   ⏳ Sell ${label} submitted; awaiting factual fills (${record.id})`);
+          return;
+        }
+        const reported = this.reportClearSell(record, terminal);
+        if (reported) {
+          actions.push(reported);
+          totalUsdcRecovered += reported.usdcResult;
+        }
+      };
+      await sellSide('sell_yes', unpairedYes);
+      await sellSide('sell_no', unpairedNo);
     }
 
     const allSuccess = actions.every((a) => a.success);
@@ -2142,10 +2179,28 @@ export class ArbitrageService extends EventEmitter {
   /** Register the record before the venue call, submit once, and return only factual terminal state or a pending ack. */
   private async submitFactualSell(record: PendingRebalanceSell,
       order: Parameters<TradingService['createMarketOrder']>[0]): Promise<RebalanceResult> {
-    const trading = this.tradingService!;
     const { action, label } = record;
     this.pendingRebalanceSells.set(record.id, record);
 
+    const { rejected } = await this.submitSellLeg(record.leg, label, order);
+    if (rejected !== undefined) {
+      // Known non-submission: nothing to reconcile; existing failure path applies.
+      this.pendingRebalanceSells.delete(record.id);
+      throw new Error(rejected);
+    }
+    const terminal = await this.reconcileRebalanceSell(record);
+    return terminal ?? { success: false, action, operationId: record.id, pending: true,
+      error: `SELL_PENDING: factual reconciliation incomplete (${record.leg.orderId ? 'order ' + record.leg.orderId : 'no order identity'})` };
+  }
+
+  /**
+   * Submit one SELL and record only what the venue reply proves about the local
+   * order: identity and acceptance, never a fill. A known REJECTED reply returns
+   * `rejected`; otherwise the leg is SUBMITTED (accepted with identity) or UNCERTAIN.
+   */
+  private async submitSellLeg(leg: PendingFillLeg, label: string,
+      order: Parameters<TradingService['createMarketOrder']>[0]): Promise<{ rejected?: string }> {
+    const trading = this.tradingService!;
     let reply: Awaited<ReturnType<TradingService['createMarketOrder']>> | undefined;
     let submissionError: string | undefined;
     try {
@@ -2157,23 +2212,115 @@ export class ArbitrageService extends EventEmitter {
     if (reply) {
       const orderId = typeof reply.orderId === 'string' ? reply.orderId.trim() : '';
       if (orderId) {
-        record.leg.orderId = orderId;
-        record.leg.tradeIds = new Set(reply.tradeIds ?? []);
+        leg.orderId = orderId;
+        leg.tradeIds = new Set(reply.tradeIds ?? []);
       }
-      if (reply.submissionState === 'REJECTED') {
-        // Known non-submission: nothing to reconcile; existing failure path applies.
-        this.pendingRebalanceSells.delete(record.id);
-        throw new Error(reply.errorMsg || `Sell ${label} failed`);
-      }
-      if (reply.submissionState === 'ACCEPTED' && orderId) record.leg.submission = 'SUBMITTED';
+      if (reply.submissionState === 'REJECTED') return { rejected: reply.errorMsg || `Sell ${label} failed` };
+      if (reply.submissionState === 'ACCEPTED' && orderId) leg.submission = 'SUBMITTED';
       submissionError = reply.errorMsg;
     }
-    if (record.leg.submission !== 'SUBMITTED') {
-      this.log(`   ⚠️ SELL ${label} submission uncertain${record.leg.orderId ? '' : ' (no order identity)'}: ${submissionError ?? 'no acceptance'}`);
+    if (leg.submission !== 'SUBMITTED') {
+      this.log(`   ⚠️ SELL ${label} submission uncertain${leg.orderId ? '' : ' (no order identity)'}: ${submissionError ?? 'no acceptance'}`);
     }
-    const terminal = await this.reconcileRebalanceSell(record);
-    return terminal ?? { success: false, action, operationId: record.id, pending: true,
+    return {};
+  }
+
+  // ===== clearPositions SELL factual authority =====
+
+  /** Unreported clearPositions SELL on this market/token, terminal or not. */
+  private findPendingClearSell(market: Pick<ArbitrageMarketConfig, 'conditionId'>, tokenId: string): PendingClearSell | undefined {
+    for (const record of this.pendingClearSells.values()) {
+      if (!record.reported && record.market.conditionId === market.conditionId && record.leg.tokenId === tokenId) return record;
+    }
+    return undefined;
+  }
+
+  /** Single flight per clear SELL record; concurrent callers share one reconciliation. */
+  private reconcileClearSell(record: PendingClearSell): Promise<ClearAction | undefined> {
+    if (record.terminal) return Promise.resolve(record.terminal);
+    if (record.flight) return record.flight;
+    const flight = this.reconcileClearSellOnce(record).finally(() => { if (record.flight === flight) record.flight = undefined; });
+    record.flight = flight;
+    return flight;
+  }
+
+  private async reconcileClearSellOnce(record: PendingClearSell): Promise<ClearAction | undefined> {
+    const leg = record.leg;
+    // An UNCERTAIN submission without order identity can never be proven; it stays unresolved.
+    if (!leg.orderId) return undefined;
+    if (leg.settlement?.state !== 'TERMINAL') {
+      try {
+        leg.settlement = await this.reconcileFillLeg(leg, 'SELL');
+      } catch (error) {
+        try { this.log(`Clear SELL ${record.id} reconciliation: ${String(error)}`); } catch { /* remain pending */ }
+      }
+    }
+    const settlement = leg.settlement;
+    if (settlement?.state !== 'TERMINAL') return undefined;
+    if (record.terminal) return record.terminal;
+    const requestedUnits = BigInt(Math.round(leg.requestedShares * 100));
+    const facts: ClearSellFacts = {
+      orderId: leg.orderId, tokenId: leg.tokenId, requestedShares: leg.requestedShares, soldShares: settlement.shares,
+      ...(settlement.weightedPrice !== undefined ? { weightedPrice: settlement.weightedPrice } : {}),
+      txHashes: [...settlement.txHashes], proceedsUsd: settlement.cost,
+    };
+    const success = settlement.units >= requestedUnits;
+    record.terminal = {
+      type: record.type, amount: settlement.shares, usdcResult: settlement.cost, success, operationId: record.id, facts,
+      ...(settlement.txHashes.length === 1 ? { txHash: settlement.txHashes[0] } : {}),
+      ...(success ? {} : { error: settlement.units === 0n
+        ? `SELL ${record.label} never filled (${leg.orderId})`
+        : `Partial SELL ${record.label}: ${settlement.shares} of ${leg.requestedShares} filled (${leg.orderId})` }),
+    };
+    return record.terminal;
+  }
+
+  /** Terminal log exactly once per clear SELL record, whichever observer arrives first. */
+  private logClearSell(record: PendingClearSell, action: ClearAction): void {
+    if (record.logged) return;
+    record.logged = true;
+    const facts = action.facts;
+    const price = facts?.weightedPrice !== undefined ? ` @ ${facts.weightedPrice.toFixed(4)}` : '';
+    if (action.success && facts) {
+      this.log(`   ✅ Sold ${record.label}: ${facts.soldShares.toFixed(4)} → $${facts.proceedsUsd.toFixed(2)} USDC (factual${price})`);
+    } else {
+      this.log(`   ❌ Sell ${record.label} not executed: ${action.error ?? 'SELL not executed'}`);
+    }
+  }
+
+  /**
+   * Hand a terminal clear SELL to exactly one ClearPositionResult and release the
+   * record; a second observer gets nothing rather than a duplicate of the proceeds.
+   */
+  private reportClearSell(record: PendingClearSell, action: ClearAction): ClearAction | undefined {
+    if (record.reported) return undefined;
+    record.reported = true;
+    this.logClearSell(record, action);
+    if (this.pendingClearSells.get(record.id) === record) this.pendingClearSells.delete(record.id);
+    return action;
+  }
+
+  private pendingClearAction(record: PendingClearSell): ClearAction {
+    return { type: record.type, amount: 0, usdcResult: 0, success: false, operationId: record.id, pending: true,
       error: `SELL_PENDING: factual reconciliation incomplete (${record.leg.orderId ? 'order ' + record.leg.orderId : 'no order identity'})` };
+  }
+
+  /** Read-only reconciliation of unresolved clear SELLs; submits nothing, reports nothing. */
+  private flushPendingClearSells(): Promise<void> {
+    if (this.clearSellFlushPromise) return this.clearSellFlushPromise;
+    this.clearSellFlushPromise = Promise.resolve().then(async () => {
+      for (const [id, record] of [...this.pendingClearSells]) {
+        if (record.reported || record.terminal) continue;
+        try {
+          if (record.id !== id) throw new Error('Clear SELL pending ID mismatch');
+          const action = await this.reconcileClearSell(record);
+          if (action) this.logClearSell(record, action);
+        } catch (error) {
+          try { this.log(`Clear SELL reconciliation ${id}: ${String(error)}`); } catch { /* remain pending */ }
+        }
+      }
+    }).finally(() => { this.clearSellFlushPromise = null; });
+    return this.clearSellFlushPromise;
   }
 
   /** Single flight per SELL record; concurrent callers share one reconciliation. */
