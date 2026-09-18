@@ -1689,7 +1689,12 @@ export class ArbitrageService extends EventEmitter {
       return;
     }
 
-    await this.updateBalance();
+    // Only a fresh, complete balance read may size a split/merge/SELL; the cached
+    // balance is telemetry, not execution authority, after a failed refresh.
+    if (!(await this.updateBalance())) {
+      this.log('⏸️ Rebalance cycle skipped: fresh balance refresh failed');
+      return;
+    }
     // A short may start during the balance read or its synchronous notification.
     if (this.getShortInventoryBlock(this.market) || this.isRebalancerWriting(this.market)) return;
     const action = this.calculateRebalanceAction();
@@ -1716,7 +1721,12 @@ export class ArbitrageService extends EventEmitter {
   private async fixImbalanceIfNeeded(): Promise<void> {
     if (!this.config.autoFixImbalance || !this.ctf || !this.tradingService || !this.market) return;
 
-    await this.updateBalance();
+    // A corrective SELL is sized from the imbalance; a cached imbalance after a
+    // failed refresh is not authority to sell anything.
+    if (!(await this.updateBalance())) {
+      this.log('   ⏸️ Imbalance correction withheld: fresh balance refresh failed');
+      return;
+    }
     const imbalance = this.balance.yesTokens - this.balance.noTokens;
 
     if (Math.abs(imbalance) <= this.config.imbalanceThreshold) return;
@@ -1766,8 +1776,17 @@ export class ArbitrageService extends EventEmitter {
     }
   }
 
-  private async updateBalance(): Promise<void> {
-    if (!this.ctf || !this.market) return;
+  /**
+   * Refresh pUSD and YES/NO balances from the chain.
+   *
+   * Returns true only when every value needed for an inventory decision was
+   * freshly and validly read and applied to `this.balance` for the still-active
+   * market. On failure the previous cached balance is left untouched (telemetry
+   * only) and the error is emitted; callers that size or direct a NEW economic
+   * write must treat a `false` result as "no fresh authority" and abort.
+   */
+  private async updateBalance(): Promise<boolean> {
+    if (!this.ctf || !this.market) return false;
 
     const version = ++this.balanceRefreshVersion;
     const conditionId = this.market.conditionId;
@@ -1791,7 +1810,7 @@ export class ArbitrageService extends EventEmitter {
       if (!balances.every(value => Number.isFinite(value) && value >= 0)) throw new Error('Invalid factual balances');
       // Discard stale overlapping reads and responses for a market no longer active.
       if (version !== this.balanceRefreshVersion || this.market?.conditionId !== conditionId ||
-          this.market.yesTokenId !== tokenIds.yesTokenId || this.market.noTokenId !== tokenIds.noTokenId) return;
+          this.market.yesTokenId !== tokenIds.yesTokenId || this.market.noTokenId !== tokenIds.noTokenId) return false;
       const balance = {
         usdc: balances[0],
         pUsdBalance: balances[0],
@@ -1802,10 +1821,12 @@ export class ArbitrageService extends EventEmitter {
       this.balance = balance;
       this.emit('balanceUpdate', this.balance);
       if (version !== this.balanceRefreshVersion || this.balance !== balance || this.market?.conditionId !== conditionId ||
-          this.market.yesTokenId !== tokenIds.yesTokenId || this.market.noTokenId !== tokenIds.noTokenId) return;
+          this.market.yesTokenId !== tokenIds.yesTokenId || this.market.noTokenId !== tokenIds.noTokenId) return true;
       for (const pending of awaitingInventory) pending.inventoryReconciled = true;
+      return true;
     } catch (error) {
       this.emit('error', error as Error);
+      return false;
     }
   }
 
@@ -2012,11 +2033,15 @@ export class ArbitrageService extends EventEmitter {
     // single-sided excess. Existing remediation runs unchanged on the live market.
     if (this.market && this.market.conditionId === op.market.conditionId &&
         this.market.yesTokenId === op.market.yesTokenId && this.market.noTokenId === op.market.noTokenId) {
-      await this.updateBalance();
-      const residual = this.balance.yesTokens - this.balance.noTokens;
-      if (Math.abs(residual) > this.config.imbalanceThreshold) {
-        this.log(`  ⚠️ Residual imbalance after merge: ${residual.toFixed(2)} - cleaning up...`);
-        await this.fixImbalanceIfNeeded();
+      if (await this.updateBalance()) {
+        const residual = this.balance.yesTokens - this.balance.noTokens;
+        if (Math.abs(residual) > this.config.imbalanceThreshold) {
+          this.log(`  ⚠️ Residual imbalance after merge: ${residual.toFixed(2)} - cleaning up...`);
+          await this.fixImbalanceIfNeeded();
+        }
+      } else {
+        // Cached inventory cannot prove a residual; the realized result below is unaffected.
+        this.log('  ⏸️ Residual check skipped: fresh balance refresh failed');
       }
     }
 
