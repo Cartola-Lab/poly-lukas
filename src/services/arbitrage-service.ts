@@ -366,6 +366,8 @@ type PendingLongLeg = PendingFillLeg;
 
 type PendingRebalanceSell = {
   id: string;
+  /** `rebalance` publishes a `rebalance` event and pacing; `corrective` only logs (fixImbalanceIfNeeded). */
+  kind: 'rebalance' | 'corrective';
   action: RebalanceAction;
   market: Pick<ArbitrageMarketConfig, 'conditionId' | 'yesTokenId' | 'noTokenId'>;
   label: string;
@@ -1725,42 +1727,40 @@ export class ArbitrageService extends EventEmitter {
     const sellAmount = Math.floor(Math.abs(imbalance) * 0.9 * 1e6) / 1e6; // Sell 90% to be safe
     if (sellAmount < this.config.minTradeSize) return;
 
+    // An unresolved SELL on this market (corrective or rebalancer) means the true
+    // imbalance is unknown; never stack another corrective order on it.
+    const unresolved = this.findPendingRebalanceSell(this.market);
+    if (unresolved) {
+      this.log(`   ⏳ Corrective SELL withheld: ${unresolved.id} pending factual reconciliation`);
+      return;
+    }
+
+    const market = this.market;
+    const outcomes = market.outcomes || ['YES', 'NO'];
+    const sellYes = imbalance > 0;
+    // Floor derived from the live best bid so the remediation itself cannot
+    // sweep the book (PROBLEMS.md #2).
+    const bestBid = (sellYes ? this.orderbook.yesBids : this.orderbook.noBids)[0]?.price;
+    const floor = bestBid !== undefined ? bestBid * (1 - this.config.maxSlippagePct) : undefined;
+    const tokenId = sellYes ? market.yesTokenId : market.noTokenId;
+    const record: PendingRebalanceSell = {
+      id: `corrective-sell-${++this.nextRebalanceSellId}`, kind: 'corrective', submittedAt: Date.now(),
+      action: { type: sellYes ? 'sell_yes' : 'sell_no', amount: sellAmount, reason: 'Imbalance correction', priority: 100 },
+      label: sellYes ? outcomes[0] : outcomes[1],
+      market: { conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId },
+      leg: { tokenId, requestedShares: sellAmount, submission: 'UNCERTAIN' },
+    };
+
     try {
-      if (imbalance > 0) {
-        // Sell excess YES with a floor derived from the live best bid so the
-        // remediation itself cannot sweep the book (PROBLEMS.md #2).
-        const bestYesBid = this.orderbook.yesBids[0]?.price;
-        const yesFloor = bestYesBid !== undefined
-          ? bestYesBid * (1 - this.config.maxSlippagePct)
-          : undefined;
-        // Sell excess YES
-        const result = await this.tradingService.createMarketOrder({
-          tokenId: this.market.yesTokenId,
-          side: 'SELL',
-          amount: sellAmount,
-          ...(yesFloor !== undefined ? { price: yesFloor } : {}),
-          orderType: 'FOK',
-        });
-        if (result.success) {
-          this.log(`   ✅ Sold ${sellAmount.toFixed(2)} excess YES to restore balance`);
-        }
-      } else {
-        const bestNoBid = this.orderbook.noBids[0]?.price;
-        const noFloor = bestNoBid !== undefined
-          ? bestNoBid * (1 - this.config.maxSlippagePct)
-          : undefined;
-        // Sell excess NO
-        const result = await this.tradingService.createMarketOrder({
-          tokenId: this.market.noTokenId,
-          side: 'SELL',
-          amount: sellAmount,
-          ...(noFloor !== undefined ? { price: noFloor } : {}),
-          orderType: 'FOK',
-        });
-        if (result.success) {
-          this.log(`   ✅ Sold ${sellAmount.toFixed(2)} excess NO to restore balance`);
-        }
+      // Acceptance is not execution: the corrective SELL completes only from factual fills.
+      const result = await this.submitFactualSell(record, {
+        tokenId, side: 'SELL', amount: sellAmount, ...(floor !== undefined ? { price: floor } : {}), orderType: 'FOK',
+      });
+      if (result.pending) {
+        this.log(`   ⏳ Corrective SELL submitted; awaiting factual fills (${result.operationId})`);
+        return;
       }
+      this.publishRebalanceSell(result);
     } catch (error: any) {
       this.log(`   ❌ Failed to fix imbalance: ${error.message}`);
     }
@@ -2107,16 +2107,24 @@ export class ArbitrageService extends EventEmitter {
     const tokenId = action.type === 'sell_yes' ? market.yesTokenId : market.noTokenId;
     if (!Number.isFinite(action.amount) || action.amount <= 0) throw new Error(`Invalid SELL ${label} amount`);
     const record: PendingRebalanceSell = {
-      id: `rebalance-sell-${++this.nextRebalanceSellId}`, action, label, submittedAt: Date.now(),
+      id: `rebalance-sell-${++this.nextRebalanceSellId}`, kind: 'rebalance', action, label, submittedAt: Date.now(),
       market: { conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId },
       leg: { tokenId, requestedShares: action.amount, submission: 'UNCERTAIN' },
     };
+    return this.submitFactualSell(record, { tokenId, side: 'SELL', amount: action.amount, orderType: 'FOK' });
+  }
+
+  /** Register the record before the venue call, submit once, and return only factual terminal state or a pending ack. */
+  private async submitFactualSell(record: PendingRebalanceSell,
+      order: Parameters<TradingService['createMarketOrder']>[0]): Promise<RebalanceResult> {
+    const trading = this.tradingService!;
+    const { action, label } = record;
     this.pendingRebalanceSells.set(record.id, record);
 
     let reply: Awaited<ReturnType<TradingService['createMarketOrder']>> | undefined;
     let submissionError: string | undefined;
     try {
-      reply = await trading.createMarketOrder({ tokenId, side: 'SELL', amount: action.amount, orderType: 'FOK' });
+      reply = await trading.createMarketOrder(order);
     } catch (error) {
       // The attempt started; an exception cannot prove non-submission.
       submissionError = error instanceof Error ? error.message : String(error);
@@ -2194,9 +2202,20 @@ export class ArbitrageService extends EventEmitter {
       record.published = true;
     }
     const facts = result.facts;
+    const price = facts?.weightedPrice !== undefined ? ` @ ${facts.weightedPrice.toFixed(4)}` : '';
+    if (record?.kind === 'corrective') {
+      // Imbalance correction never emitted events or paced the rebalancer; only its claim becomes factual.
+      if (result.success && facts) {
+        this.log(`   ✅ Sold ${facts.soldShares.toFixed(2)} excess ${record.label} to restore balance (factual${price})`);
+      } else {
+        this.log(`   ❌ Corrective SELL not executed: ${result.error ?? 'SELL not executed'}`);
+      }
+      if (this.pendingRebalanceSells.get(record.id) === record) this.pendingRebalanceSells.delete(record.id);
+      return;
+    }
     if (result.success && facts) {
       this.lastRebalanceTime = Date.now();
-      this.log(`   ✅ Sold ${facts.soldShares.toFixed(2)} ${record?.label ?? ''} tokens (factual${facts.weightedPrice !== undefined ? ` @ ${facts.weightedPrice.toFixed(4)}` : ''})`);
+      this.log(`   ✅ Sold ${facts.soldShares.toFixed(2)} ${record?.label ?? ''} tokens (factual${price})`);
     } else {
       this.log(`   ❌ Failed: ${result.error ?? 'SELL not executed'}`);
     }
