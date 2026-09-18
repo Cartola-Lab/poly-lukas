@@ -28,7 +28,7 @@ import {
 } from './realtime-service-v2.js';
 import { TradingService } from './trading-service.js';
 import { MarketService } from './market-service.js';
-import { CTFClient, MergeProvenanceError, type TokenIds, type LifecycleRouting, type MergeResult } from '../clients/ctf-client.js';
+import { CTFClient, MergeProvenanceError, type TokenIds, type LifecycleRouting, type MergeResult, type RedeemResult } from '../clients/ctf-client.js';
 import { GammaApiClient } from '../clients/gamma-api.js';
 import { RateLimiter } from '../core/rate-limiter.js';
 import { createUnifiedCache } from '../core/unified-cache.js';
@@ -439,6 +439,21 @@ function formatShareUnits(units: bigint): string {
   const whole = units / 100n, fraction = units % 100n;
   if (fraction === 0n) return whole.toString();
   return `${whole}.${fraction.toString().padStart(2, '0')}`.replace(/0$/, '');
+}
+
+/**
+ * Receipt-scoped payout of a confirmed redeem, or undefined when the client
+ * result does not prove one (unsuccessful, provenance other than CONFIRMED, or
+ * a missing/invalid `usdcReceived`). The client resolves only after the receipt
+ * is verified, so a present provenance must agree with that contract.
+ */
+function factualRedeemPayout(result: RedeemResult): number | undefined {
+  if (!result || result.success !== true) return undefined;
+  if (result.provenance !== undefined && result.provenance.state !== 'CONFIRMED') return undefined;
+  const raw = result.usdcReceived;
+  if (typeof raw !== 'string' || !/^\d+(?:\.\d+)?$/.test(raw)) return undefined;
+  const payout = Number(raw);
+  return Number.isFinite(payout) && payout >= 0 ? payout : undefined;
 }
 
 /** Factual notification only; no realized-profit contract. */
@@ -1452,15 +1467,30 @@ export class ArbitrageService extends EventEmitter {
       if (winningBalance >= 0.001) {
         try {
           const redeemResult = await this.ctf.redeemByTokenIds(market.conditionId, tokenIds, undefined, this.toLifecycleRouting(market));
-          actions.push({
-            type: 'redeem',
-            amount: winningBalance,
-            usdcResult: winningBalance,
-            txHash: redeemResult.txHash,
-            success: true,
-          });
-          totalUsdcRecovered = winningBalance;
-          this.log(`   ✅ Redeemed: ${winningBalance.toFixed(4)} tokens → $${winningBalance.toFixed(2)} USDC`);
+          // Recovered USDC is the receipt-scoped payout of the confirmed transaction,
+          // never the pre-transaction token balance or an assumed 1:1 redemption.
+          const payout = factualRedeemPayout(redeemResult);
+          if (payout === undefined) {
+            actions.push({
+              type: 'redeem',
+              amount: winningBalance,
+              usdcResult: 0,
+              ...(typeof redeemResult.txHash === 'string' && redeemResult.txHash ? { txHash: redeemResult.txHash } : {}),
+              success: false,
+              error: 'Redeem payout not factually confirmed',
+            });
+            this.log(`   ❌ Redeem not booked: payout not factually confirmed`);
+          } else {
+            actions.push({
+              type: 'redeem',
+              amount: winningBalance,
+              usdcResult: payout,
+              txHash: redeemResult.txHash,
+              success: true,
+            });
+            totalUsdcRecovered += payout;
+            this.log(`   ✅ Redeemed: ${winningBalance.toFixed(4)} tokens → $${payout.toFixed(2)} USDC (factual payout)`);
+          }
         } catch (error: any) {
           actions.push({
             type: 'redeem',
