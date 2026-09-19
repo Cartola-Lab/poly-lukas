@@ -1232,6 +1232,11 @@ export class ArbitrageService extends EventEmitter {
     const protectedShort = this.getShortInventoryBlock(market);
     if (protectedShort) return withheld(`Rebalance withheld: inventory owned by short ${protectedShort}`);
     if (this.isRebalancerWriting(market)) return withheld('Rebalance withheld: another rebalance owns this market');
+    // An unresolved long still owns uncertain BUY inventory / collateral: its fills may settle after
+    // any balance read taken here, so a fresh read is not authority over that inventory. Refuse
+    // without reading; only the long's own reconciliation releases it.
+    const pendingLong = this.findPendingLongArb(market);
+    if (pendingLong) return withheld(`Rebalance withheld: long arb ${pendingLong.id} pending factual reconciliation`);
 
     // Claim synchronously, before the first await, so every caller (scheduled or direct) gets the
     // same exclusion against execute() and against a concurrent rebalance of this market.
