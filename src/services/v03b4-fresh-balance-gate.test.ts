@@ -385,6 +385,17 @@ describe('P0.3 fresh balance gate: long-arb interaction', () => {
     return result;
   }
 
+  // P0.3H2: execute() performs one fresh entry read before any BUY. These let that read succeed
+  // and fail only the later refresh inside the correction path, which is what the tests probe.
+  function failPositionsAfterEntry(h: H) { h.ctf.getPositionBalanceByTokenIds.mockResolvedValueOnce({ ...h.balances }); h.failPositions(); }
+  function failPusdAfterEntry(h: H) { h.ctf.getPusdBalance.mockResolvedValueOnce('100'); h.failPusd(); }
+  /** The entry read published the (identical) chain inventory once; the failed correction refresh published nothing. */
+  function expectOnlyEntryReadTelemetry(h: H) {
+    expect(h.balanceUpdates).toHaveBeenCalledTimes(1);
+    expect(h.service.getBalance()).toMatchObject({ usdc: 100, pUsdBalance: 100,
+      yesTokens: Number(h.balances.yesBalance), noTokens: Number(h.balances.noBalance) });
+  }
+
   /** Leg 1 (YES) fills 10, leg 2 (NO) is rejected; cached inventory shows a YES excess. */
   function leg2Fixture() {
     const h = fixture('YES');
@@ -394,7 +405,7 @@ describe('P0.3 fresh balance gate: long-arb interaction', () => {
 
   it('leg-2 rejection with a failed refresh inside correction: no stale corrective SELL, no fabricated success', async () => {
     const h = leg2Fixture();
-    h.failPositions();
+    failPositionsAfterEntry(h);
     const result = await runLong(h);
     expect(result).toMatchObject({ type: 'long', success: false, profit: 0 });
     expect(h.sells()).toHaveLength(0);
@@ -405,12 +416,12 @@ describe('P0.3 fresh balance gate: long-arb interaction', () => {
     expect(h.service.getStats()).toMatchObject({ executionsSucceeded: 0, totalProfit: 0 });
     expect(h.logs).toContainEqual(expect.stringMatching(/Imbalance correction withheld: fresh balance refresh failed/));
     expect(soldLogs(h)).toEqual([]);
-    expectCachedTelemetryUnchanged(h);
+    expectOnlyEntryReadTelemetry(h);
   });
 
   it('leg-2 rejection with a failed pUSD read behaves the same', async () => {
     const h = leg2Fixture();
-    h.failPusd();
+    failPusdAfterEntry(h);
     const result = await runLong(h);
     expect(result).toMatchObject({ success: false, profit: 0 });
     expect(h.sells()).toHaveLength(0);
@@ -440,7 +451,7 @@ describe('P0.3 fresh balance gate: long-arb interaction', () => {
 
   it('post-merge residual correction with a failed refresh: no stale corrective SELL, factual profit unchanged', async () => {
     const h = residualFixture();
-    h.failPositions();
+    failPositionsAfterEntry(h);
     const result = await runLong(h);
     expect(result).toMatchObject({ type: 'long', success: true, size: 8, txHashes: [MERGE_TX] });
     expect(result.facts).toMatchObject({ yesShares: 10, noShares: 8, mergedShares: 8, yesCost: expect.closeTo(3.2, 10), noCost: 4 });
@@ -453,7 +464,7 @@ describe('P0.3 fresh balance gate: long-arb interaction', () => {
     expect(h.logs).not.toContainEqual(expect.stringMatching(/Residual imbalance after merge/));
     expect(h.execution).toHaveBeenCalledTimes(1);
     expect(h.service.getStats()).toMatchObject({ executionsSucceeded: 1, totalProfit: expect.closeTo(0.8, 10) });
-    expectCachedTelemetryUnchanged(h);
+    expectOnlyEntryReadTelemetry(h);
   });
 
   it('post-merge residual correction with a successful refresh still submits the corrective SELL', async () => {
@@ -475,7 +486,7 @@ describe('P0.3 fresh balance gate: long-arb interaction', () => {
   it('post-merge residual: refresh fails on the residual check but the correction path is not entered with cached inventory', async () => {
     const h = residualFixture();
     const fix = vi.spyOn(h.service as unknown as { fixImbalanceIfNeeded: ArbitrageService['fixImbalanceIfNeeded'] }, 'fixImbalanceIfNeeded');
-    h.failPusd();
+    failPusdAfterEntry(h);
     await runLong(h);
     expect(fix).not.toHaveBeenCalled();
     expect(h.sells()).toHaveLength(0);

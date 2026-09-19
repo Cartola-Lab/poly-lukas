@@ -1079,11 +1079,33 @@ export class ArbitrageService extends EventEmitter {
       if (reason) throw new Error(`Inventory admission refused: ${reason}`);
     }
 
+    // Claim synchronously, before the first await: a second execute() arriving during the
+    // fresh balance read must see the claim and perform neither its own read nor a write.
     this.isExecuting = true;
-    this.stats.executionsAttempted++;
     const startTime = Date.now();
+    let attempted = false;
 
     try {
+      // The opportunity was sized from the cached balance, which is telemetry, not authority.
+      // Only a fresh, complete read may back the collateral / held-pair checks inside the
+      // executors; a failed refresh withholds the whole opportunity, never resizes it.
+      if (!(await this.updateBalance())) {
+        this.log('⏸️ Execution withheld: fresh balance refresh failed');
+        return {
+          success: false, type: opportunity.type, size: 0, profit: 0, txHashes: [],
+          error: 'Fresh balance refresh failed; execution withheld', executionTimeMs: Date.now() - startTime,
+        };
+      }
+      // Ownership may have changed while awaiting the read (its notification runs listeners
+      // synchronously). Same admission refusals as above: no attempt, no event.
+      const shortAfterRead = opportunity.type === 'long' ? this.getShortInventoryBlock(this.market) : undefined;
+      if (shortAfterRead) throw new Error(`Inventory write blocked by short ${shortAfterRead}`);
+      if (opportunity.type === 'short' && this.isRebalancerWriting(this.market)) {
+        throw new Error('Inventory write blocked by active rebalancer');
+      }
+
+      attempted = true;
+      this.stats.executionsAttempted++;
       const result = opportunity.type === 'long'
         ? await this.executeLongArb(opportunity)
         : await this.executeShortArb(opportunity);
@@ -1104,8 +1126,8 @@ export class ArbitrageService extends EventEmitter {
       return result;
     } finally {
       this.isExecuting = false;
-      // Update balance after execution
-      await this.updateBalance();
+      // Refresh after an economic attempt; a call withheld before any write changed nothing.
+      if (attempted) await this.updateBalance();
     }
   }
 

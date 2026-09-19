@@ -93,8 +93,12 @@ function noEconomy(h: ReturnType<typeof fixture>, attempts = 1, timestamp = h.pe
   expect(h.ctf.split).not.toHaveBeenCalled();
   expect(h.service['lastExecutionTime']).toBe(timestamp);
   expect(h.service['isExecuting']).toBe(false);
-  expect(h.ctf.getPusdBalance).toHaveBeenCalledTimes(refreshes);
+  // P0.3H2: every economic attempt performs one fresh entry read before the post-attempt refresh.
+  expect(h.ctf.getPusdBalance).toHaveBeenCalledTimes(refreshes + attempts);
 }
+
+/** P0.3H2: execute() awaits its fresh entry read before leg A; settle those microtasks (fake time unchanged). */
+const entryReadSettled = () => vi.advanceTimersByTimeAsync(0);
 
 beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(100000); });
 afterEach(async () => {
@@ -122,6 +126,7 @@ describe('P0.3e-3b real short submission lifecycle', () => {
       return set(id, record);
     });
     const result = submit(h);
+    await entryReadSettled();
     expect(h.pending.get(captured.id)).toBe(captured);
     expect(captured.legA.submission).toBe('UNCERTAIN');
     expect(captured.legB.submission).toBe('NOT_SUBMITTED');
@@ -144,6 +149,7 @@ describe('P0.3e-3b real short submission lifecycle', () => {
       return b.promise;
     });
     const result = submit(h);
+    await entryReadSettled();
     const record = [...h.pending.values()][0];
     a.resolve(accepted(' a '));
     await Promise.resolve();
@@ -180,7 +186,7 @@ describe('P0.3e-3b real short submission lifecycle', () => {
     if (leg === 'B') h.trading.createMarketOrder.mockResolvedValueOnce(accepted('a'));
     h.trading.createMarketOrder.mockReturnValueOnce(gate.promise);
     const result = submit(h);
-    await Promise.resolve();
+    await entryReadSettled();
     gate.reject(new Error('transport disconnected'));
     const ack = await result;
     expect(ack.status).toBe('SUBMISSION_UNCERTAIN');
@@ -263,6 +269,7 @@ describe('P0.3e-3b real short submission lifecycle', () => {
     const h = fixture(); const a = deferred();
     h.trading.createMarketOrder.mockReset().mockReturnValueOnce(a.promise).mockResolvedValueOnce(accepted('b'));
     const result = submit(h);
+    await entryReadSettled();
     Object.assign(h.market, { conditionId: 'future-condition', yesTokenId: 'future-yes', noTokenId: 'future-no' });
     a.resolve(accepted('a'));
     const ack = await result;
@@ -276,6 +283,7 @@ describe('P0.3e-3b real short submission lifecycle', () => {
     const h = fixture(); const a = deferred();
     h.trading.createMarketOrder.mockReset().mockReturnValueOnce(a.promise);
     const first = submit(h);
+    await entryReadSettled();
     const blocked = await h.service.execute(opportunity);
     expect(blocked).toEqual({ type: 'SHORT_SUBMISSION', status: 'SUBMISSION_UNCERTAIN', operationId: [...h.pending.keys()][0] });
     expect(h.service['lastExecutionTime']).toBe(0);
@@ -414,7 +422,7 @@ describe('long wrapper and real execution remain legacy results', () => {
     expect(h.pending.size).toBe(0);
     expect(h.service.getStats()).toMatchObject({ executionsAttempted: 1, executionsSucceeded: 0, totalProfit: 0 });
     expect(h.service['isExecuting']).toBe(false);
-    expect(h.ctf.getPusdBalance).toHaveBeenCalledTimes(1);
+    expect(h.ctf.getPusdBalance).toHaveBeenCalledTimes(2); // P0.3H2 entry read + post-attempt refresh
   });
 });
 
@@ -505,7 +513,7 @@ describe('short pacing through real automatic and scheduled paths', () => {
     h.ctf.getPusdBalance.mockRejectedValueOnce(new Error('balance cycle failed'));
     await vi.advanceTimersByTimeAsync(30000);
     expect(flush).toHaveBeenCalledTimes(1);
-    expect(h.ctf.getPusdBalance).toHaveBeenCalledTimes(3);
+    expect(h.ctf.getPusdBalance).toHaveBeenCalledTimes(4); // P0.3H2: submit = entry read + refresh, start, cycle
     expect(h.pending.get(ack.operationId)?.finalized).toBe(false);
     await vi.advanceTimersByTimeAsync(30000);
     expect(flush).toHaveBeenCalledTimes(2);
