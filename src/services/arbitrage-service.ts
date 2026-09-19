@@ -152,6 +152,7 @@ export interface RebalanceResult {
 
 export interface SettleResult {
   market: ArbitrageMarketConfig;
+  /** Balances read by this call; 0 placeholders when it read nothing (withheld, or an unresolved-merge reconciliation call). */
   yesBalance: number;
   noBalance: number;
   pairedTokens: number;
@@ -162,6 +163,18 @@ export interface SettleResult {
   mergeTxHash?: string;
   usdcRecovered?: number;
   error?: string;
+  /**
+   * Another `clearPositions(market, true)` or `settlePosition(market, true)` for this market was
+   * still active, so this call performed no balance read and no write.
+   */
+  withheld?: true;
+  /**
+   * A merge transaction that may have been broadcast has no confirmed or reverted receipt yet.
+   * No recovery is claimed; the record blocks every merge on the market until it resolves.
+   */
+  pending?: true;
+  /** Identity of the unresolved or reconciled merge record this result refers to. */
+  operationId?: string;
 }
 
 export interface ClearPositionResult {
@@ -443,6 +456,15 @@ type ClearMergeThrow =
   | { state: 'CONFIRMED'; txHash: string }
   | { state: 'UNRESOLVED'; provenance: PendingClearMerge['provenance']; txHash?: string };
 
+/**
+ * What the recorded transaction's own receipt proves about an unresolved merge. Shared by every
+ * merge-writing entrypoint; only CONFIRMED and REVERTED release the record.
+ */
+type PendingMergeResolution =
+  | { state: 'CONFIRMED' }
+  | { state: 'REVERTED'; reason: string }
+  | { state: 'UNRESOLVED'; reason: string };
+
 type LongArbMerge =
   | { state: 'NOT_STARTED' }
   | { state: 'IN_FLIGHT' }
@@ -589,12 +611,16 @@ export class ArbitrageService extends EventEmitter {
   /** Clear SELL submissions per `${conditionId}:${tokenId}`; guards sizing against a stale balance read. */
   private clearSellSubmissions = new Map<string, number>();
   /**
-   * Condition IDs with a `clearPositions(market, true)` economic phase in flight. Held from
-   * before the balance read until the call settles, so no second call can merge or sell the
-   * same inventory from a snapshot another call's merge may have invalidated.
+   * Condition IDs with a `clearPositions(market, true)` or `settlePosition(market, true)`
+   * economic phase in flight. Held from before the balance read until the call settles, so no
+   * second call can merge or sell the same inventory from a snapshot another call's merge may
+   * have invalidated. One interlock for every merge-writing entrypoint.
    */
   private activeClearMarkets = new Set<string>();
-  /** Unresolved clear merges keyed by conditionId; checked under the interlock before any balance read. */
+  /**
+   * Unresolved merges keyed by conditionId, installed by either merge-writing entrypoint and
+   * checked by both under the interlock before any balance read.
+   */
   private pendingClearMerges = new Map<string, PendingClearMerge>();
   private nextClearMergeId = 0;
   private nextClearSellId = 0;
@@ -1238,6 +1264,37 @@ export class ArbitrageService extends EventEmitter {
       throw new Error('No market specified');
     }
 
+    // Dry runs never write, so they neither take nor disturb the economic-write interlock.
+    if (!execute) return this.runSettlePosition(targetMarket, false);
+
+    // Same per-market interlock as clearPositions, acquired before the balance read: a merge
+    // from either entrypoint would otherwise invalidate this call's snapshot before it merges.
+    // The loser withholds rather than waits, because after waiting its snapshot would be stale.
+    const key = targetMarket.conditionId;
+    if (this.activeClearMarkets.has(key)) {
+      this.log(`⏸️ settlePosition withheld for ${targetMarket.name}: another clear or settle operation is active for this market`);
+      return {
+        market: targetMarket,
+        yesBalance: 0,
+        noBalance: 0,
+        pairedTokens: 0,
+        unpairedYes: 0,
+        unpairedNo: 0,
+        merged: false,
+        withheld: true,
+        error: 'settlePosition withheld: another clear or settle operation is active for this market; re-run after it settles',
+      };
+    }
+    this.activeClearMarkets.add(key);
+    try {
+      return await this.runSettlePosition(targetMarket, true);
+    } finally {
+      this.activeClearMarkets.delete(key);
+    }
+  }
+
+  /** Body of {@link settlePosition}; for `execute=true` the caller holds the market's interlock. */
+  private async runSettlePosition(targetMarket: ArbitrageMarketConfig, execute: boolean): Promise<SettleResult> {
     if (!this.ctf) {
       return {
         market: targetMarket,
@@ -1249,6 +1306,13 @@ export class ArbitrageService extends EventEmitter {
         merged: false,
         error: 'CTF client not configured',
       };
+    }
+
+    // Under the interlock and before any balance read: an earlier merge whose outcome is
+    // unknown owns this market's inventory decision until its own transaction resolves.
+    if (execute) {
+      const unresolved = this.pendingClearMerges.get(targetMarket.conditionId);
+      if (unresolved) return this.reconcileSettleMergeCall(unresolved, targetMarket);
     }
 
     const tokenIds: TokenIds = {
@@ -1306,8 +1370,30 @@ export class ArbitrageService extends EventEmitter {
         this.log(`   ✅ Merge TX: ${mergeResult.txHash}`);
         this.log(`   ✅ Recovered: $${mergeAmount.toFixed(2)} USDC`);
       } catch (error: any) {
-        result.error = error.message;
-        this.log(`   ❌ Merge failed: ${error.message}`);
+        const message = error instanceof Error ? error.message : String(error);
+        const outcome = classifyClearMergeThrow(error);
+        if (outcome.state === 'NOT_SUBMITTED') {
+          // Proven non-broadcast: the pairs are still held; a later call reads fresh and may retry.
+          result.error = message;
+          this.log(`   ❌ Merge failed: ${message}`);
+        } else if (outcome.state === 'CONFIRMED') {
+          // The client proved confirmation before failing; the pairs are gone and collateral is held.
+          result.merged = true;
+          result.mergeAmount = mergeAmount;
+          result.mergeTxHash = outcome.txHash;
+          result.usdcRecovered = mergeAmount;
+          this.log(`   ✅ Merge TX: ${outcome.txHash} (confirmed; client error after receipt: ${message})`);
+          this.log(`   ✅ Recovered: $${mergeAmount.toFixed(2)} USDC`);
+        } else {
+          // May have been broadcast: block every merge on this market until the transaction
+          // itself confirms or reverts. Installed before the guard releases.
+          const record = this.installPendingClearMerge(targetMarket, mergeAmount, outcome, message);
+          result.pending = true;
+          result.operationId = record.id;
+          if (record.txHash) result.mergeTxHash = record.txHash;
+          result.error = `MERGE_PENDING: ${record.pairs} pairs unresolved (merge outcome ${outcome.provenance.toLowerCase()}: ${message})`;
+          this.log(`   ⏳ Merge outcome uncertain (${record.id}${record.txHash ? `, tx ${record.txHash}` : ', no tx hash'}): ${message}; no new merge until resolved`);
+        }
       }
     } else if (pairedTokens >= 1) {
       this.log(`   💡 Run settlePosition(market, true) to recover $${pairedTokens.toFixed(2)} USDC`);
@@ -1658,16 +1744,7 @@ export class ArbitrageService extends EventEmitter {
           } else {
             // May have been broadcast: block every write on this market until the
             // transaction itself confirms or reverts. Installed before the guard releases.
-            const record: PendingClearMerge = {
-              id: `clear-merge-${++this.nextClearMergeId}`,
-              market: { name: market.name, conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId },
-              pairs: mergeAmount,
-              ...(outcome.txHash ? { txHash: outcome.txHash } : {}),
-              provenance: outcome.provenance,
-              error: message,
-              submittedAt: Date.now(),
-            };
-            this.pendingClearMerges.set(market.conditionId, record);
+            const record = this.installPendingClearMerge(market, mergeAmount, outcome, message);
             actions.push(this.pendingClearMergeAction(record, `merge outcome ${outcome.provenance.toLowerCase()}: ${message}`));
             residualsAuthorized = false;
             this.log(`   ⏳ Merge outcome uncertain (${record.id}${record.txHash ? `, tx ${record.txHash}` : ', no tx hash'}): ${message}; no SELL until resolved`);
@@ -2477,12 +2554,61 @@ export class ArbitrageService extends EventEmitter {
   }
 
   /**
+   * Records a merge that may have been broadcast. The caller holds the market's interlock and
+   * installs the record before releasing it, so no entrypoint can merge until it resolves.
+   */
+  private installPendingClearMerge(
+    market: ArbitrageMarketConfig, pairs: number, outcome: Extract<ClearMergeThrow, { state: 'UNRESOLVED' }>, error: string
+  ): PendingClearMerge {
+    const record: PendingClearMerge = {
+      id: `clear-merge-${++this.nextClearMergeId}`,
+      market: { name: market.name, conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId },
+      pairs,
+      ...(outcome.txHash ? { txHash: outcome.txHash } : {}),
+      provenance: outcome.provenance,
+      error,
+      submittedAt: Date.now(),
+    };
+    this.pendingClearMerges.set(market.conditionId, record);
+    return record;
+  }
+
+  /**
+   * The shared decision for an unresolved merge record, made under the market's interlock: the
+   * recorded transaction's own receipt is the only thing that may settle it. CONFIRMED and
+   * REVERTED delete the record (if it is still the installed one) before returning, so the same
+   * record can be booked or released by exactly one call; `pending`, `failed` (RPC/read failure
+   * or "not found", not proof of non-execution), a lookup throw, a status for a different hash,
+   * or a missing hash keep it installed. Performs no balance read and no write.
+   */
+  private async resolvePendingClearMerge(record: PendingClearMerge): Promise<PendingMergeResolution> {
+    if (!record.txHash) return { state: 'UNRESOLVED', reason: 'no transaction identity; cannot be proven' };
+    if (!this.ctf) return { state: 'UNRESOLVED', reason: 'CTF client not configured' };
+    let status: TransactionStatus | undefined;
+    try {
+      status = await this.ctf.getTransactionStatus(record.txHash);
+    } catch (error) {
+      this.log(`   ⚠️ Merge ${record.id} status lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const sameTx = status !== undefined && typeof status.txHash === 'string' && status.txHash.toLowerCase() === record.txHash.toLowerCase();
+    if (sameTx && status!.status === 'confirmed') {
+      if (this.pendingClearMerges.get(record.market.conditionId) === record) this.pendingClearMerges.delete(record.market.conditionId);
+      return { state: 'CONFIRMED' };
+    }
+    if (sameTx && status!.status === 'reverted') {
+      if (this.pendingClearMerges.get(record.market.conditionId) === record) this.pendingClearMerges.delete(record.market.conditionId);
+      return { state: 'REVERTED', reason: status!.errorReason ? `: ${status!.errorReason}` : '' };
+    }
+    const seen = !status ? 'status unavailable' : !sameTx ? 'status for a different transaction' : `transaction ${status.status}`;
+    return { state: 'UNRESOLVED', reason: seen };
+  }
+
+  /**
    * A guarded `clearPositions(market, true)` call that found an unresolved merge for the market.
-   * It performs no balance read and no write: the recorded transaction's own receipt is the only
-   * thing that may settle it. CONFIRMED books the recorded pairs exactly once under the audited
-   * merge contract; REVERTED releases the record with zero recovery; `pending`, `failed`
-   * (RPC/read failure or "not found", not proof of non-execution), a lookup throw, or a missing
-   * hash keep it unresolved. Residual inventory is handled by a later call from a fresh read.
+   * It performs no balance read and no write; see {@link resolvePendingClearMerge} for what
+   * settles it. CONFIRMED books the recorded pairs exactly once under the audited merge
+   * contract; REVERTED releases the record with zero recovery. Residual inventory is handled by
+   * a later call from a fresh read.
    */
   private async reconcileClearMergeCall(record: PendingClearMerge, market: ArbitrageMarketConfig): Promise<ClearPositionResult> {
     const base = { market, marketStatus: 'unknown' as const, yesBalance: 0, noBalance: 0 };
@@ -2491,35 +2617,56 @@ export class ArbitrageService extends EventEmitter {
 
     let action: ClearAction;
     let recovered = 0;
-    if (!record.txHash || !this.ctf) {
-      action = this.pendingClearMergeAction(record, !record.txHash ? 'no transaction identity; cannot be proven' : 'CTF client not configured');
+    const resolution = await this.resolvePendingClearMerge(record);
+    if (resolution.state === 'CONFIRMED') {
+      action = { type: 'merge', amount: record.pairs, usdcResult: record.pairs, txHash: record.txHash, success: true, operationId: record.id };
+      recovered = record.pairs;
+      this.log(`   ✅ Merged: ${record.pairs.toFixed(4)} pairs → $${record.pairs.toFixed(2)} USDC (${record.id} confirmed on-chain); residuals need a fresh read`);
+    } else if (resolution.state === 'REVERTED') {
+      action = { type: 'merge', amount: 0, usdcResult: 0, txHash: record.txHash, success: false, operationId: record.id,
+        error: `Merge reverted on-chain${resolution.reason}` };
+      this.log(`   ❌ Merge ${record.id} reverted on-chain${resolution.reason}; inventory unchanged, a later call may re-plan from a fresh read`);
+    } else if (!record.txHash || !this.ctf) {
+      action = this.pendingClearMergeAction(record, resolution.reason);
     } else {
-      let status: TransactionStatus | undefined;
-      try {
-        status = await this.ctf.getTransactionStatus(record.txHash);
-      } catch (error) {
-        this.log(`   ⚠️ Merge ${record.id} status lookup failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      const sameTx = status !== undefined && typeof status.txHash === 'string' && status.txHash.toLowerCase() === record.txHash.toLowerCase();
-      if (sameTx && status!.status === 'confirmed') {
-        if (this.pendingClearMerges.get(record.market.conditionId) === record) this.pendingClearMerges.delete(record.market.conditionId);
-        action = { type: 'merge', amount: record.pairs, usdcResult: record.pairs, txHash: record.txHash, success: true, operationId: record.id };
-        recovered = record.pairs;
-        this.log(`   ✅ Merged: ${record.pairs.toFixed(4)} pairs → $${record.pairs.toFixed(2)} USDC (${record.id} confirmed on-chain); residuals need a fresh read`);
-      } else if (sameTx && status!.status === 'reverted') {
-        if (this.pendingClearMerges.get(record.market.conditionId) === record) this.pendingClearMerges.delete(record.market.conditionId);
-        const reason = status!.errorReason ? `: ${status!.errorReason}` : '';
-        action = { type: 'merge', amount: 0, usdcResult: 0, txHash: record.txHash, success: false, operationId: record.id,
-          error: `Merge reverted on-chain${reason}` };
-        this.log(`   ❌ Merge ${record.id} reverted on-chain${reason}; inventory unchanged, a later call may re-plan from a fresh read`);
-      } else {
-        const seen = !status ? 'status unavailable' : !sameTx ? 'status for a different transaction' : `transaction ${status.status}`;
-        action = this.pendingClearMergeAction(record, `${seen}; not proof of execution or non-execution`);
-        this.log(`   ⏳ Merge ${record.id} still unresolved (${seen}); no SELL, no new merge`);
-      }
+      action = this.pendingClearMergeAction(record, `${resolution.reason}; not proof of execution or non-execution`);
+      this.log(`   ⏳ Merge ${record.id} still unresolved (${resolution.reason}); no SELL, no new merge`);
     }
 
     const result: ClearPositionResult = { ...base, actions: [action], totalUsdcRecovered: recovered, success: action.success };
+    this.emit('settle', result);
+    return result;
+  }
+
+  /**
+   * A guarded `settlePosition(market, true)` call that found an unresolved merge for the market,
+   * installed by either entrypoint. Same decision as {@link reconcileClearMergeCall}, reported
+   * in settle shape: no balance read, no write, and recovery only for a CONFIRMED receipt.
+   */
+  private async reconcileSettleMergeCall(record: PendingClearMerge, market: ArbitrageMarketConfig): Promise<SettleResult> {
+    this.log(`\n📊 Position: ${market.name}`);
+    this.log(`   ⏳ Unresolved merge ${record.id}: ${record.pairs} pairs${record.txHash ? `, tx ${record.txHash}` : ', no tx hash'}; no new merge until it resolves`);
+
+    const result: SettleResult = {
+      market, yesBalance: 0, noBalance: 0, pairedTokens: 0, unpairedYes: 0, unpairedNo: 0, merged: false, operationId: record.id,
+      ...(record.txHash ? { mergeTxHash: record.txHash } : {}),
+    };
+    const resolution = await this.resolvePendingClearMerge(record);
+    if (resolution.state === 'CONFIRMED') {
+      result.merged = true;
+      result.mergeAmount = record.pairs;
+      result.usdcRecovered = record.pairs;
+      this.log(`   ✅ Merged: ${record.pairs.toFixed(4)} pairs → $${record.pairs.toFixed(2)} USDC (${record.id} confirmed on-chain); residuals need a fresh read`);
+    } else if (resolution.state === 'REVERTED') {
+      result.error = `Merge reverted on-chain${resolution.reason}`;
+      this.log(`   ❌ Merge ${record.id} reverted on-chain${resolution.reason}; inventory unchanged, a later call may re-plan from a fresh read`);
+    } else {
+      result.pending = true;
+      const proof = !record.txHash || !this.ctf ? resolution.reason : `${resolution.reason}; not proof of execution or non-execution`;
+      result.error = `MERGE_PENDING: ${record.pairs} pairs unresolved (${proof})`;
+      this.log(`   ⏳ Merge ${record.id} still unresolved (${resolution.reason}); no new merge`);
+    }
+
     this.emit('settle', result);
     return result;
   }
