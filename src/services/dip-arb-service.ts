@@ -42,7 +42,7 @@ import { MarketService } from './market-service.js';
 import { CTFClient, MergeProvenanceError, RedeemProvenanceError, type MergeProvenance,
   type MergeResult, type RedeemResult, type LifecycleRouting } from '../clients/ctf-client.js';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
-import { estimateTakerFee, calculateNetLongArbProfit } from '../utils/price-utils.js';
+import { estimateTakerFee } from '../utils/price-utils.js';
 import type { Side } from '../core/types.js';
 import {
   type DipArbServiceConfig,
@@ -1285,34 +1285,26 @@ export class DipArbService extends EventEmitter {
           side: signal.hedgeSide, price: avgPrice, cost: totalAmountSpent, shares: totalSharesFilled, orderId: lastOrderId,
           ...(inventoryInterruption ? { inventoryInterruption } : {}), executionTimeMs: Date.now() - startTime };
         round.totalCost = actualTotalCost;
-        // AUDIT #3: book NET profit (taker fee on both legs' notional comes
-        // out of the $1 payout — same as the fee-aware entry gates above and
-        // arb-service). No gas term: this path has no gas config.
-        const booked = calculateNetLongArbProfit(
-          actualTotalCost,
-          totalSharesFilled,
-          this.config.feeRateBps,
-          0
-        );
-        round.profit = booked.netPerUnit;
+        // Two factual BUY legs prove shares, prices and cost of the paired
+        // position. They do not prove realized collateral: the $1 pair payout
+        // only exists once a merge or redeem is factually confirmed, so no
+        // realized profit is booked or published here.
 
+        const pairedBuyCost = (round.leg1?.cost ?? leg1Price * totalSharesFilled) + totalAmountSpent;
         this.stats.leg2Filled++;
         this.stats.roundsSuccessful++;
-        this.stats.totalProfit += booked.net;
-        this.stats.totalSpent += (round.leg1?.cost ?? leg1Price * totalSharesFilled) + totalAmountSpent;
+        this.stats.totalSpent += pairedBuyCost;
 
         this.lastExecutionTime = Date.now();
 
         // Detailed execution logging
         const slippage = ((avgPrice - signal.currentPrice) / signal.currentPrice * 100);
         const execTimeMs = Date.now() - startTime;
-        const profitPerShare = round.profit;
-        const totalProfit = profitPerShare * totalSharesFilled;
 
         this.log(`✅ Leg2 FILLED: ${signal.hedgeSide} x${totalSharesFilled.toFixed(1)} @ ${avgPrice.toFixed(4)}`);
         this.log(`   Expected: ${signal.currentPrice.toFixed(4)} | Actual: ${avgPrice.toFixed(4)} | Slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}%`);
-        this.log(`   Leg1: ${leg1Price.toFixed(4)} + Leg2: ${avgPrice.toFixed(4)} = ${actualTotalCost.toFixed(4)}`);
-        this.log(`   💰 Profit: $${totalProfit.toFixed(2)} (${(profitPerShare * 100).toFixed(2)}% per share)`);
+        this.log(`   Leg1: ${leg1Price.toFixed(4)} + Leg2: ${avgPrice.toFixed(4)} = ${actualTotalCost.toFixed(4)} per pair`);
+        this.log(`   Paired: ${totalSharesFilled.toFixed(1)} shares | Factual BUY cost: $${pairedBuyCost.toFixed(2)} | Realized profit: unknown until merge/redeem is confirmed`);
         this.log(`   Execution time: ${execTimeMs}ms | Orders: ${splitCount - failedOrders}/${splitCount}`);
 
         // Log orderbook after execution
@@ -1326,8 +1318,7 @@ export class DipArbService extends EventEmitter {
           leg1: round.leg1,
           leg2: round.leg2,
           totalCost: round.totalCost,
-          profit: round.profit,
-          profitRate: calculateDipArbProfitRate(round.totalCost),
+          // profit / profitRate are withheld: the pair is formed but not settled.
           merged: false,
         };
 
