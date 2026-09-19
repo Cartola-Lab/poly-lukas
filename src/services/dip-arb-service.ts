@@ -2635,7 +2635,9 @@ export class DipArbService extends EventEmitter {
     const amountReceived = parseFloat(payout);
     const result: DipArbSettleResult = { success: true, strategy: 'redeem', market: pending.market,
       txHash, amountReceived, executionTimeMs: 0 };
-    this.stats.totalProfit += amountReceived;
+    // amountReceived is factual recovered collateral, not realized profit: the
+    // redeemed inventory was acquired at a factual BUY cost that this path
+    // cannot attribute per consumed unit yet, so stats.totalProfit is untouched.
     this.accountedRedeemTransactions.set(identity, Object.freeze({ ...result }));
     this.removePendingRedemption(pending);
     // No await or consumer code between accounting, the tombstone and dequeue.
