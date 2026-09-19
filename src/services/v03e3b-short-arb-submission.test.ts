@@ -34,12 +34,15 @@ function fixture() {
     a: { id: 'a', status: 'MINED', size: '10', price: '0.6', transactionHash: '0x' + '11'.repeat(32) },
     b: { id: 'b', status: 'MINED', size: '10', price: '0.5', transactionHash: '0x' + '22'.repeat(32) },
   };
+  // Long BUY legs ('ly'/'ln') are proven from BUY-side facts; every other order is a short SELL.
+  const assets: Record<string, string> = { a: 'yes', b: 'no', c: 'yes', d: 'no', ly: 'yes', ln: 'no' };
+  const sides: Record<string, 'BUY' | 'SELL'> = { ly: 'BUY', ln: 'BUY' };
   const trading = {
     initialize: vi.fn().mockResolvedValue(undefined),
     createMarketOrder: vi.fn<TradingService['createMarketOrder']>()
       .mockResolvedValueOnce(accepted('a')).mockResolvedValueOnce(accepted('b')),
-    getOrderFillDetails: vi.fn(async (id: string) => ({ id, asset_id: ({a:'yes',b:'no',c:'yes',d:'no'} as Record<string,string>)[id], side: 'SELL', status: 'MATCHED', tradeEnumerationPresent: true, tradeIds: [id], sizeMatched: trades[id].size! })),
-    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => ({ asset_id: ({a:'yes',b:'no',c:'yes',d:'no'} as Record<string,string>)[id], side: 'SELL' as const, taker_order_id:id, trader_side:'TAKER' as const, maker_orders:[], ...trades[id] }))),
+    getOrderFillDetails: vi.fn(async (id: string) => ({ id, asset_id: assets[id], side: sides[id] ?? 'SELL', status: 'MATCHED', tradeEnumerationPresent: true, tradeIds: [id], sizeMatched: trades[id].size! })),
+    getTradeStatuses: vi.fn(async (ids: string[]) => ids.map(id => ({ asset_id: assets[id], side: sides[id] ?? 'SELL' as const, taker_order_id:id, trader_side:'TAKER' as const, maker_orders:[], ...trades[id] }))),
   };
   const ctf = {
     getAddress: vi.fn().mockReturnValue('wallet'),
@@ -62,6 +65,15 @@ function fixture() {
   const pending = service['pendingShortArbs'];
   const flush = () => service['flushPendingShortArbs']();
   return { service, market, trading, ctf, realtime, trades, execution, recovery, pending, flush };
+}
+
+const MERGE_TX = '0x' + 'ab'.repeat(32);
+/** Factual long-arb fixture: BUY fills 10 @ 0.4 and 10 @ 0.5, receipt-confirmed merge → realized $1. */
+function armLong(h: ReturnType<typeof fixture>) {
+  h.trades.ly = { id: 'ly', status: 'MINED', size: '10', price: '0.4', transactionHash: '0x' + '33'.repeat(32) };
+  h.trades.ln = { id: 'ln', status: 'MINED', size: '10', price: '0.5', transactionHash: '0x' + '44'.repeat(32) };
+  h.trading.createMarketOrder.mockResolvedValueOnce(accepted('ly')).mockResolvedValueOnce(accepted('ln'));
+  h.ctf.mergeByTokenIds.mockResolvedValue({ success: true, txHash: MERGE_TX });
 }
 
 async function submit(h: ReturnType<typeof fixture>, op = opportunity): Promise<ShortArbSubmissionAck> {
@@ -366,12 +378,15 @@ describe('long wrapper and real execution remain legacy results', () => {
     if (existing) {
       await submit(h);
       h.market.conditionId = 'other-condition';
-      h.trading.createMarketOrder.mockClear().mockResolvedValue(accepted('long'));
+      h.trading.createMarketOrder.mockClear();
+    } else {
+      h.trading.createMarketOrder.mockReset();
     }
+    armLong(h);
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '10', noBalance: '10' });
     const result = await h.service.execute({ ...opportunity, type: 'long' });
     if (result.type === 'SHORT_SUBMISSION') throw new Error('Long must retain execution result contract');
-    expect(result).toMatchObject({ type: 'long', success: true, size: 10, profit: 1, txHashes: ['merge-tx'] });
+    expect(result).toMatchObject({ type: 'long', success: true, size: 10, profit: 1, txHashes: [MERGE_TX] });
     expect(result.executionTimeMs).toBeGreaterThanOrEqual(0);
     expect(h.trading.createMarketOrder).toHaveBeenNthCalledWith(1, { tokenId: 'yes', side: 'BUY', amount: 4, price: 0.41, orderType: 'FOK' });
     expect(h.trading.createMarketOrder).toHaveBeenNthCalledWith(2, { tokenId: 'no', side: 'BUY', amount: 5, price: 0.51, orderType: 'FOK' });
@@ -673,11 +688,12 @@ describe('post-terminal inventory release', () => {
     expect(h.execution).not.toHaveBeenCalled();
     expect(h.ctf.mergeByTokenIds).not.toHaveBeenCalled();
     await h.service['updateBalance']();
-    h.trading.createMarketOrder.mockClear().mockResolvedValue(accepted('long'));
+    h.trading.createMarketOrder.mockClear();
+    armLong(h);
     h.ctf.getPositionBalanceByTokenIds.mockResolvedValue({ yesBalance: '10', noBalance: '10' });
     const result = await h.service.execute({ ...opportunity, type: 'long' });
     if (result.type === 'SHORT_SUBMISSION') throw new Error('Long must retain execution result contract');
-    expect(result).toMatchObject({ type: 'long', success: true, size: 10, profit: 1, txHashes: ['merge-tx'] });
+    expect(result).toMatchObject({ type: 'long', success: true, size: 10, profit: 1, txHashes: [MERGE_TX] });
     expect(h.execution).toHaveBeenCalledTimes(1);
     expect(h.service.getStats()).toMatchObject({ executionsAttempted: 2, executionsSucceeded: 1, totalProfit: 1 });
     expect(h.pending.get(first.operationId)?.inventoryReconciled).toBe(true);

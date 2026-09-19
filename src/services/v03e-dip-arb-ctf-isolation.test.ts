@@ -47,7 +47,13 @@ function fixture(owned = false) {
     return pending;
   };
   const stats = () => { const { startTime, runningTimeMs, ...value } = service.getStats(); return value; };
-  return { service, ctf, market, round, guard, events, protection, write, transport, queue, stats };
+  // Factual recovered collateral accounted by receipt tombstones. Redeem payout is
+  // never realized profit, so this is the exactly-once accounting proxy.
+  const recovered = () => {
+    expect(service.getStats().totalProfit).toBe(0);
+    return [...service['accountedRedeemTransactions'].values()].reduce((sum, r) => sum + (r.amountReceived ?? 0), 0);
+  };
+  return { service, ctf, market, round, guard, events, protection, write, transport, queue, stats, recovered };
 }
 afterEach(() => vi.restoreAllMocks());
 
@@ -76,7 +82,7 @@ describe('DipArb CTF writer isolation', () => {
         expect(h.ctf.getRedeemPayout).toHaveBeenCalledTimes(2);
         expect(h.ctf.getRedeemPayout).toHaveBeenCalledWith(hash, wallet);
         expect(h.ctf.getRedeemPayout).toHaveBeenCalledWith(hashB, wallet);
-        expect(h.stats().totalProfit).toBe(Number(amountA) + 12.5);
+        expect(h.recovered()).toBe(Number(amountA) + 12.5);
         expect(h.events.settled).toHaveBeenCalledTimes(2);
         expect(h.events.settled).toHaveBeenCalledWith(expect.objectContaining({ success: true, txHash: hash, amountReceived: Number(amountA) }));
         expect(h.events.settled).toHaveBeenCalledWith(expect.objectContaining({ success: true, txHash: hashB, amountReceived: 12.5 }));
@@ -103,13 +109,13 @@ describe('DipArb CTF writer isolation', () => {
         : { state: 'PAYOUT_KNOWN', transactionHash: tx, pusdReceived: aUnknown ? '12.5' : '7.25' }) as any);
       await h.service['processPendingRedemptions']();
       expect(h.service.getPendingRedemptions()).toEqual([aUnknown ? a : b]);
-      expect(h.stats().totalProfit).toBe(aUnknown ? 12.5 : 7.25);
+      expect(h.recovered()).toBe(aUnknown ? 12.5 : 7.25);
       expect(h.service['accountedRedeemTransactions'].has(unknownHash)).toBe(false);
       expect(await h.service.settle('redeem')).toMatchObject(aUnknown
         ? { txHash: hash, error: 'CONFIRMED_PAYOUT_PENDING' } : { txHash: hash, success: true, amountReceived: 7.25 });
       h.ctf.getRedeemPayout.mockResolvedValue({ state: 'PAYOUT_KNOWN', transactionHash: unknownHash, pusdReceived: aUnknown ? '7.25' : '12.5' } as any);
       await h.service['processPendingRedemptions']();
-      expect(h.stats().totalProfit).toBe(19.75);
+      expect(h.recovered()).toBe(19.75);
       expect(h.events.settled).toHaveBeenCalledTimes(2);
       expect(h.events.settled.mock.calls.every(([result]) => result.success)).toBe(true);
       expect(h.ctf.redeemByTokenIds).toHaveBeenCalledTimes(1);
@@ -127,7 +133,7 @@ describe('DipArb CTF writer isolation', () => {
       h.ctf.getRedeemPayout.mockImplementation(async requested => ({ state: 'PAYOUT_KNOWN', transactionHash: requested, pusdReceived: '7.25' }) as any);
       await h.service['processPendingRedemptions']();
       expect(h.ctf.getRedeemPayout).toHaveBeenCalledTimes(1);
-      expect(h.stats().totalProfit).toBe(7.25);
+      expect(h.recovered()).toBe(7.25);
       expect(h.events.settled).toHaveBeenCalledTimes(1);
       expect(h.events.settled).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
       expect(h.ctf.redeemByTokenIds).not.toHaveBeenCalled();
@@ -147,7 +153,7 @@ describe('DipArb CTF writer isolation', () => {
       expect(await h.service.settle('redeem')).toMatchObject({ success: true, txHash: hash, amountReceived: 12.5 });
       expect(h.ctf.redeemByTokenIds).toHaveBeenCalledTimes(1);
       expect(h.ctf.getMarketResolution).toHaveBeenCalledTimes(1);
-      expect(h.stats().totalProfit).toBe(12.5);
+      expect(h.recovered()).toBe(12.5);
       expect(h.events.settled).toHaveBeenCalledTimes(1);
       expect(h.events.settled).toHaveBeenCalledWith(expect.objectContaining({ success: true, amountReceived: 12.5 }));
       expect(h.service.getPendingRedemptions()).toHaveLength(0);
@@ -166,14 +172,14 @@ describe('DipArb CTF writer isolation', () => {
       const pending = h.service.getPendingRedemptions()[0];
       expect(pending).toMatchObject({ state: 'CONFIRMED_PAYOUT_PENDING', transactionHash: hash, historicalWallet: wallet, retryCount: 0 });
       expect(pending.round).toBe(h.round);
-      expect(h.stats().totalProfit).toBe(0);
+      expect(h.recovered()).toBe(0);
       expect(h.events.settled).not.toHaveBeenCalled();
       await h.service['processPendingRedemptions']();
       expect(await h.service.settle('redeem')).toMatchObject({ success: true, amountReceived: 7.25, txHash: hash });
       expect(h.ctf.redeemByTokenIds).toHaveBeenCalledTimes(1);
       expect(h.ctf.getRedeemPayout).toHaveBeenCalledTimes(1);
       expect(h.ctf.getRedeemPayout).toHaveBeenCalledWith(hash, wallet);
-      expect(h.stats().totalProfit).toBe(7.25);
+      expect(h.recovered()).toBe(7.25);
       expect(h.events.settled).toHaveBeenCalledTimes(1);
       expect(h.events.settled).toHaveBeenCalledWith(expect.objectContaining({ success: true, amountReceived: 7.25 }));
       expect(h.service.getPendingRedemptions()).toHaveLength(0);
@@ -193,7 +199,7 @@ describe('DipArb CTF writer isolation', () => {
       const results = await Promise.all([first, second]);
       expect(results.map(r => r.success)).toEqual([true, true]);
       expect(h.ctf.redeemByTokenIds).toHaveBeenCalledTimes(1);
-      expect(h.stats().totalProfit).toBe(10);
+      expect(h.recovered()).toBe(10);
       expect(h.events.settled).toHaveBeenCalledTimes(1);
       expect(h.service.getPendingRedemptions()).toHaveLength(0);
     });
@@ -206,7 +212,7 @@ describe('DipArb CTF writer isolation', () => {
       expect(await h.service.settle('redeem')).toMatchObject({ success: true, amountReceived: 10, txHash: hash });
       expect(h.ctf.redeemByTokenIds).toHaveBeenCalledTimes(1);
       expect(h.events.settled).toHaveBeenCalledTimes(1);
-      expect(h.stats().totalProfit).toBe(10);
+      expect(h.recovered()).toBe(10);
     });
   }
   for (const withGuard of [true, false]) {
@@ -226,7 +232,7 @@ describe('DipArb CTF writer isolation', () => {
       h.ctf.redeemByTokenIds.mockRejectedValueOnce(new RedeemProvenanceError(new Error('post-confirmation'),
         { state: 'CONFIRMED', transactionHash: hash }, '12.5'));
       if (failure === 'listener' || failure === 'both') h.service.on('settled', () => {
-        expect(h.stats().totalProfit).toBe(before.totalProfit + 12.5);
+        expect(h.recovered()).toBe(12.5);
         expect(h.service.getPendingRedemptions()).toHaveLength(0);
         throw new Error('listener');
       });
@@ -235,7 +241,7 @@ describe('DipArb CTF writer isolation', () => {
       });
       await h.service['processPendingRedemptions']();
       await h.service['processPendingRedemptions']();
-      expect(h.stats()).toEqual({ ...before, totalProfit: before.totalProfit + 12.5 });
+      expect(h.stats()).toEqual(before); expect(h.recovered()).toBe(12.5);
       expect(h.events.settled).toHaveBeenCalledTimes(1);
       expect(h.events.settled).toHaveBeenCalledWith(expect.objectContaining({ success: true, amountReceived: 12.5, txHash: hash }));
       expect(pending.retryCount).toBe(21);
@@ -273,7 +279,7 @@ describe('DipArb CTF writer isolation', () => {
       await h.service['processPendingRedemptions']();
       await h.service['processPendingRedemptions']();
       expect(h.ctf.getRedeemPayout).toHaveBeenLastCalledWith(hash, wallet);
-      expect(h.stats()).toEqual({ ...rotatedStats, totalProfit: before.totalProfit + Number(amount) });
+      expect(h.stats()).toEqual(rotatedStats); expect(h.recovered()).toBe(Number(amount));
       expect(h.events.settled).toHaveBeenCalledTimes(1);
       expect(h.events.settled).toHaveBeenCalledWith(expect.objectContaining({ success: true, market: h.market, amountReceived: Number(amount) }));
       expect(h.service.getPendingRedemptions()).toHaveLength(0);
@@ -296,7 +302,7 @@ describe('DipArb CTF writer isolation', () => {
       await h.service['processPendingRedemptions']();
       expect(h.events.settled).toHaveBeenCalledTimes(1);
       expect(h.events.settled).toHaveBeenCalledWith(expect.objectContaining({ success: true, amountReceived: 7.25 }));
-      expect(h.stats()).toEqual({ ...before, totalProfit: before.totalProfit + 7.25 });
+      expect(h.stats()).toEqual(before); expect(h.recovered()).toBe(7.25);
       expect(h.service.getPendingRedemptions()).toHaveLength(0);
       expect(h.ctf.redeemByTokenIds).toHaveBeenCalledTimes(1);
       expect(h.ctf.getRedeemPayout).toHaveBeenCalledTimes(1);
@@ -327,7 +333,7 @@ describe('DipArb CTF writer isolation', () => {
     h.service['pendingRedemptions'].push({ ...h.service.getPendingRedemptions()[0], ...pending,
       state: 'CONFIRMED_PAYOUT_PENDING', transactionHash: '0x' + 'AB'.repeat(32), historicalWallet: wallet });
     await h.service['processPendingRedemptions']();
-    expect(h.stats().totalProfit).toBe(7.25);
+    expect(h.recovered()).toBe(7.25);
     expect(h.events.settled).toHaveBeenCalledTimes(1);
     expect(h.ctf.getRedeemPayout).toHaveBeenCalledTimes(2);
     expect(h.ctf.redeemByTokenIds).not.toHaveBeenCalled();
@@ -345,7 +351,7 @@ describe('DipArb CTF writer isolation', () => {
     response.resolve({ state: 'PAYOUT_KNOWN', transactionHash: hash, pusdReceived: '7.25' });
     await flight;
     expect(h.events.settled).not.toHaveBeenCalled();
-    expect(h.stats().totalProfit).toBe(0);
+    expect(h.recovered()).toBe(0);
   });
   for (const writer of ['merge', 'redeem'] as const) {
     const TypedError = writer === 'merge' ? MergeProvenanceError : RedeemProvenanceError;
@@ -383,7 +389,7 @@ describe('DipArb CTF writer isolation', () => {
         expect(!!h.protection()).toBe(state === 'SUBMITTED' || state === 'UNCERTAIN');
         if (h.protection()) expect([...h.service['ctfLifecycles'].values()][0]).toMatchObject({ state, transactionHash: hash });
         const finalized = writer === 'redeem' && state === 'CONFIRMED';
-        expect(h.stats()).toEqual({ ...before, totalProfit: before.totalProfit + (finalized ? 10 : 0) });
+        expect(h.stats()).toEqual(before); expect(h.recovered()).toBe(finalized ? 10 : 0);
         expect(h.events.settled).toHaveBeenCalledTimes(finalized ? 1 : 0);
         for (const event of ['execution', 'roundComplete'] as const) expect(h.events[event]).not.toHaveBeenCalled();
       });
@@ -523,15 +529,15 @@ describe('DipArb CTF writer isolation', () => {
       expect(h.ctf.redeemByTokenIds).toHaveBeenCalledTimes(1);
       expect(h.events.settled).toHaveBeenCalledTimes(1);
       expect(h.events.settled).toHaveBeenCalledWith(expect.objectContaining({ success: true, txHash: hash, amountReceived: 10 }));
-      expect(h.stats().totalProfit).toBe(before.totalProfit + 10);
+      expect(h.recovered()).toBe(10);
     });
     it.each(['listener', 'logger', 'both'] as const)(`guard=${withGuard}: CONFIRMED survives %s failure without economic retry`, async failure => {
       const h = fixture(), pending = h.queue(20), before = h.stats(), result = confirmed();
       if (!withGuard) h.service.setInventoryAdmissionGuard(undefined);
       h.ctf.redeemByTokenIds.mockResolvedValueOnce(result);
-      const observed: Array<{ profit: number; lifecycles: number }> = [];
+      const observed: Array<{ recovered: number; lifecycles: number }> = [];
       const listener = vi.fn(() => {
-        observed.push({ profit: h.stats().totalProfit, lifecycles: h.service['ctfLifecycles'].size });
+        observed.push({ recovered: h.recovered(), lifecycles: h.service['ctfLifecycles'].size });
         if (failure !== 'logger') throw new Error('consumer failed');
       });
       h.service.on('settled', listener);
@@ -544,10 +550,10 @@ describe('DipArb CTF writer isolation', () => {
       expect(h.service.getPendingRedemptions()).toHaveLength(0);
       expect(h.ctf.redeemByTokenIds).toHaveBeenCalledTimes(1);
       expect(listener).toHaveBeenCalledTimes(1);
-      expect(observed).toEqual([{ profit: before.totalProfit + 10, lifecycles: 0 }]);
+      expect(observed).toEqual([{ recovered: 10, lifecycles: 0 }]);
       expect(h.events.settled).toHaveBeenCalledTimes(1);
       expect(h.events.settled).toHaveBeenCalledWith(expect.objectContaining({ success: true, txHash: hash, amountReceived: 10 }));
-      expect(h.stats()).toEqual({ ...before, totalProfit: before.totalProfit + 10 });
+      expect(h.stats()).toEqual(before); expect(h.recovered()).toBe(10);
       expect(result.provenance).toEqual({ state: 'CONFIRMED', transactionHash: hash });
       expect(h.service['ctfLifecycles'].size).toBe(0);
       expect(h.protection()).toBeUndefined();
@@ -622,7 +628,7 @@ describe('DipArb CTF writer isolation', () => {
       } else {
         // Existing confirmed accounting, not an effect synthesized by the registry.
         expect(h.events.settled).toHaveBeenCalledTimes(1);
-        expect(h.stats().totalProfit).toBe(before.totalProfit + 10);
+        expect(h.recovered()).toBe(10);
       }
     });
   }

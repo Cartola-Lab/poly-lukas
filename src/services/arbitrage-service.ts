@@ -28,7 +28,7 @@ import {
 } from './realtime-service-v2.js';
 import { TradingService } from './trading-service.js';
 import { MarketService } from './market-service.js';
-import { CTFClient, type TokenIds, type LifecycleRouting } from '../clients/ctf-client.js';
+import { CTFClient, MergeProvenanceError, type TokenIds, type LifecycleRouting, type MergeResult, type RedeemResult, type TransactionStatus } from '../clients/ctf-client.js';
 import { GammaApiClient } from '../clients/gamma-api.js';
 import { RateLimiter } from '../core/rate-limiter.js';
 import { createUnifiedCache } from '../core/unified-cache.js';
@@ -37,6 +37,7 @@ import {
   calculateExecutableSize,
   calculateNetLongArbProfit,
   calculateNetShortArbProfit,
+  estimateTakerFee,
 } from '../utils/price-utils.js';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
 import type { BookUpdate } from '../core/types.js';
@@ -126,11 +127,27 @@ export interface RebalanceAction {
   priority: number;
 }
 
+/** Factual SELL execution attributable to one rebalance order. */
+export interface RebalanceSellFacts {
+  orderId: string;
+  tokenId: string;
+  requestedShares: number;
+  soldShares: number;
+  weightedPrice?: number;
+  txHashes: string[];
+}
+
 export interface RebalanceResult {
   success: boolean;
   action: RebalanceAction;
   txHash?: string;
   error?: string;
+  /** SELL rebalance operation identity when the result belongs to a reconcilable order. */
+  operationId?: string;
+  /** SELL submitted but not factually reconciled: no completion claim, no event. */
+  pending?: boolean;
+  /** Present for terminal SELL rebalances; `success` requires the full requested quantity. */
+  facts?: RebalanceSellFacts;
 }
 
 export interface SettleResult {
@@ -150,21 +167,45 @@ export interface SettleResult {
 export interface ClearPositionResult {
   market: ArbitrageMarketConfig;
   marketStatus: 'active' | 'resolved' | 'unknown';
+  /** Balances read by this call; 0 placeholders when it read nothing (withheld, or an unresolved-merge reconciliation call). */
   yesBalance: number;
   noBalance: number;
   actions: ClearAction[];
   totalUsdcRecovered: number;
   success: boolean;
   error?: string;
+  /**
+   * Another `clearPositions(market, true)` for this market was still active, so this call
+   * performed no balance read and no write; `yesBalance`/`noBalance` are 0 placeholders.
+   */
+  withheld?: true;
+}
+
+/** Factual SELL execution attributable to one clearPositions order. */
+export interface ClearSellFacts extends RebalanceSellFacts {
+  /** Sum of confirmed fill quantity × fill price; the only source of `usdcResult`. */
+  proceedsUsd: number;
 }
 
 export interface ClearAction {
   type: 'merge' | 'sell_yes' | 'sell_no' | 'redeem';
+  /** For terminal SELL actions: factually sold shares (see `facts.requestedShares` for the order size). */
   amount: number;
   usdcResult: number;
   txHash?: string;
   success: boolean;
   error?: string;
+  /** Identity of a reconcilable local operation: a clear SELL order or a clear merge attempt. */
+  operationId?: string;
+  /**
+   * A real economic operation whose outcome is not factually known: a SELL order awaiting
+   * fills, or a merge transaction that may have been broadcast but has no confirmed or
+   * reverted receipt yet. Zero proceeds, no success claim. Distinct from a `withheld` result,
+   * which owns no venue or on-chain action at all.
+   */
+  pending?: boolean;
+  /** Present for terminal SELL actions; `usdcResult` equals `facts.proceedsUsd`. */
+  facts?: ClearSellFacts;
 }
 
 // ===== Market Scanning Types =====
@@ -261,6 +302,21 @@ export interface ArbitrageOpportunity {
   timestamp: number;
 }
 
+/** Factual long-arb economics. Every quantity is derived from confirmed child
+ * trades of this operation's own BUY orders and a receipt-confirmed merge. */
+export interface LongArbFacts {
+  yesOrderId: string;
+  noOrderId: string;
+  yesShares: number;
+  yesCost: number;
+  noShares: number;
+  noCost: number;
+  mergedShares: number;
+  mergeValue: number;
+  feeUsd: number;
+  fillTxHashes: string[];
+}
+
 export interface ArbitrageExecutionResult {
   success: boolean;
   type: 'long' | 'short';
@@ -269,6 +325,12 @@ export interface ArbitrageExecutionResult {
   txHashes: string[];
   error?: string;
   executionTimeMs: number;
+  /** Long-arb operation identity when the result belongs to a reconcilable operation. */
+  operationId?: string;
+  /** BUY reconciliation is incomplete: no terminal claim, no economics, no execution event. */
+  pending?: boolean;
+  /** Present only when `success` was proven from factual fills and a confirmed merge. */
+  facts?: LongArbFacts;
 }
 
 export interface ShortArbSubmissionAck {
@@ -306,6 +368,143 @@ type PendingShortArb = {
   finalized?: boolean;
   inventoryReconciled?: boolean;
 };
+
+/** Terminal fill facts for one local order (BUY cost or SELL proceeds in `cost`). */
+type FillLegSettlement =
+  | { state: 'PENDING' }
+  | { state: 'TERMINAL'; units: bigint; shares: number; cost: number; weightedPrice?: number;
+      /** All confirmed fills share one price, so any sub-quantity has an exact cost. */
+      uniformPrice: boolean; txHashes: string[] };
+
+type PendingFillLeg = {
+  tokenId: string;
+  requestedShares: number;
+  orderId?: string;
+  submission: 'NOT_SUBMITTED' | 'REJECTED' | 'SUBMITTED' | 'UNCERTAIN';
+  tradeIds?: Set<string>;
+  facts?: Map<string, string>;
+  settlement?: FillLegSettlement;
+};
+type BuyLegSettlement = FillLegSettlement;
+type PendingLongLeg = PendingFillLeg;
+
+type PendingRebalanceSell = {
+  id: string;
+  /** `rebalance` publishes a `rebalance` event and pacing; `corrective` only logs (fixImbalanceIfNeeded). */
+  kind: 'rebalance' | 'corrective';
+  action: RebalanceAction;
+  market: Pick<ArbitrageMarketConfig, 'conditionId' | 'yesTokenId' | 'noTokenId'>;
+  label: string;
+  leg: PendingFillLeg;
+  submittedAt: number;
+  flight?: Promise<RebalanceResult | undefined>;
+  terminal?: RebalanceResult;
+  published?: boolean;
+};
+
+/** One clearPositions SELL: retained until its terminal facts are reported by exactly one call. */
+type PendingClearSell = {
+  id: string;
+  type: 'sell_yes' | 'sell_no';
+  market: Pick<ArbitrageMarketConfig, 'conditionId' | 'yesTokenId' | 'noTokenId'>;
+  label: string;
+  leg: PendingFillLeg;
+  submittedAt: number;
+  flight?: Promise<ClearAction | undefined>;
+  terminal?: ClearAction;
+  /** Terminal outcome logged (inline or by the periodic flush). */
+  logged?: boolean;
+  /** Terminal outcome returned in a ClearPositionResult; the record is released with it. */
+  reported?: boolean;
+};
+
+/**
+ * One clearPositions merge whose on-chain outcome is not factually known: the transaction may
+ * have been broadcast (SUBMITTED/UNCERTAIN provenance, or an unclassified throw). While the
+ * record exists no merge or SELL may be authorized for the market; only the recorded
+ * transaction's own receipt resolves it, never a balance read. At most one per conditionId.
+ */
+type PendingClearMerge = {
+  id: string;
+  market: Pick<ArbitrageMarketConfig, 'name' | 'conditionId' | 'yesTokenId' | 'noTokenId'>;
+  /** Pairs requested in the merge transaction; collateral received if and only if it confirmed. */
+  pairs: number;
+  /** Well-formed transaction hash when the client exposed one; without it the record cannot be resolved. */
+  txHash?: string;
+  /** Client classification at throw time; UNKNOWN for an exception the client did not classify. */
+  provenance: 'SUBMITTED' | 'UNCERTAIN' | 'UNKNOWN';
+  error: string;
+  submittedAt: number;
+};
+
+/** How a thrown clear merge is treated; only a proven non-broadcast may reuse the pre-merge snapshot. */
+type ClearMergeThrow =
+  | { state: 'NOT_SUBMITTED' }
+  | { state: 'CONFIRMED'; txHash: string }
+  | { state: 'UNRESOLVED'; provenance: PendingClearMerge['provenance']; txHash?: string };
+
+type LongArbMerge =
+  | { state: 'NOT_STARTED' }
+  | { state: 'IN_FLIGHT' }
+  | { state: 'UNCERTAIN'; txHash?: string }
+  | { state: 'CONFIRMED'; shares: number; value: number; txHash: string };
+
+type PendingLongArb = {
+  id: string;
+  market: ArbitrageMarketConfig;
+  size: number;
+  startedAt: number;
+  legYes: PendingLongLeg;
+  legNo: PendingLongLeg;
+  merge: LongArbMerge;
+  flight?: Promise<ArbitrageExecutionResult | undefined>;
+  result?: ArbitrageExecutionResult;
+  published?: boolean;
+};
+
+const TX_HASH_PATTERN = /^0x[0-9a-f]{64}$/i;
+
+/** CLOB share strings carry at most two decimals; 100 units = 1 share. */
+function parseShareUnits(value: unknown, label: string): bigint {
+  if (typeof value !== 'string' || !/^\d+(?:\.\d{1,2})?$/.test(value)) throw new Error(`Invalid factual ${label} shares`);
+  const [whole, fraction = ''] = value.split('.');
+  return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
+}
+
+function formatShareUnits(units: bigint): string {
+  const whole = units / 100n, fraction = units % 100n;
+  if (fraction === 0n) return whole.toString();
+  return `${whole}.${fraction.toString().padStart(2, '0')}`.replace(/0$/, '');
+}
+
+/**
+ * Receipt-scoped payout of a confirmed redeem, or undefined when the client
+ * result does not prove one (unsuccessful, provenance other than CONFIRMED, or
+ * a missing/invalid `usdcReceived`). The client resolves only after the receipt
+ * is verified, so a present provenance must agree with that contract.
+ */
+/**
+ * Classifies a thrown clear merge. Only the client's typed NOT_SUBMITTED proves no broadcast;
+ * a typed CONFIRMED with a well-formed hash proves the merge landed. Everything else, including
+ * an exception the client did not classify, may have been broadcast and stays unresolved.
+ */
+function classifyClearMergeThrow(error: unknown): ClearMergeThrow {
+  if (!(error instanceof MergeProvenanceError)) return { state: 'UNRESOLVED', provenance: 'UNKNOWN' };
+  const { state, transactionHash } = error.provenance;
+  const txHash = typeof transactionHash === 'string' && TX_HASH_PATTERN.test(transactionHash) ? transactionHash : undefined;
+  if (state === 'NOT_SUBMITTED') return { state: 'NOT_SUBMITTED' };
+  if (state === 'CONFIRMED' && txHash) return { state: 'CONFIRMED', txHash };
+  return { state: 'UNRESOLVED', provenance: state === 'SUBMITTED' ? 'SUBMITTED' : 'UNCERTAIN', ...(txHash ? { txHash } : {}) };
+}
+
+function factualRedeemPayout(result: RedeemResult): number | undefined {
+  if (!result || result.success !== true) return undefined;
+  if (result.provenance !== undefined && result.provenance.state !== 'CONFIRMED') return undefined;
+  const raw = result.usdcReceived;
+  if (typeof raw !== 'string' || !/^\d+(?:\.\d+)?$/.test(raw)) return undefined;
+  const payout = Number(raw);
+  return Number.isFinite(payout) && payout >= 0 ? payout : undefined;
+}
 
 /** Factual notification only; no realized-profit contract. */
 export type ShortArbSettledLeg = Readonly<{
@@ -378,6 +577,28 @@ export class ArbitrageService extends EventEmitter {
   private nextShortArbId = 0;
   private shortArbConsuming = false;
   private shortArbFlushPromise: Promise<void> | null = null;
+  private pendingLongArbs = new Map<string, PendingLongArb>();
+  private nextLongArbId = 0;
+  private longArbFlushPromise: Promise<void> | null = null;
+  private pendingRebalanceSells = new Map<string, PendingRebalanceSell>();
+  private nextRebalanceSellId = 0;
+  private rebalanceSellFlushPromise: Promise<void> | null = null;
+  /** Publication claims keyed by the shared terminal result object, which outlives the pending record. */
+  private publishedRebalanceSells = new WeakSet<RebalanceResult>();
+  private pendingClearSells = new Map<string, PendingClearSell>();
+  /** Clear SELL submissions per `${conditionId}:${tokenId}`; guards sizing against a stale balance read. */
+  private clearSellSubmissions = new Map<string, number>();
+  /**
+   * Condition IDs with a `clearPositions(market, true)` economic phase in flight. Held from
+   * before the balance read until the call settles, so no second call can merge or sell the
+   * same inventory from a snapshot another call's merge may have invalidated.
+   */
+  private activeClearMarkets = new Set<string>();
+  /** Unresolved clear merges keyed by conditionId; checked under the interlock before any balance read. */
+  private pendingClearMerges = new Map<string, PendingClearMerge>();
+  private nextClearMergeId = 0;
+  private nextClearSellId = 0;
+  private clearSellFlushPromise: Promise<void> | null = null;
   private balanceRefreshVersion = 0;
   private lastExecutionTime = 0;
   private lastRebalanceTime = 0;
@@ -501,6 +722,21 @@ export class ArbitrageService extends EventEmitter {
           await this.flushPendingShortArbs();
         } catch (error) {
           try { this.log(`Short-arb flush: ${String(error)}`); } catch { /* preserve future cycles */ }
+        }
+        try {
+          await this.flushPendingLongArbs();
+        } catch (error) {
+          try { this.log(`Long-arb flush: ${String(error)}`); } catch { /* preserve future cycles */ }
+        }
+        try {
+          await this.flushPendingRebalanceSells();
+        } catch (error) {
+          try { this.log(`Rebalance SELL flush: ${String(error)}`); } catch { /* preserve future cycles */ }
+        }
+        try {
+          await this.flushPendingClearSells();
+        } catch (error) {
+          try { this.log(`Clear SELL flush: ${String(error)}`); } catch { /* preserve future cycles */ }
         }
         try {
           await this.updateBalance();
@@ -779,6 +1015,17 @@ export class ArbitrageService extends EventEmitter {
       }
     }
 
+    // An unresolved long on this market is neither retried nor resubmitted:
+    // its BUY facts are still being reconciled. No attempt, no event.
+    if (opportunity.type === 'long') {
+      const unresolved = this.findPendingLongArb(this.market);
+      if (unresolved) {
+        return { success: false, type: 'long', size: 0, profit: 0, txHashes: [],
+          error: `Long arb ${unresolved.id} pending factual reconciliation`, executionTimeMs: 0,
+          operationId: unresolved.id, pending: true };
+      }
+    }
+
     // Admission refusal, not an economic execution result. No attempts or events.
     const protectedShort = opportunity.type === 'long' ? this.getShortInventoryBlock(this.market) : undefined;
     if (protectedShort) throw new Error(`Inventory write blocked by short ${protectedShort}`);
@@ -821,13 +1068,13 @@ export class ArbitrageService extends EventEmitter {
         return result;
       }
 
-      if (result.success) {
-        this.stats.executionsSucceeded++;
-        this.stats.totalProfit += result.profit;
+      if (result.pending) {
+        // BUY legs submitted but not factually reconciled: pace, never claim.
         this.lastExecutionTime = Date.now();
+        return result;
       }
 
-      this.emit('execution', result);
+      this.publishLongArbResult(result);
       return result;
     } finally {
       this.isExecuting = false;
@@ -930,6 +1177,11 @@ export class ArbitrageService extends EventEmitter {
     this.log(`\n🔄 Rebalance: ${rebalanceAction.type.toUpperCase()} ${rebalanceAction.amount.toFixed(2)}`);
     this.log(`   Reason: ${rebalanceAction.reason}`);
 
+    // Acceptance is not execution: a SELL completes only from factual fills.
+    if (rebalanceAction.type === 'sell_yes' || rebalanceAction.type === 'sell_no') {
+      return this.rebalanceSellAction(rebalanceAction);
+    }
+
     try {
       let txHash: string | undefined;
 
@@ -953,32 +1205,6 @@ export class ArbitrageService extends EventEmitter {
           );
           txHash = result.txHash;
           this.log(`   ✅ Merge TX: ${txHash}`);
-          break;
-        }
-        case 'sell_yes': {
-          const result = await this.tradingService.createMarketOrder({
-            tokenId: this.market.yesTokenId,
-            side: 'SELL',
-            amount: rebalanceAction.amount,
-            orderType: 'FOK',
-          });
-          if (!result.success) {
-            throw new Error(result.errorMsg || 'Sell YES failed');
-          }
-          this.log(`   ✅ Sold ${rebalanceAction.amount.toFixed(2)} YES tokens`);
-          break;
-        }
-        case 'sell_no': {
-          const result = await this.tradingService.createMarketOrder({
-            tokenId: this.market.noTokenId,
-            side: 'SELL',
-            amount: rebalanceAction.amount,
-            orderType: 'FOK',
-          });
-          if (!result.success) {
-            throw new Error(result.errorMsg || 'Sell NO failed');
-          }
-          this.log(`   ✅ Sold ${rebalanceAction.amount.toFixed(2)} NO tokens`);
           break;
         }
       }
@@ -1145,6 +1371,37 @@ export class ArbitrageService extends EventEmitter {
    * ```
    */
   async clearPositions(market: ArbitrageMarketConfig, execute = false): Promise<ClearPositionResult> {
+    // Dry runs never write, so they neither take nor disturb the economic-write interlock.
+    if (!execute) return this.runClearPositions(market, false);
+
+    // Per-market interlock, acquired before the balance read: a concurrent caller's merge
+    // would otherwise invalidate this call's snapshot before it merges or sells from it. The
+    // loser withholds rather than waits, because after waiting its snapshot would be stale.
+    const key = market.conditionId;
+    if (this.activeClearMarkets.has(key)) {
+      this.log(`⏸️ clearPositions withheld for ${market.name}: another clear operation is active for this market`);
+      return {
+        market,
+        marketStatus: 'unknown',
+        yesBalance: 0,
+        noBalance: 0,
+        actions: [],
+        totalUsdcRecovered: 0,
+        success: false,
+        withheld: true,
+        error: 'clearPositions withheld: another clear operation is active for this market; re-run after it settles',
+      };
+    }
+    this.activeClearMarkets.add(key);
+    try {
+      return await this.runClearPositions(market, true);
+    } finally {
+      this.activeClearMarkets.delete(key);
+    }
+  }
+
+  /** Body of {@link clearPositions}; for `execute=true` the caller holds the market's interlock. */
+  private async runClearPositions(market: ArbitrageMarketConfig, execute: boolean): Promise<ClearPositionResult> {
     if (!this.ctf) {
       return {
         market,
@@ -1158,12 +1415,24 @@ export class ArbitrageService extends EventEmitter {
       };
     }
 
+    // Under the interlock and before any balance read: an earlier merge whose outcome is
+    // unknown owns this market's inventory decision until its own transaction resolves.
+    if (execute) {
+      const unresolved = this.pendingClearMerges.get(market.conditionId);
+      if (unresolved) return this.reconcileClearMergeCall(unresolved, market);
+    }
+
     const tokenIds: TokenIds = {
       yesTokenId: market.yesTokenId,
       noTokenId: market.noTokenId,
     };
 
-    // Get token balances
+    // Get token balances. SELL sizing below is only valid while no clear SELL on the
+    // token has been submitted since this read (its fills would not be in it).
+    const submissionsAtRead = {
+      sell_yes: this.clearSellSubmissions.get(`${market.conditionId}:${market.yesTokenId}`) ?? 0,
+      sell_no: this.clearSellSubmissions.get(`${market.conditionId}:${market.noTokenId}`) ?? 0,
+    };
     const positions = await this.ctf.getPositionBalanceByTokenIds(market.conditionId, tokenIds);
     const yesBalance = parseFloat(positions.yesBalance);
     const noBalance = parseFloat(positions.noBalance);
@@ -1295,15 +1564,30 @@ export class ArbitrageService extends EventEmitter {
       if (winningBalance >= 0.001) {
         try {
           const redeemResult = await this.ctf.redeemByTokenIds(market.conditionId, tokenIds, undefined, this.toLifecycleRouting(market));
-          actions.push({
-            type: 'redeem',
-            amount: winningBalance,
-            usdcResult: winningBalance,
-            txHash: redeemResult.txHash,
-            success: true,
-          });
-          totalUsdcRecovered = winningBalance;
-          this.log(`   ✅ Redeemed: ${winningBalance.toFixed(4)} tokens → $${winningBalance.toFixed(2)} USDC`);
+          // Recovered USDC is the receipt-scoped payout of the confirmed transaction,
+          // never the pre-transaction token balance or an assumed 1:1 redemption.
+          const payout = factualRedeemPayout(redeemResult);
+          if (payout === undefined) {
+            actions.push({
+              type: 'redeem',
+              amount: winningBalance,
+              usdcResult: 0,
+              ...(typeof redeemResult.txHash === 'string' && redeemResult.txHash ? { txHash: redeemResult.txHash } : {}),
+              success: false,
+              error: 'Redeem payout not factually confirmed',
+            });
+            this.log(`   ❌ Redeem not booked: payout not factually confirmed`);
+          } else {
+            actions.push({
+              type: 'redeem',
+              amount: winningBalance,
+              usdcResult: payout,
+              txHash: redeemResult.txHash,
+              success: true,
+            });
+            totalUsdcRecovered += payout;
+            this.log(`   ✅ Redeemed: ${winningBalance.toFixed(4)} tokens → $${payout.toFixed(2)} USDC (factual payout)`);
+          }
         } catch (error: any) {
           actions.push({
             type: 'redeem',
@@ -1321,7 +1605,9 @@ export class ArbitrageService extends EventEmitter {
       let unpairedYes = yesBalance - pairedTokens;
       let unpairedNo = noBalance - pairedTokens;
 
-      // Step 1: Merge paired tokens
+      // Step 1: Merge paired tokens. Residual SELLs are sized from the balance read above,
+      // which is only valid if the merge provably did not consume inventory.
+      let residualsAuthorized = true;
       if (pairedTokens >= 1) {
         const mergeAmount = Math.floor(pairedTokens * 1e6) / 1e6;
         try {
@@ -1341,89 +1627,118 @@ export class ArbitrageService extends EventEmitter {
           totalUsdcRecovered += mergeAmount;
           this.log(`   ✅ Merged: ${mergeAmount.toFixed(4)} pairs → $${mergeAmount.toFixed(2)} USDC`);
         } catch (error: any) {
-          actions.push({
-            type: 'merge',
-            amount: mergeAmount,
-            usdcResult: 0,
-            success: false,
-            error: error.message,
-          });
-          this.log(`   ❌ Merge failed: ${error.message}`);
-          // Update unpaired amounts since merge failed
-          unpairedYes = yesBalance;
-          unpairedNo = noBalance;
+          const message = error instanceof Error ? error.message : String(error);
+          const outcome = classifyClearMergeThrow(error);
+          if (outcome.state === 'NOT_SUBMITTED') {
+            // Proven non-broadcast: the pairs are still held, so the read above still sizes them.
+            actions.push({
+              type: 'merge',
+              amount: mergeAmount,
+              usdcResult: 0,
+              success: false,
+              error: message,
+            });
+            this.log(`   ❌ Merge failed: ${message}`);
+            // Update unpaired amounts since merge failed
+            unpairedYes = yesBalance;
+            unpairedNo = noBalance;
+          } else if (outcome.state === 'CONFIRMED') {
+            // The client proved confirmation before failing; the pairs are gone and the
+            // read above no longer describes inventory, so nothing is sold this call.
+            actions.push({
+              type: 'merge',
+              amount: mergeAmount,
+              usdcResult: mergeAmount,
+              txHash: outcome.txHash,
+              success: true,
+            });
+            totalUsdcRecovered += mergeAmount;
+            residualsAuthorized = false;
+            this.log(`   ✅ Merged: ${mergeAmount.toFixed(4)} pairs → $${mergeAmount.toFixed(2)} USDC (confirmed; client error after receipt: ${message}); residuals need a fresh read`);
+          } else {
+            // May have been broadcast: block every write on this market until the
+            // transaction itself confirms or reverts. Installed before the guard releases.
+            const record: PendingClearMerge = {
+              id: `clear-merge-${++this.nextClearMergeId}`,
+              market: { name: market.name, conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId },
+              pairs: mergeAmount,
+              ...(outcome.txHash ? { txHash: outcome.txHash } : {}),
+              provenance: outcome.provenance,
+              error: message,
+              submittedAt: Date.now(),
+            };
+            this.pendingClearMerges.set(market.conditionId, record);
+            actions.push(this.pendingClearMergeAction(record, `merge outcome ${outcome.provenance.toLowerCase()}: ${message}`));
+            residualsAuthorized = false;
+            this.log(`   ⏳ Merge outcome uncertain (${record.id}${record.txHash ? `, tx ${record.txHash}` : ', no tx hash'}): ${message}; no SELL until resolved`);
+          }
         }
       }
 
-      // Step 2: Sell unpaired tokens
-      if (this.tradingService && unpairedYes >= this.config.minTradeSize) {
-        try {
-          const sellAmount = Math.floor(unpairedYes * 1e6) / 1e6;
-          const result = await this.tradingService.createMarketOrder({
-            tokenId: market.yesTokenId,
-            side: 'SELL',
-            amount: sellAmount,
-            orderType: 'FOK',
-          });
-          if (result.success) {
-            // Estimate USDC received (conservative estimate since we don't have exact trade info)
-            const usdcReceived = sellAmount * 0.5; // Assume ~0.5 average price
-            actions.push({
-              type: 'sell_yes',
-              amount: sellAmount,
-              usdcResult: usdcReceived,
-              success: true,
-            });
-            totalUsdcRecovered += usdcReceived;
-            this.log(`   ✅ Sold YES: ${sellAmount.toFixed(4)} → ~$${usdcReceived.toFixed(2)} USDC`);
-          } else {
-            throw new Error(result.errorMsg || 'Sell failed');
-          }
-        } catch (error: any) {
-          actions.push({
-            type: 'sell_yes',
-            amount: unpairedYes,
-            usdcResult: 0,
-            success: false,
-            error: error.message,
-          });
-          this.log(`   ❌ Sell YES failed: ${error.message}`);
-        }
-      }
+      // Step 2: Sell unpaired tokens. Acceptance is not execution: sold shares and
+      // proceeds come only from confirmed fills attributed to our own order.
+      const sellSide = async (type: 'sell_yes' | 'sell_no', unpaired: number): Promise<void> => {
+        if (!this.tradingService) return;
+        const label = type === 'sell_yes' ? 'YES' : 'NO';
+        const tokenId = type === 'sell_yes' ? market.yesTokenId : market.noTokenId;
 
-      if (this.tradingService && unpairedNo >= this.config.minTradeSize) {
-        try {
-          const sellAmount = Math.floor(unpairedNo * 1e6) / 1e6;
-          const result = await this.tradingService.createMarketOrder({
-            tokenId: market.noTokenId,
-            side: 'SELL',
-            amount: sellAmount,
-            orderType: 'FOK',
-          });
-          if (result.success) {
-            // Estimate USDC received (conservative estimate since we don't have exact trade info)
-            const usdcReceived = sellAmount * 0.5; // Assume ~0.5 average price
-            actions.push({
-              type: 'sell_no',
-              amount: sellAmount,
-              usdcResult: usdcReceived,
-              success: true,
-            });
-            totalUsdcRecovered += usdcReceived;
-            this.log(`   ✅ Sold NO: ${sellAmount.toFixed(4)} → ~$${usdcReceived.toFixed(2)} USDC`);
-          } else {
-            throw new Error(result.errorMsg || 'Sell failed');
+        // An earlier SELL on this token owns the inventory until its facts are known and
+        // reported; the balance read above predates them, so it sizes nothing this call.
+        const prior = this.findPendingClearSell(market, tokenId);
+        if (prior) {
+          const terminal = await this.reconcileClearSell(prior);
+          if (!terminal) {
+            actions.push(this.pendingClearAction(prior));
+            this.log(`   ⏳ Sell ${label} ${prior.id} still awaiting factual fills; no new order`);
+            return;
           }
-        } catch (error: any) {
-          actions.push({
-            type: 'sell_no',
-            amount: unpairedNo,
-            usdcResult: 0,
-            success: false,
-            error: error.message,
-          });
-          this.log(`   ❌ Sell NO failed: ${error.message}`);
+          const reported = this.reportClearSell(prior, terminal);
+          if (reported) {
+            actions.push(reported);
+            totalUsdcRecovered += reported.usdcResult;
+          }
+          return;
         }
+
+        if (unpaired < this.config.minTradeSize) return;
+        const submissionKey = `${market.conditionId}:${tokenId}`;
+        if ((this.clearSellSubmissions.get(submissionKey) ?? 0) !== submissionsAtRead[type]) {
+          actions.push({ type, amount: 0, usdcResult: 0, success: false,
+            error: `SELL ${label} withheld: a clear SELL was submitted after this balance read; re-run clearPositions` });
+          this.log(`   ⏸️ Sell ${label} withheld: inventory changed since balance read`);
+          return;
+        }
+        const sellAmount = Math.floor(unpaired * 1e6) / 1e6;
+        this.clearSellSubmissions.set(submissionKey, submissionsAtRead[type] + 1);
+        const record: PendingClearSell = {
+          id: `clear-sell-${++this.nextClearSellId}`, type, label, submittedAt: Date.now(),
+          market: { conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId },
+          leg: { tokenId, requestedShares: sellAmount, submission: 'UNCERTAIN' },
+        };
+        this.pendingClearSells.set(record.id, record);
+        const { rejected } = await this.submitSellLeg(record.leg, label, { tokenId, side: 'SELL', amount: sellAmount, orderType: 'FOK' });
+        if (rejected !== undefined) {
+          // Known non-submission: nothing to reconcile.
+          this.pendingClearSells.delete(record.id);
+          actions.push({ type, amount: 0, usdcResult: 0, success: false, error: rejected });
+          this.log(`   ❌ Sell ${label} failed: ${rejected}`);
+          return;
+        }
+        const terminal = await this.reconcileClearSell(record);
+        if (!terminal) {
+          actions.push(this.pendingClearAction(record));
+          this.log(`   ⏳ Sell ${label} submitted; awaiting factual fills (${record.id})`);
+          return;
+        }
+        const reported = this.reportClearSell(record, terminal);
+        if (reported) {
+          actions.push(reported);
+          totalUsdcRecovered += reported.usdcResult;
+        }
+      };
+      if (residualsAuthorized) {
+        await sellSide('sell_yes', unpairedYes);
+        await sellSide('sell_no', unpairedNo);
       }
     }
 
@@ -1564,6 +1879,10 @@ export class ArbitrageService extends EventEmitter {
 
   private async checkAndRebalance(): Promise<void> {
     if (!this.isRunning || this.isExecuting) return;
+    // Complete earlier SELLs from facts before reading balances; an unresolved
+    // SELL on this market means the imbalance is unknown, so no new corrective order.
+    if (this.pendingRebalanceSells.size) await this.flushPendingRebalanceSells();
+    if (this.findPendingRebalanceSell(this.market)) return;
     if (this.getShortInventoryBlock(this.market) || this.isRebalancerWriting(this.market)) return;
 
     // Check cooldown
@@ -1572,7 +1891,12 @@ export class ArbitrageService extends EventEmitter {
       return;
     }
 
-    await this.updateBalance();
+    // Only a fresh, complete balance read may size a split/merge/SELL; the cached
+    // balance is telemetry, not execution authority, after a failed refresh.
+    if (!(await this.updateBalance())) {
+      this.log('⏸️ Rebalance cycle skipped: fresh balance refresh failed');
+      return;
+    }
     // A short may start during the balance read or its synchronous notification.
     if (this.getShortInventoryBlock(this.market) || this.isRebalancerWriting(this.market)) return;
     const action = this.calculateRebalanceAction();
@@ -1599,7 +1923,12 @@ export class ArbitrageService extends EventEmitter {
   private async fixImbalanceIfNeeded(): Promise<void> {
     if (!this.config.autoFixImbalance || !this.ctf || !this.tradingService || !this.market) return;
 
-    await this.updateBalance();
+    // A corrective SELL is sized from the imbalance; a cached imbalance after a
+    // failed refresh is not authority to sell anything.
+    if (!(await this.updateBalance())) {
+      this.log('   ⏸️ Imbalance correction withheld: fresh balance refresh failed');
+      return;
+    }
     const imbalance = this.balance.yesTokens - this.balance.noTokens;
 
     if (Math.abs(imbalance) <= this.config.imbalanceThreshold) return;
@@ -1610,49 +1939,56 @@ export class ArbitrageService extends EventEmitter {
     const sellAmount = Math.floor(Math.abs(imbalance) * 0.9 * 1e6) / 1e6; // Sell 90% to be safe
     if (sellAmount < this.config.minTradeSize) return;
 
+    // An unresolved SELL on this market (corrective or rebalancer) means the true
+    // imbalance is unknown; never stack another corrective order on it.
+    const unresolved = this.findPendingRebalanceSell(this.market);
+    if (unresolved) {
+      this.log(`   ⏳ Corrective SELL withheld: ${unresolved.id} pending factual reconciliation`);
+      return;
+    }
+
+    const market = this.market;
+    const outcomes = market.outcomes || ['YES', 'NO'];
+    const sellYes = imbalance > 0;
+    // Floor derived from the live best bid so the remediation itself cannot
+    // sweep the book (PROBLEMS.md #2).
+    const bestBid = (sellYes ? this.orderbook.yesBids : this.orderbook.noBids)[0]?.price;
+    const floor = bestBid !== undefined ? bestBid * (1 - this.config.maxSlippagePct) : undefined;
+    const tokenId = sellYes ? market.yesTokenId : market.noTokenId;
+    const record: PendingRebalanceSell = {
+      id: `corrective-sell-${++this.nextRebalanceSellId}`, kind: 'corrective', submittedAt: Date.now(),
+      action: { type: sellYes ? 'sell_yes' : 'sell_no', amount: sellAmount, reason: 'Imbalance correction', priority: 100 },
+      label: sellYes ? outcomes[0] : outcomes[1],
+      market: { conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId },
+      leg: { tokenId, requestedShares: sellAmount, submission: 'UNCERTAIN' },
+    };
+
     try {
-      if (imbalance > 0) {
-        // Sell excess YES with a floor derived from the live best bid so the
-        // remediation itself cannot sweep the book (PROBLEMS.md #2).
-        const bestYesBid = this.orderbook.yesBids[0]?.price;
-        const yesFloor = bestYesBid !== undefined
-          ? bestYesBid * (1 - this.config.maxSlippagePct)
-          : undefined;
-        // Sell excess YES
-        const result = await this.tradingService.createMarketOrder({
-          tokenId: this.market.yesTokenId,
-          side: 'SELL',
-          amount: sellAmount,
-          ...(yesFloor !== undefined ? { price: yesFloor } : {}),
-          orderType: 'FOK',
-        });
-        if (result.success) {
-          this.log(`   ✅ Sold ${sellAmount.toFixed(2)} excess YES to restore balance`);
-        }
-      } else {
-        const bestNoBid = this.orderbook.noBids[0]?.price;
-        const noFloor = bestNoBid !== undefined
-          ? bestNoBid * (1 - this.config.maxSlippagePct)
-          : undefined;
-        // Sell excess NO
-        const result = await this.tradingService.createMarketOrder({
-          tokenId: this.market.noTokenId,
-          side: 'SELL',
-          amount: sellAmount,
-          ...(noFloor !== undefined ? { price: noFloor } : {}),
-          orderType: 'FOK',
-        });
-        if (result.success) {
-          this.log(`   ✅ Sold ${sellAmount.toFixed(2)} excess NO to restore balance`);
-        }
+      // Acceptance is not execution: the corrective SELL completes only from factual fills.
+      const result = await this.submitFactualSell(record, {
+        tokenId, side: 'SELL', amount: sellAmount, ...(floor !== undefined ? { price: floor } : {}), orderType: 'FOK',
+      });
+      if (result.pending) {
+        this.log(`   ⏳ Corrective SELL submitted; awaiting factual fills (${result.operationId})`);
+        return;
       }
+      this.publishRebalanceSell(result);
     } catch (error: any) {
       this.log(`   ❌ Failed to fix imbalance: ${error.message}`);
     }
   }
 
-  private async updateBalance(): Promise<void> {
-    if (!this.ctf || !this.market) return;
+  /**
+   * Refresh pUSD and YES/NO balances from the chain.
+   *
+   * Returns true only when every value needed for an inventory decision was
+   * freshly and validly read and applied to `this.balance` for the still-active
+   * market. On failure the previous cached balance is left untouched (telemetry
+   * only) and the error is emitted; callers that size or direct a NEW economic
+   * write must treat a `false` result as "no fresh authority" and abort.
+   */
+  private async updateBalance(): Promise<boolean> {
+    if (!this.ctf || !this.market) return false;
 
     const version = ++this.balanceRefreshVersion;
     const conditionId = this.market.conditionId;
@@ -1676,7 +2012,7 @@ export class ArbitrageService extends EventEmitter {
       if (!balances.every(value => Number.isFinite(value) && value >= 0)) throw new Error('Invalid factual balances');
       // Discard stale overlapping reads and responses for a market no longer active.
       if (version !== this.balanceRefreshVersion || this.market?.conditionId !== conditionId ||
-          this.market.yesTokenId !== tokenIds.yesTokenId || this.market.noTokenId !== tokenIds.noTokenId) return;
+          this.market.yesTokenId !== tokenIds.yesTokenId || this.market.noTokenId !== tokenIds.noTokenId) return false;
       const balance = {
         usdc: balances[0],
         pUsdBalance: balances[0],
@@ -1687,167 +2023,737 @@ export class ArbitrageService extends EventEmitter {
       this.balance = balance;
       this.emit('balanceUpdate', this.balance);
       if (version !== this.balanceRefreshVersion || this.balance !== balance || this.market?.conditionId !== conditionId ||
-          this.market.yesTokenId !== tokenIds.yesTokenId || this.market.noTokenId !== tokenIds.noTokenId) return;
+          this.market.yesTokenId !== tokenIds.yesTokenId || this.market.noTokenId !== tokenIds.noTokenId) return true;
       for (const pending of awaitingInventory) pending.inventoryReconciled = true;
+      return true;
     } catch (error) {
       this.emit('error', error as Error);
+      return false;
+    }
+  }
+
+  private findPendingLongArb(market: ArbitrageMarketConfig | null): PendingLongArb | undefined {
+    if (!market) return;
+    for (const op of this.pendingLongArbs.values()) {
+      if (!op.published && op.market.conditionId === market.conditionId &&
+          op.market.yesTokenId === market.yesTokenId && op.market.noTokenId === market.noTokenId) return op;
+    }
+  }
+
+  /** Session-local effects exactly once per long-arb operation; failure results without
+   * an operation (guard/config/rejection) are published directly. */
+  private publishLongArbResult(result: ArbitrageExecutionResult): void {
+    const op = result.operationId ? this.pendingLongArbs.get(result.operationId) : undefined;
+    if (op) {
+      if (op.published) return;
+      op.published = true;
+    }
+    if (result.success) {
+      this.stats.executionsSucceeded++;
+      this.stats.totalProfit += result.profit;
+      this.lastExecutionTime = Date.now();
+    }
+    try {
+      this.emit('execution', result);
+    } finally {
+      if (op && this.pendingLongArbs.get(op.id) === op) this.pendingLongArbs.delete(op.id);
     }
   }
 
   private async executeLongArb(opportunity: ArbitrageOpportunity): Promise<ArbitrageExecutionResult> {
     const startTime = Date.now();
-    const txHashes: string[] = [];
     const size = opportunity.recommendedSize;
+    const market = this.market!;
+    const trading = this.tradingService!;
+    const failure = (error: string): ArbitrageExecutionResult => ({
+      success: false, type: 'long', size, profit: 0, txHashes: [], error, executionTimeMs: Date.now() - startTime,
+    });
 
     this.log(`\nExecuting Long Arb (Buy → Merge)...`);
 
-    try {
-      const { buyYes, buyNo } = opportunity.effectivePrices;
-      const requiredUsdc = (buyYes + buyNo) * size;
+    const { buyYes, buyNo } = opportunity.effectivePrices;
+    const requiredUsdc = (buyYes + buyNo) * size;
+    if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(requiredUsdc)) return failure('Invalid long arb size');
+    if (this.balance.pUsdBalance < requiredUsdc) {
+      return failure(`Insufficient pUSD: have ${this.balance.pUsdBalance.toFixed(2)}, need ${requiredUsdc.toFixed(2)}`);
+    }
 
-      if (this.balance.pUsdBalance < requiredUsdc) {
-        return {
-          success: false,
-          type: 'long',
-          size,
-          profit: 0,
-          txHashes,
-          error: `Insufficient pUSD: have ${this.balance.pUsdBalance.toFixed(2)}, need ${requiredUsdc.toFixed(2)}`,
-          executionTimeMs: Date.now() - startTime,
-        };
+    const op: PendingLongArb = {
+      id: `long-${++this.nextLongArbId}`, market: { ...market }, size, startedAt: startTime,
+      legYes: { tokenId: market.yesTokenId, requestedShares: size, submission: 'NOT_SUBMITTED' },
+      legNo: { tokenId: market.noTokenId, requestedShares: size, submission: 'NOT_SUBMITTED' },
+      merge: { state: 'NOT_STARTED' },
+    };
+    this.pendingLongArbs.set(op.id, op);
+    const pendingResult = (error: string): ArbitrageExecutionResult => ({
+      ...failure(error), operationId: op.id, pending: true,
+    });
+    const outcomes = market.outcomes || ['YES', 'NO'];
+
+    // Submission provenance only. Acceptance never becomes a fill; an exception
+    // after the attempt started cannot prove non-submission.
+    const submitLeg = async (leg: PendingLongLeg, amount: number, price: number): Promise<string | undefined> => {
+      leg.submission = 'UNCERTAIN';
+      try {
+        const result = await trading.createMarketOrder({ tokenId: leg.tokenId, side: 'BUY', amount, price, orderType: 'FOK' });
+        const orderId = typeof result.orderId === 'string' ? result.orderId.trim() : '';
+        if (orderId) {
+          leg.orderId = orderId;
+          leg.tradeIds = new Set(result.tradeIds ?? []);
+        }
+        if (result.submissionState === 'REJECTED') {
+          leg.submission = 'REJECTED';
+          return result.errorMsg || 'venue rejection';
+        }
+        if (result.submissionState === 'ACCEPTED' && orderId) leg.submission = 'SUBMITTED';
+        return result.errorMsg;
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
       }
+    };
 
-      // Buy both legs sequentially with worst-price caps (PROBLEMS.md #2/#3).
-      // Sequential execution avoids the Promise.all dual-fill race: if the
-      // second leg fails we hold only one side and unwind it immediately
-      // instead of racing two fills. Caps are passed as `price` so the
-      // venue rejects fills beyond max slippage instead of sweeping the book.
-      const buyYesCap = opportunity.priceCaps?.buyYes ?? buyYes * (1 + this.config.maxSlippagePct);
-      const buyNoCap = opportunity.priceCaps?.buyNo ?? buyNo * (1 + this.config.maxSlippagePct);
-      this.log(`  1. Buying legs sequentially (caps YES=${buyYesCap.toFixed(4)}, NO=${buyNoCap.toFixed(4)})...`);
-      const buyYesResult = await this.tradingService!.createMarketOrder({
-        tokenId: this.market!.yesTokenId,
-        side: 'BUY',
-        amount: size * buyYes,
-        price: buyYesCap,
-        orderType: 'FOK',
-      });
-      if (!buyYesResult.success) {
-        return {
-          success: false,
-          type: 'long',
-          size,
-          profit: 0,
-          txHashes,
-          error: `Leg 1 (YES) failed: ${buyYesResult.errorMsg}`,
-          executionTimeMs: Date.now() - startTime,
-        };
+    // Buy both legs sequentially with worst-price caps (PROBLEMS.md #2/#3).
+    // Caps are passed as `price` so the venue rejects fills beyond max slippage.
+    const buyYesCap = opportunity.priceCaps?.buyYes ?? buyYes * (1 + this.config.maxSlippagePct);
+    const buyNoCap = opportunity.priceCaps?.buyNo ?? buyNo * (1 + this.config.maxSlippagePct);
+    this.log(`  1. Buying legs sequentially (caps YES=${buyYesCap.toFixed(4)}, NO=${buyNoCap.toFixed(4)})...`);
+
+    const yesError = await submitLeg(op.legYes, size * buyYes, buyYesCap);
+    if (op.legYes.submission === 'REJECTED') {
+      // Known non-submission: nothing to reconcile, no economic effects.
+      this.pendingLongArbs.delete(op.id);
+      return failure(`Leg 1 (${outcomes[0]}) failed: ${yesError}`);
+    }
+    if (op.legYes.submission !== 'SUBMITTED') {
+      // The YES order may or may not exist. Never open the second side on an
+      // unknown first side; reconcile the first side if it has an identity.
+      this.log(`  ⚠️ Leg 1 (${outcomes[0]}) submission uncertain${op.legYes.orderId ? '' : ' (no order identity)'} - ${outcomes[1]} leg withheld`);
+      const terminal = op.legYes.orderId ? await this.reconcileLongArb(op) : undefined;
+      return terminal ?? pendingResult(`Leg 1 (${outcomes[0]}) submission uncertain: ${yesError ?? 'no acceptance'}`);
+    }
+
+    const noError = await submitLeg(op.legNo, size * buyNo, buyNoCap);
+    this.log(`     ${outcomes[0]}: ✓, ${outcomes[1]}: ${op.legNo.submission === 'REJECTED' ? '✗' : '✓'}`);
+
+    if (op.legNo.submission === 'REJECTED') {
+      // Known non-submission of leg 2: the YES side may be filled. Existing
+      // remediation runs unchanged; the YES facts stay reconcilable.
+      this.log(`  ⚠️ Leg 2 (${outcomes[1]}) rejected after ${outcomes[0]} submission - unwinding single-sided position...`);
+      await this.fixImbalanceIfNeeded();
+    } else if (op.legNo.submission !== 'SUBMITTED') {
+      this.log(`  ⚠️ Leg 2 (${outcomes[1]}) submission uncertain${op.legNo.orderId ? '' : ' (no order identity)'}`);
+    }
+
+    const terminal = await this.reconcileLongArb(op);
+    if (terminal) return terminal;
+    const state = [op.legYes, op.legNo].map((leg, i) =>
+      `${outcomes[i]}=${leg.submission === 'REJECTED' ? 'rejected' : leg.submission === 'NOT_SUBMITTED' ? 'not submitted'
+        : leg.settlement?.state === 'TERMINAL' ? 'terminal' : leg.orderId ? 'pending' : 'unknown'}`).join(', ');
+    const detail = op.legNo.submission === 'REJECTED' ? `Leg 2 (${outcomes[1]}) failed: ${noError}; ` : '';
+    return pendingResult(`${detail}BUY_PENDING: factual reconciliation incomplete (${state})`);
+  }
+
+  /** Single flight per operation; concurrent callers share one reconciliation. */
+  private reconcileLongArb(op: PendingLongArb): Promise<ArbitrageExecutionResult | undefined> {
+    if (op.result) return Promise.resolve(op.result);
+    if (op.flight) return op.flight;
+    const flight = this.reconcileLongArbOnce(op).finally(() => { if (op.flight === flight) op.flight = undefined; });
+    op.flight = flight;
+    return flight;
+  }
+
+  private async reconcileLongArbOnce(op: PendingLongArb): Promise<ArbitrageExecutionResult | undefined> {
+    const size = op.size;
+    const legs = [op.legYes, op.legNo];
+    const finalize = (result: Omit<ArbitrageExecutionResult, 'type' | 'operationId' | 'executionTimeMs'>): ArbitrageExecutionResult => {
+      if (!op.result) op.result = { ...result, type: 'long', operationId: op.id, executionTimeMs: Date.now() - op.startedAt };
+      return op.result;
+    };
+    const failure = (error: string) => finalize({ success: false, size, profit: 0, txHashes: [], error });
+
+    // Known non-orders (rejected or never attempted) carry no fills to prove.
+    const resolved = (leg: PendingLongLeg) => leg.submission === 'REJECTED' || leg.submission === 'NOT_SUBMITTED' ||
+      leg.settlement?.state === 'TERMINAL';
+    for (const leg of legs) {
+      if (resolved(leg) || !leg.orderId) continue;
+      try {
+        leg.settlement = await this.reconcileBuyLeg(leg);
+      } catch (error) {
+        try { this.log(`Long-arb ${op.id} BUY reconciliation: ${String(error)}`); } catch { /* remain pending */ }
       }
-      const buyNoResult = await this.tradingService!.createMarketOrder({
-        tokenId: this.market!.noTokenId,
-        side: 'BUY',
-        amount: size * buyNo,
-        price: buyNoCap,
-        orderType: 'FOK',
-      });
+    }
+    // An UNCERTAIN leg without order identity can never be proven; it stays unresolved.
+    if (!legs.every(resolved)) return undefined;
 
-      const outcomes = this.market!.outcomes || ['YES', 'NO'];
-      this.log(`     ${outcomes[0]}: ${buyYesResult.success ? '✓' : '✗'}, ${outcomes[1]}: ${buyNoResult.success ? '✓' : '✗'}`);
+    const settled = (leg: PendingLongLeg) => leg.settlement?.state === 'TERMINAL' ? leg.settlement : undefined;
+    const yes = settled(op.legYes), no = settled(op.legNo);
+    const yesUnits = yes?.units ?? 0n, noUnits = no?.units ?? 0n;
+    const yesShares = Number(yesUnits) / 100, noShares = Number(noUnits) / 100;
+    const pairedUnits = yesUnits < noUnits ? yesUnits : noUnits;
+    const pairedShares = Number(pairedUnits) / 100;
+    const describe = `YES ${yesShares} / NO ${noShares} attributable shares`;
 
-      // Sequential legs: only the second leg can fail here (first leg
-      // returned early above). Unwind the single-sided fill immediately.
-      if (!buyNoResult.success) {
-        this.log(`  ⚠️ Leg 2 (NO) failed after YES filled - unwinding single-sided position...`);
-        await this.fixImbalanceIfNeeded();
-        return {
-          success: false,
-          type: 'long',
-          size,
-          profit: 0,
-          txHashes,
-          error: `Leg 2 (NO) failed: ${buyNoResult.errorMsg}`,
-          executionTimeMs: Date.now() - startTime,
-        };
-      }
+    if (pairedUnits === 0n) return failure(`No paired factual fills (${describe})`);
+    if (pairedShares < this.config.minTradeSize) return failure(`Insufficient attributable pairs for merge: ${describe}`);
 
-      // Merge tokens
-      const tokenIds: TokenIds = {
-        yesTokenId: this.market!.yesTokenId,
-        noTokenId: this.market!.noTokenId,
-      };
-
-      // Update balance to get accurate token counts
-      await this.updateBalance();
-      const heldPairs = Math.min(this.balance.yesTokens, this.balance.noTokens);
-      const mergeSize = Math.floor(Math.min(size, heldPairs) * 1e6) / 1e6;
-
-      if (mergeSize >= this.config.minTradeSize) {
-        this.log(`  2. Merging ${mergeSize.toFixed(2)} pairs...`);
-        try {
-          const mergeResult = await this.ctf!.mergeByTokenIds(
-            this.market!.conditionId,
-            tokenIds,
-            mergeSize.toString(),
-            this.toLifecycleRouting(this.market)
-          );
-          txHashes.push(mergeResult.txHash);
-          this.log(`     TX: ${mergeResult.txHash}`);
-
-          const profit = opportunity.profitRate * mergeSize;
-          this.log(`  ✅ Long Arb completed! Profit: ~$${profit.toFixed(2)}`);
-
-          // Post-fill reconciliation (PROBLEMS.md #10): a "successful" merge
-          // can still leave excess single-sided tokens when fills were
-          // uneven. Refresh balances and unwind any remainder above threshold.
-          await this.updateBalance();
-          const residual = this.balance.yesTokens - this.balance.noTokens;
-          if (Math.abs(residual) > this.config.imbalanceThreshold) {
-            this.log(`  ⚠️ Residual imbalance after merge: ${residual.toFixed(2)} - cleaning up...`);
-            await this.fixImbalanceIfNeeded();
+    if (op.merge.state === 'NOT_STARTED') {
+      if (!this.ctf) return undefined;
+      const amount = formatShareUnits(pairedUnits);
+      const tokenIds: TokenIds = { yesTokenId: op.market.yesTokenId, noTokenId: op.market.noTokenId };
+      // Claim before the await so no concurrent pass can submit a second merge.
+      op.merge = { state: 'IN_FLIGHT' };
+      this.log(`  2. Merging ${amount} attributable pairs (${describe})...`);
+      try {
+        const mergeResult = await this.ctf.mergeByTokenIds(op.market.conditionId, tokenIds, amount, this.toLifecycleRouting(op.market));
+        op.merge = this.classifyMergeResult(mergeResult, pairedShares);
+      } catch (error) {
+        if (error instanceof MergeProvenanceError) {
+          const provenance = error.provenance;
+          if (provenance.state === 'NOT_SUBMITTED') {
+            // Proven non-broadcast: the pairs are still held; a later pass may retry.
+            op.merge = { state: 'NOT_STARTED' };
+            this.log(`  ⚠️ Merge not submitted: ${error.message}`);
+            return undefined;
           }
+          op.merge = provenance.state === 'CONFIRMED' && typeof provenance.transactionHash === 'string' &&
+            TX_HASH_PATTERN.test(provenance.transactionHash)
+            ? { state: 'CONFIRMED', shares: pairedShares, value: pairedShares, txHash: provenance.transactionHash }
+            : { state: 'UNCERTAIN', ...(provenance.transactionHash ? { txHash: provenance.transactionHash } : {}) };
+        } else {
+          op.merge = { state: 'UNCERTAIN' };
+        }
+        if (op.merge.state === 'UNCERTAIN') this.log(`  ⚠️ Merge outcome uncertain: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (op.merge.state === 'IN_FLIGHT' || op.merge.state === 'NOT_STARTED') return undefined;
+    if (op.merge.state === 'UNCERTAIN') {
+      return failure(`Merge outcome uncertain for ${pairedShares} pairs (${describe}); no realized profit booked`);
+    }
 
-          return {
-            success: true,
-            type: 'long',
-            size: mergeSize,
-            profit,
-            txHashes,
-            executionTimeMs: Date.now() - startTime,
-          };
-        } catch (mergeError: any) {
-          this.log(`  ⚠️ Merge failed: ${mergeError.message}`);
-          return {
-            success: false,
-            type: 'long',
-            size,
-            profit: 0,
-            txHashes,
-            error: `Merge failed: ${mergeError.message}`,
-            executionTimeMs: Date.now() - startTime,
-          };
+    const merge = op.merge;
+    // Post-merge reconciliation (PROBLEMS.md #10): uneven fills can leave
+    // single-sided excess. Existing remediation runs unchanged on the live market.
+    if (this.market && this.market.conditionId === op.market.conditionId &&
+        this.market.yesTokenId === op.market.yesTokenId && this.market.noTokenId === op.market.noTokenId) {
+      if (await this.updateBalance()) {
+        const residual = this.balance.yesTokens - this.balance.noTokens;
+        if (Math.abs(residual) > this.config.imbalanceThreshold) {
+          this.log(`  ⚠️ Residual imbalance after merge: ${residual.toFixed(2)} - cleaning up...`);
+          await this.fixImbalanceIfNeeded();
+        }
+      } else {
+        // Cached inventory cannot prove a residual; the realized result below is unaffected.
+        this.log('  ⏸️ Residual check skipped: fresh balance refresh failed');
+      }
+    }
+
+    // Exact attribution: the whole leg was merged, or every fill shares one price.
+    const attributedCost = (leg: Extract<BuyLegSettlement, { state: 'TERMINAL' }>): number | undefined =>
+      leg.units === pairedUnits ? leg.cost
+        : leg.uniformPrice && leg.weightedPrice !== undefined ? leg.weightedPrice * pairedShares : undefined;
+    const yesCost = attributedCost(yes!), noCost = attributedCost(no!);
+    if (yesCost === undefined || noCost === undefined) {
+      return failure(`Merged ${merge.shares} pairs (tx ${merge.txHash}) but BUY cost attribution is not exact (${describe}); realized profit withheld`);
+    }
+    const feeUsd = estimateTakerFee(yesCost + noCost, this.config.feeRateBps);
+    const profit = merge.value - yesCost - noCost - feeUsd;
+    if (![yesCost, noCost, feeUsd, profit].every(Number.isFinite)) throw new Error('Invalid long-arb settlement totals');
+    this.log(`  ✅ Long Arb completed: merged ${merge.shares} pairs, cost ${(yesCost + noCost).toFixed(4)}, realized $${profit.toFixed(4)}`);
+
+    return finalize({
+      success: true, size: merge.shares, profit, txHashes: [merge.txHash],
+      facts: {
+        yesOrderId: op.legYes.orderId!, noOrderId: op.legNo.orderId!,
+        yesShares, yesCost, noShares, noCost,
+        mergedShares: merge.shares, mergeValue: merge.value, feeUsd,
+        fillTxHashes: [...new Set([...yes!.txHashes, ...no!.txHashes])],
+      },
+    });
+  }
+
+  /** A merge counts only with receipt-level confirmation from the CTF path. */
+  private classifyMergeResult(result: MergeResult, expectedShares: number): LongArbMerge {
+    const txHash = typeof result?.txHash === 'string' ? result.txHash : undefined;
+    const confirmed = result?.success === true && txHash !== undefined && TX_HASH_PATTERN.test(txHash) &&
+      (result.provenance === undefined || result.provenance.state === 'CONFIRMED');
+    if (!confirmed) return { state: 'UNCERTAIN', ...(txHash ? { txHash } : {}) };
+    // Collateral out equals pairs in by contract; a reported amount must agree.
+    let value = expectedShares;
+    for (const raw of [result.usdcReceived, result.amount]) {
+      if (typeof raw !== 'string' || !/^\d+(?:\.\d+)?$/.test(raw)) continue;
+      const reported = Number(raw);
+      if (!Number.isFinite(reported) || Math.abs(reported - expectedShares) > 1e-6) return { state: 'UNCERTAIN', txHash };
+      value = reported;
+      break;
+    }
+    return { state: 'CONFIRMED', shares: expectedShares, value, txHash: txHash! };
+  }
+
+  private findPendingRebalanceSell(market: ArbitrageMarketConfig | null): PendingRebalanceSell | undefined {
+    if (!market) return;
+    for (const record of this.pendingRebalanceSells.values()) {
+      if (!record.published && record.market.conditionId === market.conditionId &&
+          record.market.yesTokenId === market.yesTokenId && record.market.noTokenId === market.noTokenId) return record;
+    }
+  }
+
+  private async rebalanceSellAction(action: RebalanceAction): Promise<RebalanceResult> {
+    let result: RebalanceResult;
+    try {
+      result = await this.rebalanceSell(action);
+    } catch (error: any) {
+      // Known non-submission (venue rejection, invalid amount): the existing failure path.
+      this.log(`   ❌ Failed: ${error.message}`);
+      const failure: RebalanceResult = { success: false, action, error: error.message };
+      this.emit('rebalance', failure);
+      return failure;
+    }
+    if (result.pending) {
+      this.log(`   ⏳ SELL submitted; awaiting factual fills (${result.operationId})`);
+      return result;
+    }
+    if (result.success) {
+      // A balance refresh failure cannot demote a factual fill.
+      try { await this.updateBalance(); } catch (error) { this.log(`Balance refresh: ${String(error)}`); }
+    }
+    this.publishRebalanceSell(result);
+    return result;
+  }
+
+  /** Submit one corrective SELL and reconcile it from facts; never claims execution. */
+  private async rebalanceSell(action: RebalanceAction): Promise<RebalanceResult> {
+    const market = this.market!;
+    const trading = this.tradingService!;
+    const unresolved = this.findPendingRebalanceSell(market);
+    if (unresolved) {
+      return { success: false, action, operationId: unresolved.id, pending: true,
+        error: `Rebalance SELL ${unresolved.id} pending factual reconciliation` };
+    }
+    const outcomes = market.outcomes || ['YES', 'NO'];
+    const label = action.type === 'sell_yes' ? outcomes[0] : outcomes[1];
+    const tokenId = action.type === 'sell_yes' ? market.yesTokenId : market.noTokenId;
+    if (!Number.isFinite(action.amount) || action.amount <= 0) throw new Error(`Invalid SELL ${label} amount`);
+    const record: PendingRebalanceSell = {
+      id: `rebalance-sell-${++this.nextRebalanceSellId}`, kind: 'rebalance', action, label, submittedAt: Date.now(),
+      market: { conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId },
+      leg: { tokenId, requestedShares: action.amount, submission: 'UNCERTAIN' },
+    };
+    return this.submitFactualSell(record, { tokenId, side: 'SELL', amount: action.amount, orderType: 'FOK' });
+  }
+
+  /** Register the record before the venue call, submit once, and return only factual terminal state or a pending ack. */
+  private async submitFactualSell(record: PendingRebalanceSell,
+      order: Parameters<TradingService['createMarketOrder']>[0]): Promise<RebalanceResult> {
+    const { action, label } = record;
+    this.pendingRebalanceSells.set(record.id, record);
+
+    const { rejected } = await this.submitSellLeg(record.leg, label, order);
+    if (rejected !== undefined) {
+      // Known non-submission: nothing to reconcile; existing failure path applies.
+      this.pendingRebalanceSells.delete(record.id);
+      throw new Error(rejected);
+    }
+    const terminal = await this.reconcileRebalanceSell(record);
+    return terminal ?? { success: false, action, operationId: record.id, pending: true,
+      error: `SELL_PENDING: factual reconciliation incomplete (${record.leg.orderId ? 'order ' + record.leg.orderId : 'no order identity'})` };
+  }
+
+  /**
+   * Submit one SELL and record only what the venue reply proves about the local
+   * order: identity and acceptance, never a fill. A known REJECTED reply returns
+   * `rejected`; otherwise the leg is SUBMITTED (accepted with identity) or UNCERTAIN.
+   */
+  private async submitSellLeg(leg: PendingFillLeg, label: string,
+      order: Parameters<TradingService['createMarketOrder']>[0]): Promise<{ rejected?: string }> {
+    const trading = this.tradingService!;
+    let reply: Awaited<ReturnType<TradingService['createMarketOrder']>> | undefined;
+    let submissionError: string | undefined;
+    try {
+      reply = await trading.createMarketOrder(order);
+    } catch (error) {
+      // The attempt started; an exception cannot prove non-submission.
+      submissionError = error instanceof Error ? error.message : String(error);
+    }
+    if (reply) {
+      const orderId = typeof reply.orderId === 'string' ? reply.orderId.trim() : '';
+      if (orderId) {
+        leg.orderId = orderId;
+        leg.tradeIds = new Set(reply.tradeIds ?? []);
+      }
+      if (reply.submissionState === 'REJECTED') return { rejected: reply.errorMsg || `Sell ${label} failed` };
+      if (reply.submissionState === 'ACCEPTED' && orderId) leg.submission = 'SUBMITTED';
+      submissionError = reply.errorMsg;
+    }
+    if (leg.submission !== 'SUBMITTED') {
+      this.log(`   ⚠️ SELL ${label} submission uncertain${leg.orderId ? '' : ' (no order identity)'}: ${submissionError ?? 'no acceptance'}`);
+    }
+    return {};
+  }
+
+  // ===== clearPositions SELL factual authority =====
+
+  /** Unreported clearPositions SELL on this market/token, terminal or not. */
+  private findPendingClearSell(market: Pick<ArbitrageMarketConfig, 'conditionId'>, tokenId: string): PendingClearSell | undefined {
+    for (const record of this.pendingClearSells.values()) {
+      if (!record.reported && record.market.conditionId === market.conditionId && record.leg.tokenId === tokenId) return record;
+    }
+    return undefined;
+  }
+
+  /** Single flight per clear SELL record; concurrent callers share one reconciliation. */
+  private reconcileClearSell(record: PendingClearSell): Promise<ClearAction | undefined> {
+    if (record.terminal) return Promise.resolve(record.terminal);
+    if (record.flight) return record.flight;
+    const flight = this.reconcileClearSellOnce(record).finally(() => { if (record.flight === flight) record.flight = undefined; });
+    record.flight = flight;
+    return flight;
+  }
+
+  private async reconcileClearSellOnce(record: PendingClearSell): Promise<ClearAction | undefined> {
+    const leg = record.leg;
+    // An UNCERTAIN submission without order identity can never be proven; it stays unresolved.
+    if (!leg.orderId) return undefined;
+    if (leg.settlement?.state !== 'TERMINAL') {
+      try {
+        leg.settlement = await this.reconcileFillLeg(leg, 'SELL');
+      } catch (error) {
+        try { this.log(`Clear SELL ${record.id} reconciliation: ${String(error)}`); } catch { /* remain pending */ }
+      }
+    }
+    const settlement = leg.settlement;
+    if (settlement?.state !== 'TERMINAL') return undefined;
+    if (record.terminal) return record.terminal;
+    const requestedUnits = BigInt(Math.round(leg.requestedShares * 100));
+    const facts: ClearSellFacts = {
+      orderId: leg.orderId, tokenId: leg.tokenId, requestedShares: leg.requestedShares, soldShares: settlement.shares,
+      ...(settlement.weightedPrice !== undefined ? { weightedPrice: settlement.weightedPrice } : {}),
+      txHashes: [...settlement.txHashes], proceedsUsd: settlement.cost,
+    };
+    const success = settlement.units >= requestedUnits;
+    record.terminal = {
+      type: record.type, amount: settlement.shares, usdcResult: settlement.cost, success, operationId: record.id, facts,
+      ...(settlement.txHashes.length === 1 ? { txHash: settlement.txHashes[0] } : {}),
+      ...(success ? {} : { error: settlement.units === 0n
+        ? `SELL ${record.label} never filled (${leg.orderId})`
+        : `Partial SELL ${record.label}: ${settlement.shares} of ${leg.requestedShares} filled (${leg.orderId})` }),
+    };
+    return record.terminal;
+  }
+
+  /** Terminal log exactly once per clear SELL record, whichever observer arrives first. */
+  private logClearSell(record: PendingClearSell, action: ClearAction): void {
+    if (record.logged) return;
+    record.logged = true;
+    const facts = action.facts;
+    const price = facts?.weightedPrice !== undefined ? ` @ ${facts.weightedPrice.toFixed(4)}` : '';
+    if (action.success && facts) {
+      this.log(`   ✅ Sold ${record.label}: ${facts.soldShares.toFixed(4)} → $${facts.proceedsUsd.toFixed(2)} USDC (factual${price})`);
+    } else {
+      this.log(`   ❌ Sell ${record.label} not executed: ${action.error ?? 'SELL not executed'}`);
+    }
+  }
+
+  /**
+   * Hand a terminal clear SELL to exactly one ClearPositionResult and release the
+   * record; a second observer gets nothing rather than a duplicate of the proceeds.
+   */
+  private reportClearSell(record: PendingClearSell, action: ClearAction): ClearAction | undefined {
+    if (record.reported) return undefined;
+    record.reported = true;
+    this.logClearSell(record, action);
+    if (this.pendingClearSells.get(record.id) === record) this.pendingClearSells.delete(record.id);
+    return action;
+  }
+
+  private pendingClearAction(record: PendingClearSell): ClearAction {
+    return { type: record.type, amount: 0, usdcResult: 0, success: false, operationId: record.id, pending: true,
+      error: `SELL_PENDING: factual reconciliation incomplete (${record.leg.orderId ? 'order ' + record.leg.orderId : 'no order identity'})` };
+  }
+
+  private pendingClearMergeAction(record: PendingClearMerge, reason: string): ClearAction {
+    return { type: 'merge', amount: 0, usdcResult: 0, success: false, operationId: record.id, pending: true,
+      ...(record.txHash ? { txHash: record.txHash } : {}),
+      error: `MERGE_PENDING: ${record.pairs} pairs unresolved (${reason})` };
+  }
+
+  /**
+   * A guarded `clearPositions(market, true)` call that found an unresolved merge for the market.
+   * It performs no balance read and no write: the recorded transaction's own receipt is the only
+   * thing that may settle it. CONFIRMED books the recorded pairs exactly once under the audited
+   * merge contract; REVERTED releases the record with zero recovery; `pending`, `failed`
+   * (RPC/read failure or "not found", not proof of non-execution), a lookup throw, or a missing
+   * hash keep it unresolved. Residual inventory is handled by a later call from a fresh read.
+   */
+  private async reconcileClearMergeCall(record: PendingClearMerge, market: ArbitrageMarketConfig): Promise<ClearPositionResult> {
+    const base = { market, marketStatus: 'unknown' as const, yesBalance: 0, noBalance: 0 };
+    this.log(`\n🧹 Clearing positions: ${market.name}`);
+    this.log(`   ⏳ Unresolved clear merge ${record.id}: ${record.pairs} pairs${record.txHash ? `, tx ${record.txHash}` : ', no tx hash'}; no new write until it resolves`);
+
+    let action: ClearAction;
+    let recovered = 0;
+    if (!record.txHash || !this.ctf) {
+      action = this.pendingClearMergeAction(record, !record.txHash ? 'no transaction identity; cannot be proven' : 'CTF client not configured');
+    } else {
+      let status: TransactionStatus | undefined;
+      try {
+        status = await this.ctf.getTransactionStatus(record.txHash);
+      } catch (error) {
+        this.log(`   ⚠️ Merge ${record.id} status lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      const sameTx = status !== undefined && typeof status.txHash === 'string' && status.txHash.toLowerCase() === record.txHash.toLowerCase();
+      if (sameTx && status!.status === 'confirmed') {
+        if (this.pendingClearMerges.get(record.market.conditionId) === record) this.pendingClearMerges.delete(record.market.conditionId);
+        action = { type: 'merge', amount: record.pairs, usdcResult: record.pairs, txHash: record.txHash, success: true, operationId: record.id };
+        recovered = record.pairs;
+        this.log(`   ✅ Merged: ${record.pairs.toFixed(4)} pairs → $${record.pairs.toFixed(2)} USDC (${record.id} confirmed on-chain); residuals need a fresh read`);
+      } else if (sameTx && status!.status === 'reverted') {
+        if (this.pendingClearMerges.get(record.market.conditionId) === record) this.pendingClearMerges.delete(record.market.conditionId);
+        const reason = status!.errorReason ? `: ${status!.errorReason}` : '';
+        action = { type: 'merge', amount: 0, usdcResult: 0, txHash: record.txHash, success: false, operationId: record.id,
+          error: `Merge reverted on-chain${reason}` };
+        this.log(`   ❌ Merge ${record.id} reverted on-chain${reason}; inventory unchanged, a later call may re-plan from a fresh read`);
+      } else {
+        const seen = !status ? 'status unavailable' : !sameTx ? 'status for a different transaction' : `transaction ${status.status}`;
+        action = this.pendingClearMergeAction(record, `${seen}; not proof of execution or non-execution`);
+        this.log(`   ⏳ Merge ${record.id} still unresolved (${seen}); no SELL, no new merge`);
+      }
+    }
+
+    const result: ClearPositionResult = { ...base, actions: [action], totalUsdcRecovered: recovered, success: action.success };
+    this.emit('settle', result);
+    return result;
+  }
+
+  /** Read-only reconciliation of unresolved clear SELLs; submits nothing, reports nothing. */
+  private flushPendingClearSells(): Promise<void> {
+    if (this.clearSellFlushPromise) return this.clearSellFlushPromise;
+    this.clearSellFlushPromise = Promise.resolve().then(async () => {
+      for (const [id, record] of [...this.pendingClearSells]) {
+        if (record.reported || record.terminal) continue;
+        try {
+          if (record.id !== id) throw new Error('Clear SELL pending ID mismatch');
+          const action = await this.reconcileClearSell(record);
+          if (action) this.logClearSell(record, action);
+        } catch (error) {
+          try { this.log(`Clear SELL reconciliation ${id}: ${String(error)}`); } catch { /* remain pending */ }
         }
       }
+    }).finally(() => { this.clearSellFlushPromise = null; });
+    return this.clearSellFlushPromise;
+  }
 
-      return {
-        success: false,
-        type: 'long',
-        size,
-        profit: 0,
-        txHashes,
-        error: `Insufficient pairs for merge: ${heldPairs.toFixed(2)}`,
-        executionTimeMs: Date.now() - startTime,
-      };
-    } catch (error: any) {
-      return {
-        success: false,
-        type: 'long',
-        size,
-        profit: 0,
-        txHashes,
-        error: error.message,
-        executionTimeMs: Date.now() - startTime,
-      };
+  /** Single flight per SELL record; concurrent callers share one reconciliation. */
+  private reconcileRebalanceSell(record: PendingRebalanceSell): Promise<RebalanceResult | undefined> {
+    if (record.terminal) return Promise.resolve(record.terminal);
+    if (record.flight) return record.flight;
+    const flight = this.reconcileRebalanceSellOnce(record).finally(() => { if (record.flight === flight) record.flight = undefined; });
+    record.flight = flight;
+    return flight;
+  }
+
+  private async reconcileRebalanceSellOnce(record: PendingRebalanceSell): Promise<RebalanceResult | undefined> {
+    const leg = record.leg;
+    // An UNCERTAIN submission without order identity can never be proven; it stays unresolved.
+    if (!leg.orderId) return undefined;
+    if (leg.settlement?.state !== 'TERMINAL') {
+      try {
+        leg.settlement = await this.reconcileFillLeg(leg, 'SELL');
+      } catch (error) {
+        try { this.log(`Rebalance SELL ${record.id} reconciliation: ${String(error)}`); } catch { /* remain pending */ }
+      }
     }
+    const settlement = leg.settlement;
+    if (settlement?.state !== 'TERMINAL') return undefined;
+    const requestedUnits = BigInt(Math.round(leg.requestedShares * 100));
+    const facts: RebalanceSellFacts = {
+      orderId: leg.orderId, tokenId: leg.tokenId, requestedShares: leg.requestedShares, soldShares: settlement.shares,
+      ...(settlement.weightedPrice !== undefined ? { weightedPrice: settlement.weightedPrice } : {}),
+      txHashes: [...settlement.txHashes],
+    };
+    if (record.terminal) return record.terminal;
+    record.terminal = settlement.units >= requestedUnits
+      ? { success: true, action: record.action, operationId: record.id, facts }
+      : { success: false, action: record.action, operationId: record.id, facts,
+          error: settlement.units === 0n
+            ? `SELL ${record.label} never filled (${leg.orderId})`
+            : `Partial SELL ${record.label}: ${settlement.shares} of ${leg.requestedShares} filled (${leg.orderId})` };
+    return record.terminal;
+  }
+
+  /** Terminal effects exactly once per SELL record: log, pacing, event, release. */
+  private publishRebalanceSell(result: RebalanceResult): void {
+    // Every joiner of the single-flight reconciliation holds this same terminal object
+    // (`record.terminal` is assigned once), so the claim on it survives the record's
+    // removal by an earlier publisher; the record flag alone would not.
+    if (this.publishedRebalanceSells.has(result)) return;
+    this.publishedRebalanceSells.add(result);
+    const record = result.operationId ? this.pendingRebalanceSells.get(result.operationId) : undefined;
+    if (record) {
+      if (record.published) return;
+      record.published = true;
+    }
+    const facts = result.facts;
+    const price = facts?.weightedPrice !== undefined ? ` @ ${facts.weightedPrice.toFixed(4)}` : '';
+    if (record?.kind === 'corrective') {
+      // Imbalance correction never emitted events or paced the rebalancer; only its claim becomes factual.
+      if (result.success && facts) {
+        this.log(`   ✅ Sold ${facts.soldShares.toFixed(2)} excess ${record.label} to restore balance (factual${price})`);
+      } else {
+        this.log(`   ❌ Corrective SELL not executed: ${result.error ?? 'SELL not executed'}`);
+      }
+      if (this.pendingRebalanceSells.get(record.id) === record) this.pendingRebalanceSells.delete(record.id);
+      return;
+    }
+    if (result.success && facts) {
+      this.lastRebalanceTime = Date.now();
+      this.log(`   ✅ Sold ${facts.soldShares.toFixed(2)} ${record?.label ?? ''} tokens (factual${price})`);
+    } else {
+      this.log(`   ❌ Failed: ${result.error ?? 'SELL not executed'}`);
+    }
+    try {
+      this.emit('rebalance', result);
+    } finally {
+      if (record && this.pendingRebalanceSells.get(record.id) === record) this.pendingRebalanceSells.delete(record.id);
+    }
+  }
+
+  /** Read-only reconciliation of unresolved corrective SELLs; submits nothing. */
+  private flushPendingRebalanceSells(): Promise<void> {
+    if (this.rebalanceSellFlushPromise) return this.rebalanceSellFlushPromise;
+    this.rebalanceSellFlushPromise = Promise.resolve().then(async () => {
+      for (const [id, record] of [...this.pendingRebalanceSells]) {
+        if (record.published) continue;
+        try {
+          if (record.id !== id) throw new Error('Rebalance SELL pending ID mismatch');
+          const result = await this.reconcileRebalanceSell(record);
+          if (!result) continue;
+          if (result.success) {
+            try { await this.updateBalance(); } catch (error) { this.log(`Balance refresh: ${String(error)}`); }
+          }
+          this.publishRebalanceSell(result);
+        } catch (error) {
+          try { this.log(`Rebalance SELL reconciliation ${id}: ${String(error)}`); } catch { /* remain pending */ }
+        }
+      }
+    }).finally(() => { this.rebalanceSellFlushPromise = null; });
+    return this.rebalanceSellFlushPromise;
+  }
+
+  private reconcileBuyLeg(leg: PendingLongLeg): Promise<BuyLegSettlement> {
+    return this.reconcileFillLeg(leg, 'BUY');
+  }
+
+  /** Factual fills of one local order. BUY: we bought `tokenId`; SELL: we sold it.
+   * Identical authority for both sides (mirrors the short-arb SELL reconciliation). */
+  private async reconcileFillLeg(leg: PendingFillLeg, side: 'BUY' | 'SELL'): Promise<FillLegSettlement> {
+    if (!this.tradingService) throw new Error('Trading not configured');
+    if (!leg.orderId) throw new Error(`${side} leg has no orderId`);
+    const orderId = leg.orderId;
+    // The counterparty side of a trade on our own token.
+    const counter = side === 'BUY' ? 'SELL' : 'BUY';
+    const pending: FillLegSettlement = { state: 'PENDING' };
+    const details = await this.tradingService.getOrderFillDetails(orderId);
+    if (details.id !== orderId || details.asset_id !== leg.tokenId || details.side !== side ||
+        !Array.isArray(details.tradeIds)) return pending;
+    const matched = parseShareUnits(details.sizeMatched, side);
+    const orderTerminal = ['MATCHED', 'CANCELED'].includes(details.status ?? '') && details.tradeEnumerationPresent === true;
+    const known = leg.tradeIds ??= new Set<string>();
+    for (const id of details.tradeIds) known.add(id);
+    const ids = [...known];
+    if (!ids.length) {
+      // A canceled FOK with complete, empty enumeration and zero matched volume never filled.
+      if (details.status === 'CANCELED' && details.tradeEnumerationPresent === true && matched === 0n) {
+        return { state: 'TERMINAL', units: 0n, shares: 0, cost: 0, uniformPrice: true, txHashes: [] };
+      }
+      return pending;
+    }
+    if (ids.some(id => typeof id !== 'string' || !id.trim() || !details.tradeIds.includes(id))) return pending;
+    const trades = await this.tradingService.getTradeStatuses(ids);
+    if (trades.length !== ids.length || new Set(trades.map(t => t.id)).size !== ids.length ||
+        trades.some(t => !known.has(t.id))) return pending;
+    const facts = leg.facts ??= new Map<string, string>();
+    let units = 0n, cost = 0, complete = true;
+    const prices = new Set<string>();
+    const txHashes = new Set<string>();
+    for (const trade of trades) {
+      // Same factual authority as the short-arb SELL path: local allocation, confirmed
+      // status AND transaction identity. Invalid siblings never complete a leg.
+      if (!Array.isArray(trade.maker_orders) || !trade.taker_order_id) { complete = false; continue; }
+      const makers = trade.maker_orders.filter(m => m.order_id === orderId);
+      let size: string | undefined, rawPrice: string | undefined;
+      if (trade.taker_order_id === orderId) {
+        if (trade.trader_side !== 'TAKER' || makers.length || trade.asset_id !== leg.tokenId || trade.side !== side) {
+          complete = false; continue;
+        }
+        size = trade.size; rawPrice = trade.price;
+      } else {
+        const maker = makers[0];
+        // As maker on our token the taker took the counter side; on the complement any side.
+        if (trade.trader_side !== 'MAKER' || makers.length !== 1 || maker.asset_id !== leg.tokenId ||
+            (maker.side !== undefined && maker.side !== side) || !trade.asset_id ||
+            !['BUY', 'SELL'].includes(trade.side ?? '') || (trade.asset_id === leg.tokenId && trade.side !== counter)) {
+          complete = false; continue;
+        }
+        size = maker.matched_amount; rawPrice = maker.price;
+        if (parseShareUnits(size, side) > parseShareUnits(trade.size, side)) { complete = false; continue; }
+      }
+      const confirmed = ['MINED', 'CONFIRMED'].includes(trade.status) &&
+        typeof trade.transactionHash === 'string' && TX_HASH_PATTERN.test(trade.transactionHash);
+      if (!confirmed) {
+        // A retained fact can never be demoted; a failed child without a hash is a terminal non-fill.
+        if (facts.has(trade.id) || trade.status !== 'FAILED' || trade.transactionHash?.trim()) complete = false;
+        continue;
+      }
+      if (size === undefined) { complete = false; continue; }
+      const quantity = parseShareUnits(size, side);
+      const price = typeof rawPrice === 'string' && /^\d+(?:\.\d+)?$/.test(rawPrice) ? Number(rawPrice) : NaN;
+      if (quantity <= 0n || !Number.isFinite(price) || price <= 0 || price > 1) throw new Error(`Invalid successful ${side} facts`);
+      const hash = trade.transactionHash!.toLowerCase();
+      const fingerprint = JSON.stringify([leg.tokenId, side, trade.trader_side, trade.taker_order_id, quantity.toString(), rawPrice, hash]);
+      const prior = facts.get(trade.id);
+      if (prior !== undefined && prior !== fingerprint) { complete = false; continue; }
+      facts.set(trade.id, fingerprint);
+      units += quantity;
+      cost += Number(quantity) / 100 * price;
+      prices.add(rawPrice!);
+      txHashes.add(hash);
+    }
+    if (!complete) return pending;
+    if (units > matched) throw new Error(`${side} child sizes exceed sizeMatched`);
+    // Matched volume is a completeness check, never a source of shares.
+    if (units !== matched || !orderTerminal) return pending;
+    if (units > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`${side} shares exceed safe economic precision`);
+    const shares = Number(units) / 100;
+    if (!Number.isFinite(cost)) throw new Error(`Invalid ${side} settlement totals`);
+    return { state: 'TERMINAL', units, shares, cost, weightedPrice: units > 0n ? cost / shares : undefined,
+      uniformPrice: prices.size <= 1, txHashes: [...txHashes] };
+  }
+
+  /** Periodic reconciliation of long arbs whose BUY legs were not terminal inline.
+   * Holds the execution lock so the merge cannot interleave with another execution. */
+  private flushPendingLongArbs(): Promise<void> {
+    if (this.longArbFlushPromise) return this.longArbFlushPromise;
+    this.longArbFlushPromise = Promise.resolve().then(async () => {
+      if (this.isExecuting) return;
+      this.isExecuting = true;
+      try {
+        for (const [id, op] of [...this.pendingLongArbs]) {
+          // A rebalancer writing this inventory may move the pairs; merge on a later pass.
+          if (op.published || this.isRebalancerWriting(op.market)) continue;
+          try {
+            if (op.id !== id) throw new Error('Long-arb pending ID mismatch');
+            const result = await this.reconcileLongArb(op);
+            if (result) this.publishLongArbResult(result);
+          } catch (error) {
+            // One query/anomaly must not prevent independent operations progressing.
+            try { this.log(`Long-arb reconciliation ${id}: ${String(error)}`); } catch { /* remain pending */ }
+          }
+        }
+      } finally {
+        this.isExecuting = false;
+      }
+    }).finally(() => { this.longArbFlushPromise = null; });
+    return this.longArbFlushPromise;
   }
 
   private async reconcileSellLeg(orderId: string, includeExactUnits = false, leg?: PendingShortLeg): Promise<SellLegSettlement> {
