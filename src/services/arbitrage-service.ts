@@ -1222,11 +1222,17 @@ export class ArbitrageService extends EventEmitter {
     const withheld = (error: string): RebalanceResult => ({
       success: false, action: action || { type: 'none', amount: 0, reason: 'Rebalance withheld', priority: 0 }, error,
     });
-    // Same acknowledgement the SELL path returns for an unresolved SELL, hoisted ahead of the read.
-    const unresolvedSell = action && (action.type === 'sell_yes' || action.type === 'sell_no') ? this.findPendingRebalanceSell(market) : undefined;
-    if (unresolvedSell && action) {
-      return { success: false, action, operationId: unresolvedSell.id, pending: true,
-        error: `Rebalance SELL ${unresolvedSell.id} pending factual reconciliation` };
+    // An unresolved SELL (rebalancer or corrective) still owns this market's inventory until its
+    // fills are factual and published: they may settle after any balance read taken here. An
+    // explicit SELL repeat gets the same acknowledgement the SELL path returns; every other
+    // request is a pre-write refusal. Nothing here reads, reconciles, or releases the record.
+    const unresolvedSell = this.findPendingRebalanceSell(market);
+    if (unresolvedSell) {
+      if (action && (action.type === 'sell_yes' || action.type === 'sell_no')) {
+        return { success: false, action, operationId: unresolvedSell.id, pending: true,
+          error: `Rebalance SELL ${unresolvedSell.id} pending factual reconciliation` };
+      }
+      return withheld(`Rebalance withheld: SELL ${unresolvedSell.id} pending factual reconciliation`);
     }
     if (this.isExecuting) return withheld('Rebalance withheld: arbitrage execution in progress');
     const protectedShort = this.getShortInventoryBlock(market);
