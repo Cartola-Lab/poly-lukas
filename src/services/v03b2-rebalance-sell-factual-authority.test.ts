@@ -279,8 +279,9 @@ describe.each<Side>(['sell_yes', 'sell_no'])('P0.3 B2 rebalance %s factual autho
     expect(h.sells()).toHaveLength(1);
     expect(h.pending.size).toBe(1);
     expect(h.events).not.toHaveBeenCalled();
-    // Balance reads are not needed while the market is blocked.
-    expect(h.ctf.getPusdBalance).not.toHaveBeenCalled();
+    // Balance reads are not needed while the market is blocked: only the first call's
+    // P0.3H3 fresh entry read happened; the acknowledged repeat and the cycle read nothing.
+    expect(h.ctf.getPusdBalance).toHaveBeenCalledTimes(1);
   });
 
   it('a different market is not blocked by the unresolved SELL', async () => {
@@ -306,7 +307,8 @@ describe.each<Side>(['sell_yes', 'sell_no'])('P0.3 B2 rebalance %s factual autho
     let release!: (reply: Reply) => void;
     h.trading.createMarketOrder.mockImplementationOnce(() => new Promise<Reply>(resolve => { release = resolve; }));
     const first = h.service.rebalance(action(type));
-    await Promise.resolve();
+    // P0.3H3: the first call awaits its fresh entry read before submitting; settle it so the SELL is in flight.
+    await new Promise(resolve => setTimeout(resolve, 0));
     const second = await h.service.rebalance(action(type));
     expect(second).toMatchObject({ success: false, pending: true, operationId: 'rebalance-sell-1' });
     release(accepted('r1'));
@@ -369,7 +371,8 @@ describe.each<Side>(['sell_yes', 'sell_no'])('P0.3 B2 rebalance %s factual autho
 
   it('a balance refresh failure after factual success does not demote the result', async () => {
     const h = fixture(type);
-    h.ctf.getPusdBalance.mockRejectedValueOnce(new Error('rpc'));
+    // P0.3H3: the fresh entry read authorizes the SELL; only the post-success refresh fails.
+    h.ctf.getPusdBalance.mockResolvedValueOnce('100').mockRejectedValueOnce(new Error('rpc'));
     const result = await h.service.rebalance(action(type));
     expect(result).toMatchObject({ success: true, facts: { soldShares: 20 } });
     expect(h.events).toHaveBeenCalledTimes(1);
@@ -380,10 +383,10 @@ describe.each<Side>(['sell_yes', 'sell_no'])('P0.3 B2 rebalance %s factual autho
     const h = fixture(type);
     h.orders.r1 = { ...h.orders.r1, status: 'LIVE', tradeIds: [], sizeMatched: '0' };
     expectPending(h, await h.service.rebalance(action(type)));
-    expect(h.ctf.getPusdBalance).not.toHaveBeenCalled();
+    expect(h.ctf.getPusdBalance).toHaveBeenCalledTimes(1); // P0.3H3 fresh entry read only; nothing after the pending ack
     h.orders.r1 = { ...h.orders.r1, status: 'MATCHED', tradeIds: ['t1'], sizeMatched: '20' };
     await h.flush();
-    expect(h.ctf.getPusdBalance).toHaveBeenCalledTimes(1);
+    expect(h.ctf.getPusdBalance).toHaveBeenCalledTimes(2); // + the refresh after factual success
     expect(h.events).toHaveBeenCalledTimes(1);
   });
 });

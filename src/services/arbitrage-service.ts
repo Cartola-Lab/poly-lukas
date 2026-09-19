@@ -1053,11 +1053,11 @@ export class ArbitrageService extends EventEmitter {
     }
 
     // Admission refusal, not an economic execution result. No attempts or events.
+    // A rebalance writer (SELL / split / merge) changes both collateral and YES/NO inventory,
+    // so it excludes LONG and SHORT alike.
     const protectedShort = opportunity.type === 'long' ? this.getShortInventoryBlock(this.market) : undefined;
     if (protectedShort) throw new Error(`Inventory write blocked by short ${protectedShort}`);
-    if (opportunity.type === 'short' && this.isRebalancerWriting(this.market)) {
-      throw new Error('Inventory write blocked by active rebalancer');
-    }
+    if (this.isRebalancerWriting(this.market)) throw new Error('Inventory write blocked by active rebalancer');
 
     if (this.isExecuting) {
       return {
@@ -1100,9 +1100,7 @@ export class ArbitrageService extends EventEmitter {
       // synchronously). Same admission refusals as above: no attempt, no event.
       const shortAfterRead = opportunity.type === 'long' ? this.getShortInventoryBlock(this.market) : undefined;
       if (shortAfterRead) throw new Error(`Inventory write blocked by short ${shortAfterRead}`);
-      if (opportunity.type === 'short' && this.isRebalancerWriting(this.market)) {
-        throw new Error('Inventory write blocked by active rebalancer');
-      }
+      if (this.isRebalancerWriting(this.market)) throw new Error('Inventory write blocked by active rebalancer');
 
       attempted = true;
       this.stats.executionsAttempted++;
@@ -1217,60 +1215,114 @@ export class ArbitrageService extends EventEmitter {
       };
     }
 
-    const rebalanceAction = action || this.calculateRebalanceAction();
-    if (rebalanceAction.type === 'none') {
-      return { success: true, action: rebalanceAction };
+    // Ownership admission before any read or write: an arbitrage execution, an unresolved short,
+    // or another rebalance already owns this market's inventory. Refusals here are not economic
+    // attempts: no balance read, no write, no event.
+    const market = this.market;
+    const withheld = (error: string): RebalanceResult => ({
+      success: false, action: action || { type: 'none', amount: 0, reason: 'Rebalance withheld', priority: 0 }, error,
+    });
+    // Same acknowledgement the SELL path returns for an unresolved SELL, hoisted ahead of the read.
+    const unresolvedSell = action && (action.type === 'sell_yes' || action.type === 'sell_no') ? this.findPendingRebalanceSell(market) : undefined;
+    if (unresolvedSell && action) {
+      return { success: false, action, operationId: unresolvedSell.id, pending: true,
+        error: `Rebalance SELL ${unresolvedSell.id} pending factual reconciliation` };
     }
+    if (this.isExecuting) return withheld('Rebalance withheld: arbitrage execution in progress');
+    const protectedShort = this.getShortInventoryBlock(market);
+    if (protectedShort) return withheld(`Rebalance withheld: inventory owned by short ${protectedShort}`);
+    if (this.isRebalancerWriting(market)) return withheld('Rebalance withheld: another rebalance owns this market');
 
-    this.log(`\n🔄 Rebalance: ${rebalanceAction.type.toUpperCase()} ${rebalanceAction.amount.toFixed(2)}`);
-    this.log(`   Reason: ${rebalanceAction.reason}`);
-
-    // Acceptance is not execution: a SELL completes only from factual fills.
-    if (rebalanceAction.type === 'sell_yes' || rebalanceAction.type === 'sell_no') {
-      return this.rebalanceSellAction(rebalanceAction);
-    }
-
+    // Claim synchronously, before the first await, so every caller (scheduled or direct) gets the
+    // same exclusion against execute() and against a concurrent rebalance of this market.
+    const writer = { conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId };
+    this.rebalancerInventoryWrites.add(writer);
     try {
-      let txHash: string | undefined;
+      // Cached balance is telemetry. Only a fresh, complete read may derive an action or
+      // authorize a caller-supplied amount.
+      if (!(await this.updateBalance())) {
+        this.log('⏸️ Rebalance withheld: fresh balance refresh failed');
+        return withheld('Fresh balance refresh failed; rebalance withheld');
+      }
+      // Ownership may have moved while awaiting the read (its notification runs listeners synchronously).
+      if (this.isExecuting) return withheld('Rebalance withheld: arbitrage execution in progress');
+      const shortAfterRead = this.getShortInventoryBlock(market);
+      if (shortAfterRead) return withheld(`Rebalance withheld: inventory owned by short ${shortAfterRead}`);
 
-      switch (rebalanceAction.type) {
-        case 'split': {
-          const result = await this.ctf.split(this.market.conditionId, rebalanceAction.amount.toString(), this.toLifecycleRouting(this.market));
-          txHash = result.txHash;
-          this.log(`   ✅ Split TX: ${txHash}`);
-          break;
-        }
-        case 'merge': {
-          const tokenIds: TokenIds = {
-            yesTokenId: this.market.yesTokenId,
-            noTokenId: this.market.noTokenId,
-          };
-          const result = await this.ctf.mergeByTokenIds(
-            this.market.conditionId,
-            tokenIds,
-            rebalanceAction.amount.toString(),
-            this.toLifecycleRouting(this.market)
-          );
-          txHash = result.txHash;
-          this.log(`   ✅ Merge TX: ${txHash}`);
-          break;
-        }
+      const rebalanceAction = action || this.calculateRebalanceAction();
+      if (rebalanceAction.type === 'none') {
+        return { success: true, action: rebalanceAction };
+      }
+      // The requested amount is authorized against fresh inventory as-is: never shrunk, never
+      // replaced by a recalculated action. Non-finite / non-positive amounts keep their existing paths.
+      const shortfall = this.rebalanceAuthorityShortfall(rebalanceAction);
+      if (shortfall) {
+        this.log(`⏸️ Rebalance withheld: ${shortfall}`);
+        return { success: false, action: rebalanceAction, error: `Rebalance withheld: ${shortfall}` };
       }
 
-      await this.updateBalance();
-      const rebalanceResult: RebalanceResult = { success: true, action: rebalanceAction, txHash };
-      this.emit('rebalance', rebalanceResult);
-      return rebalanceResult;
-    } catch (error: any) {
-      this.log(`   ❌ Failed: ${error.message}`);
-      const rebalanceResult: RebalanceResult = {
-        success: false,
-        action: rebalanceAction,
-        error: error.message,
-      };
-      this.emit('rebalance', rebalanceResult);
-      return rebalanceResult;
+      this.log(`\n🔄 Rebalance: ${rebalanceAction.type.toUpperCase()} ${rebalanceAction.amount.toFixed(2)}`);
+      this.log(`   Reason: ${rebalanceAction.reason}`);
+
+      // Acceptance is not execution: a SELL completes only from factual fills.
+      if (rebalanceAction.type === 'sell_yes' || rebalanceAction.type === 'sell_no') {
+        return await this.rebalanceSellAction(rebalanceAction);
+      }
+
+      try {
+        let txHash: string | undefined;
+
+        switch (rebalanceAction.type) {
+          case 'split': {
+            const result = await this.ctf.split(this.market.conditionId, rebalanceAction.amount.toString(), this.toLifecycleRouting(this.market));
+            txHash = result.txHash;
+            this.log(`   ✅ Split TX: ${txHash}`);
+            break;
+          }
+          case 'merge': {
+            const tokenIds: TokenIds = {
+              yesTokenId: this.market.yesTokenId,
+              noTokenId: this.market.noTokenId,
+            };
+            const result = await this.ctf.mergeByTokenIds(
+              this.market.conditionId,
+              tokenIds,
+              rebalanceAction.amount.toString(),
+              this.toLifecycleRouting(this.market)
+            );
+            txHash = result.txHash;
+            this.log(`   ✅ Merge TX: ${txHash}`);
+            break;
+          }
+        }
+
+        await this.updateBalance();
+        const rebalanceResult: RebalanceResult = { success: true, action: rebalanceAction, txHash };
+        this.emit('rebalance', rebalanceResult);
+        return rebalanceResult;
+      } catch (error: any) {
+        this.log(`   ❌ Failed: ${error.message}`);
+        const rebalanceResult: RebalanceResult = {
+          success: false,
+          action: rebalanceAction,
+          error: error.message,
+        };
+        this.emit('rebalance', rebalanceResult);
+        return rebalanceResult;
+      }
+    } finally {
+      this.rebalancerInventoryWrites.delete(writer);
     }
+  }
+
+  /** Amount the action needs beyond the freshly applied inventory, as a message; undefined when authorized. */
+  private rebalanceAuthorityShortfall(action: RebalanceAction): string | undefined {
+    const { pUsdBalance, yesTokens, noTokens } = this.balance;
+    const available = action.type === 'sell_yes' ? yesTokens : action.type === 'sell_no' ? noTokens
+      : action.type === 'split' ? pUsdBalance : Math.min(yesTokens, noTokens);
+    const label = action.type === 'sell_yes' ? 'YES' : action.type === 'sell_no' ? 'NO'
+      : action.type === 'split' ? 'pUSD' : 'paired tokens';
+    if (action.amount > available) return `${action.type} ${action.amount} exceeds fresh ${label} ${available}`;
   }
 
   // ===== Settle Position Methods =====
@@ -2001,17 +2053,10 @@ export class ArbitrageService extends EventEmitter {
     const action = this.calculateRebalanceAction();
 
     if (action.type !== 'none' && action.amount >= this.config.minTradeSize && this.market) {
-      // Preparation may admit a short (the second guard aborts us). Once writing
-      // starts, claim before rebalance can yield inside an external submission.
-      const writer = { conditionId: this.market.conditionId,
-        yesTokenId: this.market.yesTokenId, noTokenId: this.market.noTokenId };
-      this.rebalancerInventoryWrites.add(writer);
-      try {
-        await this.rebalance(action);
-        this.lastRebalanceTime = Date.now();
-      } finally {
-        this.rebalancerInventoryWrites.delete(writer);
-      }
+      // rebalance() claims the market writer itself and re-authorizes this planned action
+      // against its own fresh read; an action the newest inventory no longer supports is withheld.
+      await this.rebalance(action);
+      this.lastRebalanceTime = Date.now();
     }
   }
 
