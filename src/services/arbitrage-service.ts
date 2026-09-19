@@ -142,9 +142,9 @@ export interface RebalanceResult {
   action: RebalanceAction;
   txHash?: string;
   error?: string;
-  /** SELL rebalance operation identity when the result belongs to a reconcilable order. */
+  /** Identity of a reconcilable operation: a SELL order, or an unresolved/reconciled merge (`clear-merge-*`). */
   operationId?: string;
-  /** SELL submitted but not factually reconciled: no completion claim, no event. */
+  /** SELL submitted or merge broadcast whose facts are not yet known: no completion claim, no event. */
   pending?: boolean;
   /** Present for terminal SELL rebalances; `success` requires the full requested quantity. */
   facts?: RebalanceSellFacts;
@@ -1244,11 +1244,27 @@ export class ArbitrageService extends EventEmitter {
     const pendingLong = this.findPendingLongArb(market);
     if (pendingLong) return withheld(`Rebalance withheld: long arb ${pendingLong.id} pending factual reconciliation`);
 
-    // Claim synchronously, before the first await, so every caller (scheduled or direct) gets the
-    // same exclusion against execute() and against a concurrent rebalance of this market.
+    // Shared economic-write interlock with settlePosition/clearPositions, held from before the
+    // authoritative read until this call returns: while it is held neither entrypoint can merge,
+    // install a pending merge, or otherwise invalidate the snapshot this write is sized from.
+    // The loser withholds rather than waits, because after waiting its snapshot would be stale.
+    const key = market.conditionId;
+    if (this.activeClearMarkets.has(key)) {
+      this.log(`⏸️ Rebalance withheld for ${market.name}: a clear or settle operation is active for this market`);
+      return withheld('Rebalance withheld: clear or settle operation active for this market');
+    }
+
+    // Claim both guards synchronously, before the first await, so every caller (scheduled or direct)
+    // gets the same exclusion against execute(), a concurrent rebalance, and settle/clear.
     const writer = { conditionId: market.conditionId, yesTokenId: market.yesTokenId, noTokenId: market.noTokenId };
     this.rebalancerInventoryWrites.add(writer);
+    this.activeClearMarkets.add(key);
     try {
+      // Under the interlock and before any balance read: an earlier merge whose outcome is
+      // unknown owns this market's inventory decision until its own transaction resolves.
+      const unresolvedMerge = this.pendingClearMerges.get(key);
+      if (unresolvedMerge) return await this.reconcileRebalanceMergeCall(unresolvedMerge);
+
       // Cached balance is telemetry. Only a fresh, complete read may derive an action or
       // authorize a caller-supplied amount.
       if (!(await this.updateBalance())) {
@@ -1280,50 +1296,106 @@ export class ArbitrageService extends EventEmitter {
         return await this.rebalanceSellAction(rebalanceAction);
       }
 
-      try {
-        let txHash: string | undefined;
-
-        switch (rebalanceAction.type) {
-          case 'split': {
-            const result = await this.ctf.split(this.market.conditionId, rebalanceAction.amount.toString(), this.toLifecycleRouting(this.market));
-            txHash = result.txHash;
-            this.log(`   ✅ Split TX: ${txHash}`);
-            break;
-          }
-          case 'merge': {
-            const tokenIds: TokenIds = {
-              yesTokenId: this.market.yesTokenId,
-              noTokenId: this.market.noTokenId,
-            };
-            const result = await this.ctf.mergeByTokenIds(
-              this.market.conditionId,
-              tokenIds,
-              rebalanceAction.amount.toString(),
-              this.toLifecycleRouting(this.market)
-            );
-            txHash = result.txHash;
-            this.log(`   ✅ Merge TX: ${txHash}`);
-            break;
-          }
+      if (rebalanceAction.type === 'split') {
+        try {
+          const result = await this.ctf.split(this.market.conditionId, rebalanceAction.amount.toString(), this.toLifecycleRouting(this.market));
+          this.log(`   ✅ Split TX: ${result.txHash}`);
+          await this.updateBalance();
+          const rebalanceResult: RebalanceResult = { success: true, action: rebalanceAction, txHash: result.txHash };
+          this.emit('rebalance', rebalanceResult);
+          return rebalanceResult;
+        } catch (error: any) {
+          this.log(`   ❌ Failed: ${error.message}`);
+          const rebalanceResult: RebalanceResult = {
+            success: false,
+            action: rebalanceAction,
+            error: error.message,
+          };
+          this.emit('rebalance', rebalanceResult);
+          return rebalanceResult;
         }
-
-        await this.updateBalance();
-        const rebalanceResult: RebalanceResult = { success: true, action: rebalanceAction, txHash };
-        this.emit('rebalance', rebalanceResult);
-        return rebalanceResult;
-      } catch (error: any) {
-        this.log(`   ❌ Failed: ${error.message}`);
-        const rebalanceResult: RebalanceResult = {
-          success: false,
-          action: rebalanceAction,
-          error: error.message,
-        };
-        this.emit('rebalance', rebalanceResult);
-        return rebalanceResult;
       }
+
+      // MERGE under the shared factual merge contract: the economic outcome is classified first,
+      // an unresolved broadcast is recorded before the interlock releases, and the event is
+      // emitted only once the factual result is fixed (a listener throw cannot reclassify it).
+      let confirmedTxHash: string;
+      try {
+        const tokenIds: TokenIds = { yesTokenId: market.yesTokenId, noTokenId: market.noTokenId };
+        const result = await this.ctf.mergeByTokenIds(
+          market.conditionId,
+          tokenIds,
+          rebalanceAction.amount.toString(),
+          this.toLifecycleRouting(market)
+        );
+        confirmedTxHash = result.txHash;
+        this.log(`   ✅ Merge TX: ${confirmedTxHash}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const outcome = classifyClearMergeThrow(error);
+        if (outcome.state === 'NOT_SUBMITTED') {
+          // Proven non-broadcast: the pairs are still held; a later call reads fresh and may re-plan.
+          this.log(`   ❌ Merge failed: ${message}`);
+          const failure: RebalanceResult = { success: false, action: rebalanceAction, error: message };
+          this.emit('rebalance', failure);
+          return failure;
+        } else if (outcome.state === 'CONFIRMED') {
+          // The client proved confirmation before failing; the pairs are gone and collateral is held.
+          confirmedTxHash = outcome.txHash;
+          this.log(`   ✅ Merge TX: ${outcome.txHash} (confirmed; client error after receipt: ${message})`);
+        } else {
+          // May have been broadcast: block every write on this market until the transaction
+          // itself confirms or reverts. Installed before the guards release; no event.
+          const record = this.installPendingClearMerge(market, rebalanceAction.amount, outcome, message);
+          this.log(`   ⏳ Merge outcome uncertain (${record.id}${record.txHash ? `, tx ${record.txHash}` : ', no tx hash'}): ${message}; no new write until resolved`);
+          return { success: false, action: rebalanceAction, operationId: record.id, pending: true,
+            ...(record.txHash ? { txHash: record.txHash } : {}),
+            error: `MERGE_PENDING: ${record.pairs} pairs unresolved (merge outcome ${outcome.provenance.toLowerCase()}: ${message})` };
+        }
+      }
+      // A balance refresh failure cannot demote a confirmed merge.
+      try { await this.updateBalance(); } catch (error) { this.log(`Balance refresh: ${String(error)}`); }
+      const confirmed: RebalanceResult = { success: true, action: rebalanceAction, txHash: confirmedTxHash };
+      this.emit('rebalance', confirmed);
+      return confirmed;
     } finally {
+      this.activeClearMarkets.delete(key);
       this.rebalancerInventoryWrites.delete(writer);
     }
+  }
+
+  /**
+   * A guarded `rebalance()` call that found an unresolved merge for its market. It performs no
+   * balance read and no write, and never executes the caller's request: the existing merge owns
+   * the inventory decision, so the result describes that merge. See
+   * {@link resolvePendingClearMerge} for what settles it; CONFIRMED and REVERTED are reported
+   * (and emitted) exactly once by whichever entrypoint observes them, UNRESOLVED emits nothing.
+   */
+  private async reconcileRebalanceMergeCall(record: PendingClearMerge): Promise<RebalanceResult> {
+    this.log(`\n🔄 Rebalance: unresolved merge ${record.id} (${record.pairs} pairs${record.txHash ? `, tx ${record.txHash}` : ', no tx hash'}) owns this market; no new write until it resolves`);
+    const action: RebalanceAction = {
+      type: 'merge', amount: record.pairs, priority: 0,
+      reason: `Unresolved merge ${record.id} reconciled from its own transaction receipt`,
+    };
+    const identity = { action, operationId: record.id, ...(record.txHash ? { txHash: record.txHash } : {}) };
+    const resolution = await this.resolvePendingClearMerge(record);
+    if (resolution.state === 'CONFIRMED') {
+      this.log(`   ✅ Merged: ${record.pairs.toFixed(4)} pairs → $${record.pairs.toFixed(2)} USDC (${record.id} confirmed on-chain); residuals need a fresh read`);
+      // A balance refresh failure cannot demote a confirmed merge.
+      try { await this.updateBalance(); } catch (error) { this.log(`Balance refresh: ${String(error)}`); }
+      const confirmed: RebalanceResult = { success: true, ...identity };
+      this.emit('rebalance', confirmed);
+      return confirmed;
+    }
+    if (resolution.state === 'REVERTED') {
+      this.log(`   ❌ Merge ${record.id} reverted on-chain${resolution.reason}; inventory unchanged, a later call may re-plan from a fresh read`);
+      const reverted: RebalanceResult = { success: false, ...identity, error: `Merge reverted on-chain${resolution.reason}` };
+      this.emit('rebalance', reverted);
+      return reverted;
+    }
+    const proof = !record.txHash || !this.ctf ? resolution.reason : `${resolution.reason}; not proof of execution or non-execution`;
+    this.log(`   ⏳ Merge ${record.id} still unresolved (${resolution.reason}); no new write`);
+    return { success: false, ...identity, pending: true, error: `MERGE_PENDING: ${record.pairs} pairs unresolved (${proof})` };
   }
 
   /** Amount the action needs beyond the freshly applied inventory, as a message; undefined when authorized. */
